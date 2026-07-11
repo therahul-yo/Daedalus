@@ -7,36 +7,78 @@ import logging
 import sys
 
 
+def _setup_logging(level: str) -> None:
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        format="%(asctime)s │ %(levelname)-5s │ %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    for noisy in ("httpx", "urllib3", "filelock", "huggingface_hub", "transformers"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
 def cmd_serve(args) -> int:
+    import time
+
     import uvicorn
 
+    from daedalus import __version__
     from daedalus.cache.store import PrefixCacheStore
     from daedalus.engine import Engine, EngineConfig
     from daedalus.governor import PROFILES, GovernorConfig, ThermalGovernor
     from daedalus.sensors import ThermalMonitor
     from daedalus.server import create_app
 
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    _setup_logging(args.log_level)
+    log = logging.getLogger("daedalus")
+
     monitor = ThermalMonitor().start()
+    monitor.on_change(
+        lambda old, new: log.log(
+            logging.WARNING if int(new) >= 2 else logging.INFO,
+            "thermal %s → %s",
+            old.name,
+            new.name,
+        )
+    )
     governor = ThermalGovernor(
         monitor,
         GovernorConfig(
             policies=dict(PROFILES[args.profile]), max_duty=args.max_duty
         ),
     )
-    print(f"loading {args.model} ...", flush=True)
+
+    log.info("loading %s ...", args.model)
+    t0 = time.monotonic()
     engine = Engine.from_pretrained(
         args.model,
         governor=governor,
         config=EngineConfig(kv_bits=args.kv_bits or None),
     )
+    load_s = time.monotonic() - t0
+
+    import mlx.core as mx
+
     store = PrefixCacheStore(args.model)
+    cache_stats = store.stats()
     app = create_app(engine, store, model_id=args.model)
-    print(
-        f"daedalus serving {args.model} on http://{args.host}:{args.port}/v1"
-        f" | thermal={monitor.level.name}",
-        flush=True,
-    )
+
+    bar = "─" * 62
+    for line in (
+        bar,
+        f"  daedalus v{__version__} — wings that don't melt",
+        bar,
+        f"  model    {args.model}",
+        f"  loaded   {load_s:.1f}s · {mx.get_active_memory() / 1e9:.2f} GB weights"
+        f" · kv cache {args.kv_bits or 16}-bit",
+        f"  cache    {store.dir} ({cache_stats['entries']} entries)",
+        f"  thermal  {monitor.level.name} · profile {args.profile}"
+        + (f" · max-duty {args.max_duty}" if args.max_duty < 1.0 else ""),
+        f"  api      http://{args.host}:{args.port}/v1  (OpenAI-compatible)",
+        bar,
+    ):
+        print(line, flush=True)
+
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
     return 0
 
@@ -134,6 +176,12 @@ def main() -> int:
         type=float,
         default=1.0,
         help="global GPU duty ceiling (0-1); e.g. 0.5 for quiet mode",
+    )
+    serve.add_argument(
+        "--log-level",
+        choices=["debug", "info", "warning", "error"],
+        default="info",
+        help="request/thermal log verbosity (default: info)",
     )
     serve.set_defaults(fn=cmd_serve)
 

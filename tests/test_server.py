@@ -12,10 +12,15 @@ class FakeTokenizer:
     has_tool_calling = True
     tool_call_start = "<tool_call>"
     tool_call_end = "</tool_call>"
+    # Simulates whether the chat template left the prompt inside <think>.
+    prompt_tail = ""
 
     @staticmethod
     def tool_parser(text, tools=None):
         return json.loads(text)
+
+    def decode(self, tokens):
+        return self.prompt_tail
 
     def apply_chat_template(self, messages, add_generation_prompt=True, tools=None):
         # Deterministic: token ids derived from the serialized messages.
@@ -27,6 +32,7 @@ class FakeResponse:
     def __init__(self, text, generation_tokens, finish_reason=None):
         self.text = text
         self.generation_tokens = generation_tokens
+        self.generation_tps = 20.0
         self.finish_reason = finish_reason
 
 
@@ -272,3 +278,79 @@ def test_no_tools_means_no_filter_interference():
         json={"messages": [{"role": "user", "content": "hi"}]},
     )
     assert r.json()["choices"][0]["message"]["content"] == "plain <tool text passes"
+
+
+def make_thinking_client(script):
+    """Engine whose template opened a <think> block (Qwen3.5 behavior)."""
+    engine, store = FakeEngine(script=script), FakeStore()
+    engine.tokenizer.prompt_tail = "<|im_start|>assistant\n<think>"
+    app = create_app(engine, store, model_id="test-model")
+    return TestClient(app), engine, store
+
+
+THINK_SCRIPT = [
+    "The user greets me. ",
+    "I should reply.</think>",
+    "\n\nYo! How can I help?",
+]
+
+
+def test_reasoning_separated_non_streaming():
+    client, _, _ = make_thinking_client(THINK_SCRIPT)
+    r = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "yo"}]},
+    )
+    msg = r.json()["choices"][0]["message"]
+    assert msg["content"] == "Yo! How can I help?"
+    assert msg["reasoning_content"] == "The user greets me. I should reply."
+    assert "</think>" not in msg["content"]
+
+
+def test_reasoning_separated_streaming():
+    client, _, _ = make_thinking_client(THINK_SCRIPT)
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "yo"}], "stream": True},
+    ) as r:
+        raw = "".join(r.iter_text())
+    lines = [
+        l for l in raw.split("\n") if l.startswith("data: ") and l != "data: [DONE]"
+    ]
+    chunks = [json.loads(l[6:]) for l in lines]
+    reasoning = "".join(
+        c["choices"][0]["delta"].get("reasoning_content", "") for c in chunks
+    )
+    content = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks)
+    assert reasoning == "The user greets me. I should reply."
+    assert content == "Yo! How can I help?"
+    assert "</think>" not in content
+
+
+def test_thinking_then_tool_call():
+    client, _, _ = make_thinking_client(
+        [
+            "Need the file.</think>",
+            '<tool_call>{"name": "read_file", "arguments": {"path": "/x"}}</tool_call>',
+        ]
+    )
+    r = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "read x"}], "tools": TOOLS},
+    )
+    choice = r.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["tool_calls"][0]["function"]["name"] == "read_file"
+    assert choice["message"]["reasoning_content"] == "Need the file."
+
+
+def test_no_think_model_untouched():
+    client, _, _ = make_tool_client(["Direct answer, no thinking."])
+    r = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+    )
+    msg = r.json()["choices"][0]["message"]
+    assert msg["content"] == "Direct answer, no thinking."
+    assert "reasoning_content" not in msg

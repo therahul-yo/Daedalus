@@ -34,6 +34,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from daedalus.cache.store import PrefixCacheStore
 from daedalus.engine import Engine, PrefillAborted
+from daedalus.reasoning import ThinkStreamFilter
 from daedalus.tools import make_stream_filter
 
 logger = logging.getLogger(__name__)
@@ -205,6 +206,22 @@ def create_app(
         request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
 
+        # Qwen3.5-style templates end the generation prompt inside an opened
+        # <think> block; if so, the model's first output is reasoning.
+        try:
+            tail = state.engine.tokenizer.decode(tokens[-8:])
+        except Exception:
+            tail = ""
+        prompt_in_think = tail.rstrip().endswith("<think>")
+
+        logger.info(
+            "→ %s · %d tok%s%s",
+            request_id[-6:],
+            len(tokens),
+            f" · {len(tools)} tools" if tools else "",
+            " · stream" if stream else "",
+        )
+
         gen = _Generation(
             state=state,
             tokens=tokens,
@@ -212,6 +229,8 @@ def create_app(
             temperature=temperature,
             top_p=top_p,
             tools=tools,
+            prompt_in_think=prompt_in_think,
+            rid=request_id[-6:],
         )
 
         if stream:
@@ -226,6 +245,8 @@ def create_app(
 
         result = await asyncio.to_thread(gen.run_to_completion)
         message: dict = {"role": "assistant", "content": result["text"] or None}
+        if result["reasoning"]:
+            message["reasoning_content"] = result["reasoning"]
         if result["tool_calls"]:
             # Response-format tool calls carry no "index" field.
             message["tool_calls"] = [
@@ -261,7 +282,15 @@ class _Generation:
     """
 
     def __init__(
-        self, state: ServerState, tokens, max_tokens, temperature, top_p, tools=None
+        self,
+        state: ServerState,
+        tokens,
+        max_tokens,
+        temperature,
+        top_p,
+        tools=None,
+        prompt_in_think=False,
+        rid="",
     ):
         self.state = state
         self.tokens = tokens
@@ -269,6 +298,8 @@ class _Generation:
         self.temperature = temperature
         self.top_p = top_p
         self.tools = tools
+        self.prompt_in_think = prompt_in_think
+        self.rid = rid
         self.events: "asyncio.Queue[dict]" = None  # set in stream()
         self.aborted = threading.Event()
         self.prefill_done = 0
@@ -290,12 +321,15 @@ class _Generation:
 
     def run_to_completion(self) -> dict:
         text_parts: List[str] = []
+        reasoning_parts: List[str] = []
         tool_calls: List[dict] = []
         finish_reason = "stop"
         usage = {}
         for event in self._run_engine():
             if event["type"] == "delta":
                 text_parts.append(event["text"])
+            elif event["type"] == "reasoning":
+                reasoning_parts.append(event["text"])
             elif event["type"] == "tool_calls":
                 tool_calls.extend(event["calls"])
             elif event["type"] == "done":
@@ -303,6 +337,7 @@ class _Generation:
                 usage = event["usage"]
         return {
             "text": "".join(text_parts),
+            "reasoning": "".join(reasoning_parts),
             "tool_calls": tool_calls,
             "finish_reason": "tool_calls" if tool_calls else finish_reason,
             "usage": usage,
@@ -313,6 +348,7 @@ class _Generation:
     def _run_engine(self):
         """Sync generator of events: prefill progress, text deltas, done."""
         state = self.state
+        t_start = time.monotonic()
         with state.lock:
             hit = state.store.fetch(self.tokens)
             if hit is not None:
@@ -320,20 +356,45 @@ class _Generation:
                 already = hit.matched_tokens
                 self.cached_tokens = already
                 logger.info(
-                    "cache hit: %d/%d tokens (%s)",
+                    "  %s · cache hit %d/%d tok (%s) — prefilling %d",
+                    self.rid,
                     already,
                     len(self.tokens),
                     hit.source,
+                    len(self.tokens) - already,
                 )
             else:
                 prompt_cache = state.engine.make_cache()
                 already = 0
+                logger.info(
+                    "  %s · cache miss — cold prefill %d tok",
+                    self.rid,
+                    len(self.tokens),
+                )
 
             last_checkpoint = already
+            last_progress_log = [time.monotonic()]
+
+            def progress_cb(done: int, total: int) -> None:
+                self.prefill_done = done
+                now = time.monotonic()
+                if now - last_progress_log[0] >= 5.0 and done < total:
+                    fresh = done - already
+                    elapsed = now - t_start
+                    rate = fresh / elapsed if elapsed > 0 else 0
+                    logger.info(
+                        "  %s · prefill %d/%d (%d%%) @ %.0f tok/s · thermal %s",
+                        self.rid,
+                        done,
+                        total,
+                        100 * done // max(total, 1),
+                        rate,
+                        state.engine.governor.effective_level.name,
+                    )
+                    last_progress_log[0] = now
 
             def checkpoint_cb(done: int, cache: List[Any]) -> None:
                 nonlocal last_checkpoint
-                self.prefill_done = done
                 if done >= len(self.tokens) - 1:
                     # End-of-prefill snapshot keyed by the prompt: for
                     # non-trimmable (hybrid) caches this is the only state
@@ -343,11 +404,42 @@ class _Generation:
                     state.store.checkpoint(self.tokens, done, cache)
                     last_checkpoint = done
 
+            think_filter = ThinkStreamFilter(
+                initially_thinking=self.prompt_in_think
+            )
             tool_filter = make_stream_filter(state.engine.tokenizer, self.tools)
             call_index = 0
             emitted_calls = False
             finish_reason = "stop"
             n_generated = 0
+            decode_tps = 0.0
+            t_first_token = None
+
+            def route(text):
+                """think-split, then tool-split the content half."""
+                nonlocal call_index, emitted_calls
+                reasoning, content = think_filter.feed(text)
+                events = []
+                if reasoning:
+                    events.append({"type": "reasoning", "text": reasoning})
+                if content:
+                    plain, calls = tool_filter.feed(content)
+                    if plain:
+                        events.append({"type": "delta", "text": plain})
+                    if calls:
+                        emitted_calls = True
+                        events.append(
+                            {
+                                "type": "tool_calls",
+                                "calls": [
+                                    c.as_openai(call_index + i)
+                                    for i, c in enumerate(calls)
+                                ],
+                            }
+                        )
+                        call_index += len(calls)
+                return events
+
             try:
                 for resp in state.engine.generate(
                     self.tokens,
@@ -356,36 +448,42 @@ class _Generation:
                     top_p=self.top_p,
                     prompt_cache=prompt_cache,
                     already_cached=already,
+                    progress_cb=progress_cb,
                     checkpoint_cb=checkpoint_cb,
                     should_abort=self.aborted.is_set,
                 ):
                     if self.aborted.is_set():
                         finish_reason = "abort"
                         break
+                    if t_first_token is None:
+                        t_first_token = time.monotonic()
                     if resp.text:
-                        content, calls = tool_filter.feed(resp.text)
-                        if content:
-                            yield {"type": "delta", "text": content}
-                        if calls:
-                            emitted_calls = True
-                            yield {
-                                "type": "tool_calls",
-                                "calls": [
-                                    c.as_openai(call_index + i)
-                                    for i, c in enumerate(calls)
-                                ],
-                            }
-                            call_index += len(calls)
+                        yield from route(resp.text)
                     n_generated = resp.generation_tokens
+                    decode_tps = resp.generation_tps
                     if resp.finish_reason is not None:
                         finish_reason = resp.finish_reason
             except PrefillAborted:
-                logger.info("prefill aborted at %d tokens", self.prefill_done)
+                logger.info(
+                    "  %s · prefill aborted at %d tok (client gone)",
+                    self.rid,
+                    self.prefill_done,
+                )
                 return
 
-            content, calls = tool_filter.finalize()
+            reasoning, content = think_filter.finalize()
+            if reasoning:
+                yield {"type": "reasoning", "text": reasoning}
             if content:
-                yield {"type": "delta", "text": content}
+                plain, calls = tool_filter.feed(content)
+                content_tail, tail_calls = tool_filter.finalize()
+                if plain or content_tail:
+                    yield {"type": "delta", "text": plain + content_tail}
+                calls = calls + tail_calls
+            else:
+                content_tail, calls = tool_filter.finalize()
+                if content_tail:
+                    yield {"type": "delta", "text": content_tail}
             if calls:
                 emitted_calls = True
                 yield {
@@ -397,6 +495,23 @@ class _Generation:
 
             if emitted_calls:
                 finish_reason = "tool_calls"
+
+            total_s = time.monotonic() - t_start
+            prefill_s = (t_first_token or time.monotonic()) - t_start
+            fresh = len(self.tokens) - already
+            logger.info(
+                "← %s · %.1fs · prefill %d tok %.1fs (%d cached) · "
+                "decode %d tok @ %.1f tok/s · thermal %s · finish=%s",
+                self.rid,
+                total_s,
+                fresh,
+                prefill_s,
+                already,
+                n_generated,
+                decode_tps,
+                state.engine.governor.effective_level.name,
+                finish_reason,
+            )
             yield {
                 "type": "done",
                 "finish_reason": finish_reason or "stop",
@@ -457,6 +572,17 @@ async def _stream_response(
             if event["type"] == "delta":
                 yield _sse(
                     _chunk(request_id, model, created, {"content": event["text"]})
+                )
+            elif event["type"] == "reasoning":
+                # DeepSeek/OpenAI-style reasoning delta: reasoning-aware
+                # clients render it dimmed; others ignore the field.
+                yield _sse(
+                    _chunk(
+                        request_id,
+                        model,
+                        created,
+                        {"reasoning_content": event["text"]},
+                    )
                 )
             elif event["type"] == "tool_calls" and event["calls"]:
                 # Guarded non-empty: an empty tool_calls array hangs OpenCode.
