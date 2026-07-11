@@ -1,4 +1,4 @@
-"""OpenAI-compatible server for airlift.
+"""OpenAI-compatible server for daedalus.
 
 Endpoints: /v1/chat/completions (SSE + non-stream), /v1/models, /health,
 /v1/cache/stats.
@@ -32,9 +32,9 @@ from typing import Any, AsyncGenerator, List, Optional
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from airlift.cache.store import PrefixCacheStore
-from airlift.engine import Engine, PrefillAborted
-from airlift.tools import make_stream_filter
+from daedalus.cache.store import PrefixCacheStore
+from daedalus.engine import Engine, PrefillAborted
+from daedalus.tools import make_stream_filter
 
 logger = logging.getLogger(__name__)
 
@@ -88,11 +88,11 @@ def _chunk(
 def create_app(
     engine: Engine, store: PrefixCacheStore, model_id: str
 ) -> FastAPI:
-    app = FastAPI(title="airlift")
+    app = FastAPI(title="daedalus")
     state = ServerState(
         engine=engine, store=store, model_id=model_id, lock=threading.Lock()
     )
-    app.state.airlift = state
+    app.state.daedalus = state
 
     @app.get("/health")
     def health():
@@ -110,7 +110,7 @@ def create_app(
                 {
                     "id": state.model_id,
                     "object": "model",
-                    "owned_by": "airlift",
+                    "owned_by": "daedalus",
                 }
             ],
         }

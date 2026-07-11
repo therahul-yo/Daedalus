@@ -5,7 +5,7 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
-from airlift.server import create_app
+from daedalus.server import create_app
 
 
 class FakeTokenizer:
@@ -81,7 +81,7 @@ class FakeStore:
     def fetch(self, tokens):
         key = tuple(tokens[:-1])
         if key in self.entries:
-            from airlift.cache.store import CacheHit
+            from daedalus.cache.store import CacheHit
 
             return CacheHit(
                 cache=["cached"], matched_tokens=len(tokens) - 1, source="ram"

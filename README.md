@@ -1,9 +1,9 @@
-# airlift
+# daedalus
 
 **A MacBook-Air-first MLX inference engine.** Local coding agents (OpenCode, Hermes Agent,
 Pi Code) send 10–40k-token first prompts; on a passively-cooled Air, prefilling that prompt
 is a multi-minute full-power GPU burn that thermally throttles the machine and times out the
-client. airlift is a local OpenAI-compatible server built on [mlx-lm](https://github.com/ml-explore/mlx-lm)
+client. daedalus is a local OpenAI-compatible server built on [mlx-lm](https://github.com/ml-explore/mlx-lm)
 that treats the Air's thermal envelope as a first-class scheduling constraint.
 
 ## Measured (M4 Air 16GB, Qwen3.5-9B MLX 4-bit)
@@ -62,10 +62,10 @@ streaming marker filter, so any model mlx-lm can parse tools for works here too.
 ## Usage
 
 ```bash
-airlift doctor                      # verify thermal sensor + mlx setup
-airlift serve --model mlx-community/Qwen3.5-9B-MLX-4bit --port 8080
+daedalus doctor                      # verify thermal sensor + mlx setup
+daedalus serve --model mlx-community/Qwen3.5-9B-MLX-4bit --port 8080
 # point any OpenAI-compatible agent at http://127.0.0.1:8080/v1
-airlift warm --model ... --prompts prompts.json   # pre-prefill while cool
+daedalus warm --model ... --prompts prompts.json   # pre-prefill while cool
 ```
 
 Target models: Qwen3.5-9B MLX 4-bit, Gemma 4 E4B / 12B MLX 4-bit — anything mlx-lm loads.

@@ -6,9 +6,9 @@ Usage: python bench/smoke.py [model_id] [prompt_tokens]
 import sys
 import time
 
-from airlift.engine import Engine
-from airlift.governor import ThermalGovernor
-from airlift.sensors import ThermalLevel, ThermalMonitor
+from daedalus.engine import Engine
+from daedalus.governor import ThermalGovernor
+from daedalus.sensors import ThermalLevel, ThermalMonitor
 
 MODEL = sys.argv[1] if len(sys.argv) > 1 else "mlx-community/Qwen3-0.6B-4bit"
 PROMPT_TOKENS = int(sys.argv[2]) if len(sys.argv) > 2 else 4000

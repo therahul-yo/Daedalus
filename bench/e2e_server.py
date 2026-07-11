@@ -77,7 +77,7 @@ def timed_request(label):
 
 def main():
     proc = subprocess.Popen(
-        [".venv/bin/python", "-m", "airlift.cli", "serve", "--model", MODEL,
+        [".venv/bin/python", "-m", "daedalus.cli", "serve", "--model", MODEL,
          "--port", str(PORT)],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,

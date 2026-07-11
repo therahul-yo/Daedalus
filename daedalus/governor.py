@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Mapping, Optional
 
-from airlift.sensors import ThermalLevel, ThermalMonitor
+from daedalus.sensors import ThermalLevel, ThermalMonitor
 
 
 @dataclass(frozen=True)

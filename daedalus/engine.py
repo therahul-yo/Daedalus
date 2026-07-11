@@ -1,4 +1,4 @@
-"""The airlift engine: thermally-paced chunked prefill + streamed decode.
+"""The daedalus engine: thermally-paced chunked prefill + streamed decode.
 
 Built on mlx-lm's public primitives (``model(tokens, cache=...)``,
 ``make_prompt_cache``, ``maybe_quantize_kv_cache``, ``stream_generate``) —
@@ -33,8 +33,8 @@ from mlx_lm.generate import (
 from mlx_lm.models import cache as cache_mod
 from mlx_lm.sample_utils import make_sampler
 
-from airlift.governor import ThermalGovernor
-from airlift.sensors import ThermalMonitor
+from daedalus.governor import ThermalGovernor
+from daedalus.sensors import ThermalMonitor
 
 
 class PrefillAborted(Exception):

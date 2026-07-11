@@ -3,9 +3,9 @@
 import mlx.core as mx
 import pytest
 
-from airlift.engine import Engine, EngineConfig, PrefillAborted
-from airlift.governor import GovernorConfig, LevelPolicy, ThermalGovernor
-from airlift.sensors import ThermalLevel, ThermalMonitor
+from daedalus.engine import Engine, EngineConfig, PrefillAborted
+from daedalus.governor import GovernorConfig, LevelPolicy, ThermalGovernor
+from daedalus.sensors import ThermalLevel, ThermalMonitor
 
 
 class FakeLayerCache:

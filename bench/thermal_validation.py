@@ -17,9 +17,9 @@ import json
 import time
 from pathlib import Path
 
-from airlift.engine import Engine, EngineConfig
-from airlift.governor import GovernorConfig, LevelPolicy, ThermalGovernor
-from airlift.sensors import ThermalLevel, ThermalMonitor
+from daedalus.engine import Engine, EngineConfig
+from daedalus.governor import GovernorConfig, LevelPolicy, ThermalGovernor
+from daedalus.sensors import ThermalLevel, ThermalMonitor
 
 WORDS = (
     "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima "

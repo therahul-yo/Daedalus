@@ -170,7 +170,7 @@ class ThermalMonitor:
     def start(self) -> "ThermalMonitor":
         if self._thread is None:
             self._thread = threading.Thread(
-                target=self._run, name="airlift-thermal", daemon=True
+                target=self._run, name="daedalus-thermal", daemon=True
             )
             self._thread.start()
         return self

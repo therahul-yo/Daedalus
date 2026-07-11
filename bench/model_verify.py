@@ -14,10 +14,10 @@ Checks, in order:
 import json
 import sys
 
-from airlift.engine import Engine, EngineConfig
-from airlift.governor import ThermalGovernor
-from airlift.sensors import ThermalMonitor
-from airlift.tools import make_stream_filter
+from daedalus.engine import Engine, EngineConfig
+from daedalus.governor import ThermalGovernor
+from daedalus.sensors import ThermalMonitor
+from daedalus.tools import make_stream_filter
 
 MODEL = sys.argv[1]
 

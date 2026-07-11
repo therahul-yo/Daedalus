@@ -9,7 +9,7 @@ import mlx.core as mx
 import pytest
 from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
 
-from airlift.cache.store import PrefixCacheStore
+from daedalus.cache.store import PrefixCacheStore
 
 
 def kv_cache_with(n_tokens: int) -> KVCache:

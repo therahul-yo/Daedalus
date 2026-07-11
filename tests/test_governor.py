@@ -1,5 +1,5 @@
-from airlift.governor import GovernorConfig, LevelPolicy, ThermalGovernor
-from airlift.sensors import ThermalLevel, ThermalMonitor
+from daedalus.governor import GovernorConfig, LevelPolicy, ThermalGovernor
+from daedalus.sensors import ThermalLevel, ThermalMonitor
 
 
 class FakeClock:

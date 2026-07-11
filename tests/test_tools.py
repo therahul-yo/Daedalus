@@ -1,6 +1,6 @@
 import json
 
-from airlift.tools import PassthroughFilter, ToolCallStreamFilter, make_stream_filter
+from daedalus.tools import PassthroughFilter, ToolCallStreamFilter, make_stream_filter
 
 
 def qwen_parser(text, tools=None):

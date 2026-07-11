@@ -1,4 +1,4 @@
-"""airlift CLI: serve, doctor, warm."""
+"""daedalus CLI: serve, doctor, warm."""
 
 from __future__ import annotations
 
@@ -10,11 +10,11 @@ import sys
 def cmd_serve(args) -> int:
     import uvicorn
 
-    from airlift.cache.store import PrefixCacheStore
-    from airlift.engine import Engine, EngineConfig
-    from airlift.governor import PROFILES, GovernorConfig, ThermalGovernor
-    from airlift.sensors import ThermalMonitor
-    from airlift.server import create_app
+    from daedalus.cache.store import PrefixCacheStore
+    from daedalus.engine import Engine, EngineConfig
+    from daedalus.governor import PROFILES, GovernorConfig, ThermalGovernor
+    from daedalus.sensors import ThermalMonitor
+    from daedalus.server import create_app
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     monitor = ThermalMonitor().start()
@@ -33,7 +33,7 @@ def cmd_serve(args) -> int:
     store = PrefixCacheStore(args.model)
     app = create_app(engine, store, model_id=args.model)
     print(
-        f"airlift serving {args.model} on http://{args.host}:{args.port}/v1"
+        f"daedalus serving {args.model} on http://{args.host}:{args.port}/v1"
         f" | thermal={monitor.level.name}",
         flush=True,
     )
@@ -45,7 +45,7 @@ def cmd_doctor(args) -> int:
     import platform
     import subprocess
 
-    from airlift.sensors import ThermalMonitor, make_pressure_reader
+    from daedalus.sensors import ThermalMonitor, make_pressure_reader
 
     hw = subprocess.run(
         ["sysctl", "-n", "machdep.cpu.brand_string", "hw.memsize"],
@@ -79,10 +79,10 @@ def cmd_warm(args) -> int:
     import json as _json
     from pathlib import Path
 
-    from airlift.cache.store import PrefixCacheStore
-    from airlift.engine import Engine, EngineConfig
-    from airlift.governor import ThermalGovernor
-    from airlift.sensors import ThermalMonitor
+    from daedalus.cache.store import PrefixCacheStore
+    from daedalus.engine import Engine, EngineConfig
+    from daedalus.governor import ThermalGovernor
+    from daedalus.sensors import ThermalMonitor
 
     monitor = ThermalMonitor().start()
     engine = Engine.from_pretrained(
@@ -114,7 +114,7 @@ def cmd_warm(args) -> int:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(prog="airlift")
+    ap = argparse.ArgumentParser(prog="daedalus")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     serve = sub.add_parser("serve", help="run the OpenAI-compatible server")

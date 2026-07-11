@@ -3,7 +3,7 @@ import time
 
 import pytest
 
-from airlift.sensors import ThermalLevel, ThermalMonitor, make_pressure_reader
+from daedalus.sensors import ThermalLevel, ThermalMonitor, make_pressure_reader
 
 is_macos = sys.platform == "darwin"
 

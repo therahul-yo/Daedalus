@@ -50,7 +50,7 @@ FORMAT_VERSION = 1
 
 
 def _default_cache_dir() -> Path:
-    return Path.home() / ".cache" / "airlift" / "prefix"
+    return Path.home() / ".cache" / "daedalus" / "prefix"
 
 
 def _sanitize_model_key(model_key: str) -> str:
@@ -287,7 +287,7 @@ class PrefixCacheStore:
                 str(tmp),
                 prompt_cache,
                 metadata={
-                    "airlift_format": str(FORMAT_VERSION),
+                    "daedalus_format": str(FORMAT_VERSION),
                     "model_key": self.model_key,
                     "n_tokens": str(len(tokens)),
                 },
