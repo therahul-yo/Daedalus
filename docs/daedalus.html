@@ -1,0 +1,445 @@
+<title>daedalus — wings that don't melt</title>
+<style>
+  :root {
+    --void: #0a0908;
+    --void-lift: #121110;
+    --card: #161412;
+    --ivory: #f3ece0;
+    --dim: #978d7f;
+    --amber: #f2a944;
+    --amber-hot: #ffc46b;
+    --ember: #d96f32;
+    --line: #262320;
+    --glow: rgba(242, 169, 68, 0.35);
+    --glow-soft: rgba(242, 169, 68, 0.12);
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--void);
+    color: var(--ivory);
+    font-family: "Avenir Next", "Avenir", "Helvetica Neue", system-ui, sans-serif;
+    font-size: 16.5px;
+    line-height: 1.65;
+    overflow-x: hidden;
+  }
+  .serif { font-family: "Didot", "Bodoni 72", "Playfair Display", Georgia, serif; }
+  pre, code { font-family: "SF Mono", Menlo, Monaco, monospace; }
+  pre { overflow-x: auto; }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 0 28px; }
+  ::selection { background: var(--amber); color: var(--void); }
+</style>
+<style>
+  /* ============ nav ============ */
+  nav {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 10;
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 20px 34px;
+    background: linear-gradient(var(--void) 30%, transparent);
+  }
+  .brand { font-size: 15px; letter-spacing: 0.34em; text-transform: uppercase; color: var(--ivory); }
+  .brand em { color: var(--amber); font-style: normal; }
+  nav .links { display: flex; gap: 28px; }
+  nav a { color: var(--dim); text-decoration: none; font-size: 13px; letter-spacing: 0.12em; text-transform: uppercase; transition: color 0.25s; }
+  nav a:hover, nav a:focus-visible { color: var(--amber-hot); outline: none; }
+
+  /* ============ hero ============ */
+  .hero {
+    min-height: 100svh;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    text-align: center;
+    position: relative;
+    padding: 90px 24px 60px;
+  }
+  .sun {
+    position: relative;
+    width: clamp(180px, 30vw, 300px);
+    height: clamp(180px, 30vw, 300px);
+    margin-bottom: 58px;
+  }
+  .sun .core {
+    position: absolute; inset: 18%;
+    border-radius: 50%;
+    background: radial-gradient(circle at 42% 38%, #fff3da 0%, var(--amber-hot) 34%, var(--ember) 78%, #7a3a16 100%);
+    box-shadow:
+      0 0 40px var(--glow),
+      0 0 120px var(--glow),
+      0 0 260px var(--glow-soft),
+      0 0 420px var(--glow-soft);
+    animation: pulse 7s ease-in-out infinite;
+  }
+  .sun .halo {
+    position: absolute; inset: 0;
+    border-radius: 50%;
+    border: 1px solid rgba(242, 169, 68, 0.18);
+    animation: halo 7s ease-in-out infinite;
+  }
+  .sun .halo.h2 { inset: -14%; border-color: rgba(242, 169, 68, 0.09); animation-delay: 1.2s; }
+  .sun .halo.h3 { inset: -30%; border-color: rgba(242, 169, 68, 0.05); animation-delay: 2.4s; }
+  @keyframes pulse { 0%,100% { transform: scale(1); } 50% { transform: scale(1.035); } }
+  @keyframes halo { 0%,100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.05); opacity: 0.6; } }
+  .wing-cross {
+    position: absolute;
+    top: 58%; left: -18%;
+    font-family: "SF Mono", Menlo, monospace;
+    font-size: 15px;
+    color: var(--ivory);
+    opacity: 0.85;
+    text-shadow: 0 0 14px rgba(243, 236, 224, 0.4);
+    animation: cross 16s linear infinite;
+    will-change: transform;
+  }
+  @keyframes cross {
+    0% { transform: translateX(0); }
+    100% { transform: translateX(calc(clamp(180px, 30vw, 300px) * 1.4 + 36vw)); }
+  }
+  .kicker {
+    font-size: 12px; letter-spacing: 0.42em; text-transform: uppercase;
+    color: var(--dim); margin-bottom: 26px;
+  }
+  h1 {
+    font-size: clamp(46px, 8.4vw, 96px);
+    font-weight: 400;
+    line-height: 1.04;
+    letter-spacing: 0.045em;
+    text-wrap: balance;
+  }
+  h1 .melt {
+    color: var(--amber);
+    text-shadow: 0 0 30px var(--glow), 0 0 90px var(--glow-soft);
+    font-style: italic;
+  }
+  .hero .sub {
+    margin: 30px auto 0; max-width: 56ch;
+    color: var(--dim); font-size: 17.5px; font-weight: 400;
+  }
+  .cta-row { margin-top: 44px; display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; }
+  .btn {
+    font: inherit; font-size: 13.5px; font-weight: 500;
+    letter-spacing: 0.18em; text-transform: uppercase;
+    padding: 15px 34px; cursor: pointer; text-decoration: none;
+    transition: all 0.25s ease;
+  }
+  .btn.solar {
+    color: var(--void); background: var(--amber);
+    box-shadow: 0 0 34px var(--glow);
+    border: 1px solid var(--amber);
+  }
+  .btn.solar:hover, .btn.solar:focus-visible {
+    background: var(--amber-hot); box-shadow: 0 0 60px var(--glow); outline: none;
+  }
+  .btn.night {
+    color: var(--ivory); background: transparent;
+    border: 1px solid var(--line);
+  }
+  .btn.night:hover, .btn.night:focus-visible { border-color: var(--amber); color: var(--amber-hot); outline: none; }
+  .scroll-hint {
+    position: absolute; bottom: 30px; left: 50%; transform: translateX(-50%);
+    color: var(--dim); font-size: 11px; letter-spacing: 0.4em; text-transform: uppercase;
+    animation: sink 2.6s ease-in-out infinite;
+  }
+  @keyframes sink { 0%,100% { transform: translate(-50%, 0); opacity: 0.55; } 50% { transform: translate(-50%, 8px); opacity: 1; } }
+
+  /* ============ sections ============ */
+  section { padding: 130px 0 20px; }
+  .eyebrow {
+    font-size: 11.5px; font-weight: 600; letter-spacing: 0.38em; text-transform: uppercase;
+    color: var(--amber); margin-bottom: 18px;
+  }
+  h2 {
+    font-size: clamp(30px, 4.6vw, 48px);
+    font-weight: 400; letter-spacing: 0.02em; line-height: 1.12;
+    margin-bottom: 16px; text-wrap: balance;
+  }
+  .lede { color: var(--dim); max-width: 60ch; font-size: 17px; margin-bottom: 46px; }
+
+  /* the flight — three acts */
+  .acts { display: grid; gap: 0; border-top: 1px solid var(--line); }
+  .act {
+    display: grid; grid-template-columns: 90px 220px 1fr; gap: 26px;
+    padding: 34px 6px; border-bottom: 1px solid var(--line);
+    align-items: baseline;
+  }
+  @media (max-width: 720px) { .act { grid-template-columns: 60px 1fr; } .act p { grid-column: 1 / -1; } }
+  .act .num { font-size: 30px; color: var(--line); font-weight: 300; }
+  .act h3 { font-size: 21px; font-weight: 500; letter-spacing: 0.02em; }
+  .act p { color: var(--dim); font-size: 15.5px; max-width: 56ch; }
+  .act.doom h3 { color: var(--ember); }
+  .act.doom .num { color: rgba(217, 111, 50, 0.4); }
+  .act.win h3 {
+    color: var(--amber);
+    text-shadow: 0 0 24px var(--glow-soft);
+  }
+  .act.win .num { color: var(--glow); }
+
+  /* ============ numbers ============ */
+  .constellation {
+    display: grid; grid-template-columns: repeat(2, 1fr);
+    gap: 1px; background: var(--line);
+    border: 1px solid var(--line);
+  }
+  @media (max-width: 640px) { .constellation { grid-template-columns: 1fr; } }
+  .star {
+    background: var(--void-lift);
+    padding: 52px 40px 44px;
+    text-align: center;
+  }
+  .star .n {
+    font-size: clamp(52px, 7.5vw, 84px);
+    font-weight: 400;
+    line-height: 1;
+    color: var(--ivory);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.01em;
+    opacity: 0.25;
+    transition: opacity 1.1s ease, text-shadow 1.1s ease, color 1.1s ease;
+  }
+  .star.lit .n {
+    opacity: 1;
+    color: var(--amber-hot);
+    text-shadow: 0 0 32px var(--glow), 0 0 100px var(--glow-soft);
+  }
+  .star .d { margin-top: 16px; color: var(--dim); font-size: 14px; max-width: 34ch; margin-inline: auto; }
+  .provenance { text-align: center; margin-top: 26px; color: var(--dim); font-size: 13px; }
+  .provenance code { background: var(--card); padding: 2px 8px; border-radius: 4px; font-size: 12px; }
+
+  /* ============ craft ============ */
+  .relics { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  @media (max-width: 700px) { .relics { grid-template-columns: 1fr; } }
+  .relic {
+    background: var(--card);
+    border: 1px solid var(--line);
+    padding: 34px 30px;
+    position: relative;
+    transition: border-color 0.3s;
+  }
+  .relic:hover { border-color: rgba(242, 169, 68, 0.4); }
+  .relic .myth {
+    font-size: 11px; letter-spacing: 0.3em; text-transform: uppercase;
+    color: var(--amber);
+  }
+  .relic h3 { font-size: 19px; font-weight: 500; margin: 12px 0 10px; letter-spacing: 0.01em; }
+  .relic p { color: var(--dim); font-size: 14.5px; }
+  .relic code { background: var(--void); padding: 1px 7px; border-radius: 4px; font-size: 12.5px; color: var(--ivory); }
+
+  /* ============ quickstart ============ */
+  .terminal {
+    background: #0d0c0b;
+    border: 1px solid var(--line);
+    box-shadow: 0 0 80px rgba(0,0,0,0.6), 0 0 50px var(--glow-soft);
+  }
+  .tbar { display: flex; gap: 8px; padding: 15px 20px; border-bottom: 1px solid var(--line); }
+  .tbar i { width: 10px; height: 10px; border-radius: 50%; background: var(--line); }
+  .tbar i:first-child { background: var(--ember); }
+  .terminal pre { padding: 26px 28px; font-size: 13.5px; line-height: 1.9; color: var(--ivory); }
+  .terminal .c { color: var(--dim); }
+  .terminal .p { color: var(--amber); }
+  .terminal .ok { color: var(--amber-hot); }
+
+  footer {
+    margin-top: 140px; padding: 44px 0 70px;
+    border-top: 1px solid var(--line);
+    text-align: center; color: var(--dim); font-size: 13.5px;
+  }
+  footer a { color: var(--amber); text-decoration: none; }
+  footer .ep { margin-top: 12px; font-size: 12px; font-style: italic; opacity: 0.7; }
+
+  .reveal { opacity: 0; transform: translateY(26px); transition: opacity 0.9s ease, transform 0.9s ease; }
+  .reveal.in { opacity: 1; transform: none; }
+  @media (prefers-reduced-motion: reduce) {
+    .reveal { opacity: 1; transform: none; transition: none; }
+    .sun .core, .sun .halo, .wing-cross, .scroll-hint { animation: none; }
+    .star .n { transition: none; }
+    html { scroll-behavior: auto; }
+  }
+</style>
+
+<nav>
+  <span class="brand">daedal<em>u</em>s</span>
+  <span class="links">
+    <a href="#flight">the flight</a>
+    <a href="#numbers">numbers</a>
+    <a href="#craft">craft</a>
+    <a href="#start">install</a>
+  </span>
+</nav>
+
+<div class="hero">
+  <div class="sun" aria-hidden="true">
+    <div class="halo"></div>
+    <div class="halo h2"></div>
+    <div class="halo h3"></div>
+    <div class="core"></div>
+    <span class="wing-cross">=›»</span>
+  </div>
+  <p class="kicker">a thermally-governed inference engine for macbook air</p>
+  <h1 class="serif">Wings that<br><span class="melt">don't melt</span></h1>
+  <p class="sub">Coding agents hurl twenty-thousand-token prompts at your fanless laptop. Other
+  engines fly straight into the sun. daedalus flies the middle path — it remembers every league
+  already flown, and paces the burns it cannot avoid.</p>
+  <div class="cta-row">
+    <a class="btn solar" href="#start">Begin the flight</a>
+    <a class="btn night" href="#numbers">The evidence</a>
+  </div>
+  <span class="scroll-hint" aria-hidden="true">descend</span>
+</div>
+
+<section class="wrap reveal" id="flight">
+  <p class="eyebrow">The oldest design document</p>
+  <h2 class="serif">Three ways to cross the Aegean</h2>
+  <p class="lede">Daedalus built wings of wax and feathers, and gave his son a single engineering
+  constraint: fly the middle course. Three thousand years later, it is still the correct thermal
+  policy.</p>
+  <div class="acts">
+    <div class="act doom">
+      <span class="num serif">I</span>
+      <h3 class="serif">Icarus flew high</h3>
+      <p>Full-power prefill, no pacing — every other MLX engine. The sun melts the wax: your Air
+      pins at HEAVY thermal pressure inside the first prompt, clocks throttle, and throughput
+      decays with every round. It never recovers mid-session.</p>
+    </div>
+    <div class="act doom">
+      <span class="num serif">II</span>
+      <h3 class="serif">Too low drowns</h3>
+      <p>Overcautious throttling wastes the sky. OpenCode kills any request at 300 seconds,
+      streamed or not — timidity without a cache is just a slower crash into the sea.</p>
+    </div>
+    <div class="act win">
+      <span class="num serif">III</span>
+      <h3 class="serif">Daedalus arrived</h3>
+      <p>Race while cool. Ease off as live thermal pressure rises. Never re-fly a league already
+      flown. Cool silicon runs faster when it runs — the middle path is the fast path.</p>
+    </div>
+  </div>
+</section>
+
+<section class="wrap reveal" id="numbers">
+  <p class="eyebrow">Measured on a real M4 Air, not promised</p>
+  <h2 class="serif">The evidence</h2>
+  <p class="lede">Qwen3.5-9B, 4-bit, passively-cooled M4 MacBook Air with 16 GB — the exact machine
+  this engine exists for. Numbers ignite as they enter the sky.</p>
+  <div class="constellation">
+    <div class="star">
+      <div class="n serif" data-count="218" data-suffix="×">0×</div>
+      <p class="d">faster time-to-first-token on a warm agent turn — 52.2 s cold → 0.24 s from the
+      persistent cache, surviving restarts</p>
+    </div>
+    <div class="star">
+      <div class="n serif" data-count="20" data-prefix="−" data-suffix="%">−0%</div>
+      <p class="d">total GPU time for identical work — pacing keeps silicon unthrottled, so the
+      same 80k tokens cost less burn</p>
+    </div>
+    <div class="star">
+      <div class="n serif" data-count="21" data-prefix="50→" data-suffix="%">50→50%</div>
+      <p class="d">of the run spent throttled at HEAVY pressure, governor off → on, four
+      back-to-back 20k-token prefills</p>
+    </div>
+    <div class="star">
+      <div class="n serif" data-count="157" data-suffix="">0</div>
+      <p class="d">tokens per second, sustained and undecaying — unpaced falls 133 → 119 and keeps
+      falling as the chassis heats</p>
+    </div>
+  </div>
+  <p class="provenance">Raw traces in <code>bench/results/</code> · reproduce with
+  <code>bench/thermal_validation.py</code></p>
+</section>
+
+<section class="wrap reveal" id="craft">
+  <p class="eyebrow">Τέχνη</p>
+  <h2 class="serif">Four inventions, one workshop</h2>
+  <p class="lede">Built on mlx-lm's public primitives — no monkey-patching, no forks to chase.</p>
+  <div class="relics">
+    <div class="relic">
+      <span class="myth">The Labyrinth</span>
+      <h3>A prefix cache that survives everything</h3>
+      <p>Your agent's giant system prompt is prefilled once, ever — persisted to disk as KV state
+      and recalled exactly on every later turn, across crashes and reboots. Correct even for
+      hybrid-attention models (Qwen3.5, Gemma 4) where stock servers silently miss every time.</p>
+    </div>
+    <div class="relic">
+      <span class="myth">The Thread</span>
+      <h3>Resumable prefill</h3>
+      <p>Checkpoints every 4k tokens. A timeout, a crash, or a client's hard deadline never sends
+      you back to the entrance — the retry picks up the thread exactly where it dropped.</p>
+    </div>
+    <div class="relic">
+      <span class="myth">The Middle Path</span>
+      <h3>The first thermal governor in local inference</h3>
+      <p>Reads macOS's five-level thermal-pressure signal live, no <code>sudo</code> — including
+      the two levels Apple's public API hides — and duty-cycles prefill against it. Three tempers:
+      <code>performance · balanced · cool</code>.</p>
+    </div>
+    <div class="relic">
+      <span class="myth">The Herald</span>
+      <h3>Keepalives and tool calls that never hang</h3>
+      <p>SSE heartbeats carry progress, thermal state, and ETA from the first second of a long
+      prefill. Tool calls stream as strict OpenAI deltas — indexed, never empty — so pi, OpenCode,
+      and every OpenAI-compatible agent simply work.</p>
+    </div>
+  </div>
+</section>
+
+<section class="wrap reveal" id="start">
+  <p class="eyebrow">Take flight</p>
+  <h2 class="serif">Three commands</h2>
+  <p class="lede">Apple Silicon · macOS 14+ · Python 3.12+</p>
+  <div class="terminal">
+    <div class="tbar" aria-hidden="true"><i></i><i></i><i></i></div>
+    <pre>
+<span class="c"># check the wings — thermal sensor, Metal, mlx</span>
+<span class="p">$</span> daedalus doctor
+<span class="ok">thermal pressure (no sudo): NOMINAL — OK
+doctor: all good</span>
+
+<span class="c"># serve any MLX model behind an OpenAI-compatible API</span>
+<span class="p">$</span> daedalus serve --model mlx-community/Qwen3.5-9B-MLX-4bit --port 8484
+
+<span class="c"># point pi, OpenCode, or any OpenAI-compatible agent at it</span>
+<span class="p">$</span> curl http://127.0.0.1:8484/v1/chat/completions \
+    -d '{"messages":[{"role":"user","content":"fly"}],"stream":true}'</pre>
+  </div>
+</section>
+
+<footer>
+  <p>daedalus · Apache-2.0 · built on <a href="https://github.com/ml-explore/mlx-lm">mlx-lm</a> ·
+  validated on a real MacBook Air</p>
+  <p class="ep">No wax was melted in the making of this engine.</p>
+</footer>
+
+<script>
+  const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  const io = new IntersectionObserver(
+    (es) => es.forEach((e) => e.isIntersecting && e.target.classList.add("in")),
+    { threshold: 0.1 }
+  );
+  document.querySelectorAll(".reveal").forEach((el) => io.observe(el));
+
+  // numbers ignite + count up when scrolled into view
+  const starIO = new IntersectionObserver(
+    (entries) => {
+      entries.forEach((entry) => {
+        if (!entry.isIntersecting) return;
+        const star = entry.target;
+        starIO.unobserve(star);
+        star.classList.add("lit");
+        const el = star.querySelector(".n");
+        const target = parseInt(el.dataset.count, 10);
+        const prefix = el.dataset.prefix || "";
+        const suffix = el.dataset.suffix || "";
+        if (reduced) { el.textContent = prefix + target + suffix; return; }
+        const t0 = performance.now(), dur = 1400;
+        function step(t) {
+          const k = Math.min(1, (t - t0) / dur);
+          const eased = 1 - Math.pow(1 - k, 3);
+          el.textContent = prefix + Math.round(target * eased) + suffix;
+          if (k < 1) requestAnimationFrame(step);
+        }
+        requestAnimationFrame(step);
+      });
+    },
+    { threshold: 0.5 }
+  );
+  document.querySelectorAll(".star").forEach((el) => starIO.observe(el));
+</script>
