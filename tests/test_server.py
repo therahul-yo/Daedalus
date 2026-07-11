@@ -320,6 +320,19 @@ def test_memory_guard_evicts_cache_then_rejects_when_still_over_limit():
     assert store.trimmed
 
 
+def test_server_enforces_prompt_and_completion_limits():
+    engine, store = FakeEngine(), FakeStore()
+    client = TestClient(create_app(
+        engine, store, model_id="test-model", max_prompt_tokens=10, max_completion_tokens=2
+    ))
+    assert client.post(
+        "/v1/chat/completions", json={"messages": [{"role": "user", "content": "long prompt"}], "max_tokens": 1}
+    ).status_code == 413
+    assert client.post(
+        "/v1/chat/completions", json={"messages": [{"role": "user", "content": "x"}], "max_tokens": 3}
+    ).status_code == 400
+
+
 TOOLS = [
     {
         "type": "function",

@@ -82,12 +82,15 @@ def cmd_serve(args) -> int:
         cache_key,
         max_ram_bytes=args.cache_ram_mb * 1024**2 if args.cache_ram_mb else None,
         max_disk_bytes=args.cache_disk_gb * 1024**3,
+        exclusive=True,
     )
     cache_stats = store.stats()
     app = create_app(
         engine, store, model_id=args.model, max_pending_requests=args.max_pending_requests,
         api_key=api_key,
         max_active_memory_bytes=args.max_active_memory_gb * 1024**3 if args.max_active_memory_gb else None,
+        max_prompt_tokens=args.max_prompt_tokens,
+        max_completion_tokens=args.max_completion_tokens,
     )
 
     bar = "─" * 62
@@ -169,7 +172,7 @@ def cmd_warm(args) -> int:
         args.model, kv_bits=args.kv_bits or None,
         tokenizer_id=getattr(engine.tokenizer, "name_or_path", args.model),
         model_revision=args.model_revision,
-    ))
+    ), exclusive=True)
 
     raw = Path(args.prompts).read_text()
     prompts = _json.loads(raw)  # [{"messages": [...]}, ...]
@@ -285,6 +288,8 @@ def main() -> int:
         "--max-active-memory-gb", type=float,
         help="reject new work after cache eviction if MLX active memory exceeds this limit",
     )
+    serve.add_argument("--max-prompt-tokens", type=int, default=65536)
+    serve.add_argument("--max-completion-tokens", type=int, default=4096)
     serve.add_argument("--kv-bits", type=int, default=8)
     serve.add_argument(
         "--prefill-chunk-tokens", type=int,
@@ -352,6 +357,8 @@ def main() -> int:
             ap.error("--prefill-chunk-tokens must be at least 128")
         if args.max_active_memory_gb is not None and args.max_active_memory_gb <= 0:
             ap.error("--max-active-memory-gb must be positive")
+        if args.max_prompt_tokens < 1 or args.max_completion_tokens < 1:
+            ap.error("token limits must be positive")
         if args.num_draft_tokens < 0:
             ap.error("--num-draft-tokens cannot be negative")
         if args.num_draft_tokens and not args.draft_model:

@@ -111,9 +111,16 @@ class Engine:
         model, tokenizer = load(model_path)
         draft_model = None
         if draft_model_path:
+            if not cache_mod.can_trim_prompt_cache(cache_mod.make_prompt_cache(model)):
+                raise ValueError(
+                    "speculative decoding requires trimmable prompt caches; "
+                    "this hybrid/sliding-window model is not compatible"
+                )
             draft_model, draft_tokenizer = load(draft_model_path)
             if draft_tokenizer.vocab_size != tokenizer.vocab_size:
                 raise ValueError("draft model tokenizer vocabulary does not match target model")
+            if not cache_mod.can_trim_prompt_cache(cache_mod.make_prompt_cache(draft_model)):
+                raise ValueError("draft model prompt cache is not trimmable")
         if governor is None:
             monitor = (monitor or ThermalMonitor()).start()
             governor = ThermalGovernor(monitor)

@@ -21,6 +21,7 @@ Single-user engine: one request at a time; a queue lock serializes access.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import hmac
 import json
 import logging
@@ -66,6 +67,8 @@ class ServerState:
     token_cache: "PromptTokenCache" = None
     head_cache: "SharedHeadIndex" = None
     max_active_memory_bytes: Optional[int] = None
+    max_prompt_tokens: int = 65536
+    max_completion_tokens: int = 4096
 
     def try_admit(self) -> bool:
         with self.admission_lock:
@@ -250,11 +253,15 @@ def create_app(
     api_key: Optional[str] = None,
     token_cache_entries: int = 256,
     max_active_memory_bytes: Optional[int] = None,
+    max_prompt_tokens: int = 65536,
+    max_completion_tokens: int = 4096,
 ) -> FastAPI:
     if max_pending_requests < 1:
         raise ValueError("max_pending_requests must be at least 1")
     if token_cache_entries < 1:
         raise ValueError("token_cache_entries must be at least 1")
+    if max_prompt_tokens < 1 or max_completion_tokens < 1:
+        raise ValueError("token limits must be positive")
     state = ServerState(
         engine=engine, store=store, model_id=model_id, lock=FifoLock(),
         max_pending_requests=max_pending_requests, api_key=api_key,
@@ -262,6 +269,8 @@ def create_app(
         token_cache=PromptTokenCache(token_cache_entries),
         head_cache=SharedHeadIndex(),
         max_active_memory_bytes=max_active_memory_bytes,
+        max_prompt_tokens=max_prompt_tokens,
+        max_completion_tokens=max_completion_tokens,
     )
 
     @asynccontextmanager
@@ -364,6 +373,8 @@ def create_app(
             return error("max_tokens, temperature, and top_p must be numeric", 400)
         if max_tokens < 1 or temperature < 0 or not 0 < top_p <= 1:
             return error("max_tokens must be positive, temperature non-negative, and top_p in (0, 1]", 400)
+        if max_tokens > state.max_completion_tokens:
+            return error(f"max_tokens exceeds server limit ({state.max_completion_tokens})", 400)
         tools = body.get("tools") or None
         if body.get("tool_choice") == "none":
             tools = None
@@ -375,6 +386,8 @@ def create_app(
             # opaque 500 the client silently retries.
             logger.warning("prompt build failed: %s", exc)
             return error(f"prompt could not be templated: {exc}", 400)
+        if len(tokens) > state.max_prompt_tokens:
+            return error(f"prompt exceeds server limit ({state.max_prompt_tokens} tokens)", 413)
         if not state.try_admit():
             state.metrics.inc_request("rejected")
             return error("server queue is full; retry shortly", 429, "rate_limit_error")
@@ -587,6 +600,10 @@ class _Generation:
         state = self.state
         t_start = time.monotonic()
         with state.lock:
+            # A client can disconnect while its FIFO ticket is waiting. It
+            # still releases its turn, but never starts cache/model work.
+            if self.aborted.is_set():
+                return
             hit = state.store.fetch(self.tokens)
             if hit is not None:
                 prompt_cache = hit.cache
@@ -803,24 +820,40 @@ async def _stream_response(
     request: Request,
 ) -> AsyncGenerator[str, None]:
     model = state.model_id
-    queue: asyncio.Queue = asyncio.Queue()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=64)
     loop = asyncio.get_running_loop()
+    closed = threading.Event()
+
+    def enqueue(event: dict) -> bool:
+        """Backpressure worker output instead of accumulating slow-client RAM."""
+        future = asyncio.run_coroutine_threadsafe(queue.put(event), loop)
+        while True:
+            try:
+                future.result(timeout=0.1)
+                return not closed.is_set()
+            except concurrent.futures.TimeoutError:
+                if closed.is_set():
+                    future.cancel()
+                    return False
 
     def worker():
         completed = False
         try:
             for event in gen._run_engine():
                 completed = completed or event["type"] == "done"
-                loop.call_soon_threadsafe(queue.put_nowait, event)
+                if not enqueue(event):
+                    break
         except Exception as exc:  # surface engine errors to the client
             logger.exception("engine error")
-            loop.call_soon_threadsafe(
-                queue.put_nowait, {"type": "error", "message": str(exc)}
-            )
+            enqueue({"type": "error", "message": str(exc)})
         finally:
             state.metrics.inc_request("completed" if completed else "cancelled")
+            # Idempotent slot release (leak fix from PR #4) + backpressured
+            # eof (bounded queue from PR #3): put_nowait could raise on a
+            # full queue, so eof goes through enqueue like every other event.
             gen.release_slot()
-            loop.call_soon_threadsafe(queue.put_nowait, {"type": "eof"})
+            if not closed.is_set():
+                enqueue({"type": "eof"})
 
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
@@ -888,5 +921,6 @@ async def _stream_response(
             elif event["type"] == "eof":
                 break
     finally:
+        closed.set()
         gen.aborted.set()
     yield "data: [DONE]\n\n"

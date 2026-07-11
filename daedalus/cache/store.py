@@ -114,10 +114,21 @@ class PrefixCacheStore:
         max_ram_bytes: Optional[int] = None,
         max_disk_bytes: int = 10 * 1024**3,
         min_persist_tokens: int = 1024,
+        exclusive: bool = False,
     ) -> None:
         self.model_key = model_key
         self.dir = (cache_dir or _default_cache_dir()) / _sanitize_model_key(model_key)
         self.dir.mkdir(parents=True, exist_ok=True)
+        self._process_lock = None
+        if exclusive:
+            import fcntl
+
+            self._process_lock = (self.dir / ".daedalus.lock").open("a+")
+            try:
+                fcntl.flock(self._process_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                self._process_lock.close()
+                raise RuntimeError(f"cache directory is already owned: {self.dir}")
         if max_ram_bytes is None:
             try:
                 import subprocess
@@ -148,6 +159,12 @@ class PrefixCacheStore:
         for token in tokens:
             node = node.children.setdefault(token, _TrieNode())
         node.keys.add(key)
+
+    def _rebuild_index(self) -> None:
+        """Drop stale trie paths after eviction, corruption, or cache clear."""
+        self._trie = _TrieNode()
+        for key, entry in self._entries.items():
+            self._index(key, entry.tokens)
 
     def _candidate_keys(self, tokens: List[int]) -> set[str]:
         """Only inspect entries sharing a token prefix with the request."""
@@ -266,6 +283,7 @@ class PrefixCacheStore:
             logger.warning("dropping unreadable cache entry %s: %s", entry.path, exc)
             with self._lock:
                 self._entries.pop(_tokens_digest(entry.tokens), None)
+                self._rebuild_index()
             if entry.path:
                 entry.path.unlink(missing_ok=True)
                 Path(str(entry.path) + ".json").unlink(missing_ok=True)
@@ -326,8 +344,13 @@ class PrefixCacheStore:
             self._evict_disk()
 
     def close(self, timeout: float = 10.0) -> None:
-        """Compatibility lifecycle hook; current persistence is stream-bound."""
-        return None
+        """Release the optional single-process cache ownership lock."""
+        if self._process_lock is not None:
+            import fcntl
+
+            fcntl.flock(self._process_lock.fileno(), fcntl.LOCK_UN)
+            self._process_lock.close()
+            self._process_lock = None
 
     def checkpoint(self, tokens: List[int], done: int, prompt_cache: List[Any]) -> None:
         """Persist the live cache state for ``tokens[:done]`` (no deep copy in
@@ -439,6 +462,7 @@ class PrefixCacheStore:
                 entry.nbytes = 0
                 if entry.path is None:
                     self._entries.pop(_tokens_digest(entry.tokens), None)
+            self._rebuild_index()
 
     def _evict_disk(self) -> None:
         files = sorted(
@@ -458,6 +482,8 @@ class PrefixCacheStore:
                         self._entries.pop(key, None)
                     else:
                         entry.path = None
+        with self._lock:
+            self._rebuild_index()
 
     # ---------------------------------------------------------------- stats
 
@@ -480,6 +506,7 @@ class PrefixCacheStore:
         with self._lock:
             count = len(self._entries)
             self._entries.clear()
+            self._rebuild_index()
             self.hits = 0
             self.misses = 0
         for path in self.dir.glob("*.safetensors"):
@@ -502,4 +529,5 @@ class PrefixCacheStore:
                 entry.nbytes = 0
                 if entry.path is None:
                     self._entries.pop(_tokens_digest(entry.tokens), None)
+            self._rebuild_index()
             return before - total
