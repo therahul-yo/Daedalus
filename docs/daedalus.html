@@ -1,445 +1,659 @@
-<title>daedalus — wings that don't melt</title>
+<title>DAEDALUS — wings that don't melt</title>
 <style>
   :root {
-    --void: #0a0908;
-    --void-lift: #121110;
-    --card: #161412;
-    --ivory: #f3ece0;
-    --dim: #978d7f;
-    --amber: #f2a944;
-    --amber-hot: #ffc46b;
-    --ember: #d96f32;
-    --line: #262320;
-    --glow: rgba(242, 169, 68, 0.35);
-    --glow-soft: rgba(242, 169, 68, 0.12);
+    --black: #000000;
+    --panel: #0a0a0a;
+    --ink: #e8e8e8;
+    --dim: #7a7a7a;
+    --amber: #ffb000;
+    --orange: #ff6a00;
+    --red: #ff3355;
+    --teal: #00e5c7;
+    --green: #3dff8c;
+    --border: #2a2a2a;
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html { scroll-behavior: smooth; }
   body {
-    background: var(--void);
-    color: var(--ivory);
-    font-family: "Avenir Next", "Avenir", "Helvetica Neue", system-ui, sans-serif;
-    font-size: 16.5px;
-    line-height: 1.65;
+    background: var(--black);
+    color: var(--ink);
+    font-family: "SF Mono", Menlo, Monaco, "Courier New", monospace;
+    font-size: 14px;
+    line-height: 1.7;
     overflow-x: hidden;
   }
-  .serif { font-family: "Didot", "Bodoni 72", "Playfair Display", Georgia, serif; }
-  pre, code { font-family: "SF Mono", Menlo, Monaco, monospace; }
+  /* CRT scanlines over everything, very faint */
+  body::after {
+    content: "";
+    position: fixed; inset: 0; z-index: 99; pointer-events: none;
+    background: repeating-linear-gradient(
+      0deg, transparent 0 2px, rgba(255, 255, 255, 0.015) 2px 4px
+    );
+  }
+  canvas { image-rendering: pixelated; display: block; }
   pre { overflow-x: auto; }
-  .wrap { max-width: 900px; margin: 0 auto; padding: 0 28px; }
-  ::selection { background: var(--amber); color: var(--void); }
-</style>
-<style>
+  .wrap { max-width: 880px; margin: 0 auto; padding: 0 22px; }
+  ::selection { background: var(--amber); color: var(--black); }
+  a { color: var(--teal); text-decoration: none; }
+  a:hover, a:focus-visible { background: var(--teal); color: var(--black); outline: none; }
+
   /* ============ nav ============ */
   nav {
-    position: fixed; top: 0; left: 0; right: 0; z-index: 10;
     display: flex; justify-content: space-between; align-items: center;
-    padding: 20px 34px;
-    background: linear-gradient(var(--void) 30%, transparent);
+    padding: 18px 26px;
+    border-bottom: 2px solid var(--border);
   }
-  .brand { font-size: 15px; letter-spacing: 0.34em; text-transform: uppercase; color: var(--ivory); }
-  .brand em { color: var(--amber); font-style: normal; }
-  nav .links { display: flex; gap: 28px; }
-  nav a { color: var(--dim); text-decoration: none; font-size: 13px; letter-spacing: 0.12em; text-transform: uppercase; transition: color 0.25s; }
-  nav a:hover, nav a:focus-visible { color: var(--amber-hot); outline: none; }
+  .brand { color: var(--amber); font-weight: 700; letter-spacing: 0.2em; font-size: 13px; }
+  nav .links { display: flex; gap: 20px; font-size: 12px; }
+  nav .links a { color: var(--dim); padding: 2px 6px; }
+  nav .links a:hover { color: var(--black); background: var(--amber); }
 
   /* ============ hero ============ */
   .hero {
-    min-height: 100svh;
-    display: flex; flex-direction: column;
-    align-items: center; justify-content: center;
     text-align: center;
+    padding: 64px 20px 30px;
     position: relative;
-    padding: 90px 24px 60px;
   }
-  .sun {
-    position: relative;
-    width: clamp(180px, 30vw, 300px);
-    height: clamp(180px, 30vw, 300px);
-    margin-bottom: 58px;
+  #sunCanvas { margin: 0 auto 8px; }
+  .skyband {
+    position: relative; height: 60px; max-width: 640px; margin: 0 auto;
+    overflow: hidden;
   }
-  .sun .core {
-    position: absolute; inset: 18%;
-    border-radius: 50%;
-    background: radial-gradient(circle at 42% 38%, #fff3da 0%, var(--amber-hot) 34%, var(--ember) 78%, #7a3a16 100%);
-    box-shadow:
-      0 0 40px var(--glow),
-      0 0 120px var(--glow),
-      0 0 260px var(--glow-soft),
-      0 0 420px var(--glow-soft);
-    animation: pulse 7s ease-in-out infinite;
+  #wingCanvas {
+    position: absolute; top: 12px; left: -64px;
+    animation: fly 11s steps(56) infinite;
   }
-  .sun .halo {
-    position: absolute; inset: 0;
-    border-radius: 50%;
-    border: 1px solid rgba(242, 169, 68, 0.18);
-    animation: halo 7s ease-in-out infinite;
+  @keyframes fly { from { left: -64px; } to { left: 100%; } }
+  .seaband { color: #23406e; font-size: 12px; letter-spacing: 4px; user-select: none; line-height: 1.4; }
+  #titleCanvas { margin: 34px auto 0; max-width: 92%; height: auto; }
+  #tagCanvas { margin: 14px auto 0; max-width: 88%; height: auto; }
+  .cursor {
+    display: inline-block; width: 12px; height: 22px;
+    background: var(--amber); vertical-align: text-bottom;
+    animation: blink 1s steps(2) infinite;
   }
-  .sun .halo.h2 { inset: -14%; border-color: rgba(242, 169, 68, 0.09); animation-delay: 1.2s; }
-  .sun .halo.h3 { inset: -30%; border-color: rgba(242, 169, 68, 0.05); animation-delay: 2.4s; }
-  @keyframes pulse { 0%,100% { transform: scale(1); } 50% { transform: scale(1.035); } }
-  @keyframes halo { 0%,100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.05); opacity: 0.6; } }
-  .wing-cross {
-    position: absolute;
-    top: 58%; left: -18%;
-    font-family: "SF Mono", Menlo, monospace;
-    font-size: 15px;
-    color: var(--ivory);
-    opacity: 0.85;
-    text-shadow: 0 0 14px rgba(243, 236, 224, 0.4);
-    animation: cross 16s linear infinite;
-    will-change: transform;
-  }
-  @keyframes cross {
-    0% { transform: translateX(0); }
-    100% { transform: translateX(calc(clamp(180px, 30vw, 300px) * 1.4 + 36vw)); }
-  }
-  .kicker {
-    font-size: 12px; letter-spacing: 0.42em; text-transform: uppercase;
-    color: var(--dim); margin-bottom: 26px;
-  }
-  h1 {
-    font-size: clamp(46px, 8.4vw, 96px);
-    font-weight: 400;
-    line-height: 1.04;
-    letter-spacing: 0.045em;
-    text-wrap: balance;
-  }
-  h1 .melt {
-    color: var(--amber);
-    text-shadow: 0 0 30px var(--glow), 0 0 90px var(--glow-soft);
-    font-style: italic;
-  }
+  @keyframes blink { 50% { opacity: 0; } }
   .hero .sub {
-    margin: 30px auto 0; max-width: 56ch;
-    color: var(--dim); font-size: 17.5px; font-weight: 400;
+    margin: 26px auto 0; max-width: 62ch; color: var(--dim); font-size: 13.5px;
   }
-  .cta-row { margin-top: 44px; display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; }
-  .btn {
-    font: inherit; font-size: 13.5px; font-weight: 500;
-    letter-spacing: 0.18em; text-transform: uppercase;
-    padding: 15px 34px; cursor: pointer; text-decoration: none;
-    transition: all 0.25s ease;
+  .hero .sub b { color: var(--ink); font-weight: 400; }
+  .cta-row { margin-top: 34px; display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+  .pxbtn {
+    font: inherit; font-size: 13px; font-weight: 700;
+    letter-spacing: 0.1em; text-transform: uppercase;
+    padding: 13px 26px; cursor: pointer; text-decoration: none;
+    border: 0; position: relative;
+    box-shadow: 0 4px 0 0 #7a5500, 4px 0 0 0 #7a5500, 4px 4px 0 0 #7a5500;
+    background: var(--amber); color: var(--black);
+    transition: transform 0.05s;
   }
-  .btn.solar {
-    color: var(--void); background: var(--amber);
-    box-shadow: 0 0 34px var(--glow);
-    border: 1px solid var(--amber);
+  .pxbtn:hover, .pxbtn:focus-visible { transform: translate(2px, 2px); box-shadow: 0 2px 0 0 #7a5500, 2px 0 0 0 #7a5500, 2px 2px 0 0 #7a5500; outline: none; }
+  .pxbtn.alt {
+    background: var(--black); color: var(--teal);
+    box-shadow: inset 0 0 0 2px var(--teal), 0 4px 0 0 #00584c, 4px 0 0 0 #00584c, 4px 4px 0 0 #00584c;
   }
-  .btn.solar:hover, .btn.solar:focus-visible {
-    background: var(--amber-hot); box-shadow: 0 0 60px var(--glow); outline: none;
-  }
-  .btn.night {
-    color: var(--ivory); background: transparent;
-    border: 1px solid var(--line);
-  }
-  .btn.night:hover, .btn.night:focus-visible { border-color: var(--amber); color: var(--amber-hot); outline: none; }
-  .scroll-hint {
-    position: absolute; bottom: 30px; left: 50%; transform: translateX(-50%);
-    color: var(--dim); font-size: 11px; letter-spacing: 0.4em; text-transform: uppercase;
-    animation: sink 2.6s ease-in-out infinite;
-  }
-  @keyframes sink { 0%,100% { transform: translate(-50%, 0); opacity: 0.55; } 50% { transform: translate(-50%, 8px); opacity: 1; } }
+  .pxbtn.alt:hover, .pxbtn.alt:focus-visible { box-shadow: inset 0 0 0 2px var(--teal), 0 2px 0 0 #00584c, 2px 0 0 0 #00584c, 2px 2px 0 0 #00584c; }
 
   /* ============ sections ============ */
-  section { padding: 130px 0 20px; }
-  .eyebrow {
-    font-size: 11.5px; font-weight: 600; letter-spacing: 0.38em; text-transform: uppercase;
-    color: var(--amber); margin-bottom: 18px;
-  }
-  h2 {
-    font-size: clamp(30px, 4.6vw, 48px);
-    font-weight: 400; letter-spacing: 0.02em; line-height: 1.12;
-    margin-bottom: 16px; text-wrap: balance;
-  }
-  .lede { color: var(--dim); max-width: 60ch; font-size: 17px; margin-bottom: 46px; }
+  section { padding: 84px 0 8px; }
+  .sec-head { display: flex; align-items: center; gap: 14px; margin-bottom: 8px; }
+  .sec-head .icon-cv { flex: 0 0 auto; }
+  .eyebrow { color: var(--dim); font-size: 11px; letter-spacing: 0.28em; text-transform: uppercase; margin-bottom: 10px; }
+  h2 { font-size: 20px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--amber); }
+  h2.teal { color: var(--teal); }
+  .lede { color: var(--dim); max-width: 62ch; margin: 12px 0 34px; font-size: 13.5px; }
 
-  /* the flight — three acts */
-  .acts { display: grid; gap: 0; border-top: 1px solid var(--line); }
-  .act {
-    display: grid; grid-template-columns: 90px 220px 1fr; gap: 26px;
-    padding: 34px 6px; border-bottom: 1px solid var(--line);
-    align-items: baseline;
+  /* quest log (myth) */
+  .quests { display: grid; gap: 14px; }
+  .quest {
+    display: grid; grid-template-columns: 74px 1fr; gap: 18px;
+    border: 2px solid var(--border);
+    background: var(--panel);
+    padding: 20px;
+    align-items: center;
   }
-  @media (max-width: 720px) { .act { grid-template-columns: 60px 1fr; } .act p { grid-column: 1 / -1; } }
-  .act .num { font-size: 30px; color: var(--line); font-weight: 300; }
-  .act h3 { font-size: 21px; font-weight: 500; letter-spacing: 0.02em; }
-  .act p { color: var(--dim); font-size: 15.5px; max-width: 56ch; }
-  .act.doom h3 { color: var(--ember); }
-  .act.doom .num { color: rgba(217, 111, 50, 0.4); }
-  .act.win h3 {
-    color: var(--amber);
-    text-shadow: 0 0 24px var(--glow-soft);
+  .quest .art { width: 64px; height: 64px; }
+  .quest h3 { font-size: 14px; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 6px; }
+  .quest p { color: var(--dim); font-size: 13px; }
+  .quest .status { font-size: 11px; letter-spacing: 0.12em; margin-top: 8px; display: inline-block; padding: 2px 8px; }
+  .quest.fail h3 { color: var(--red); }
+  .quest.fail .status { background: var(--red); color: var(--black); }
+  .quest.win { border-color: var(--teal); }
+  .quest.win h3 { color: var(--teal); }
+  .quest.win .status { background: var(--teal); color: var(--black); }
+
+  /* ============ demo ============ */
+  .demo {
+    border: 2px solid var(--border); background: var(--panel);
+    padding: 22px;
   }
-  .act.win .num { color: var(--glow); }
+  .demo-top { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
+  .demo-title { font-size: 11px; color: var(--dim); letter-spacing: 0.14em; }
+  .demo .ctrls { display: flex; gap: 10px; }
+  .demo button {
+    font: inherit; font-size: 11.5px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.08em; padding: 9px 16px; cursor: pointer; border: 2px solid var(--border);
+    background: var(--black); color: var(--ink);
+  }
+  .demo button:hover, .demo button:focus-visible { border-color: var(--ink); outline: none; }
+  .demo button.on { background: var(--teal); border-color: var(--teal); color: var(--black); }
+  .demo button.off { background: var(--red); border-color: var(--red); color: var(--black); }
+  .demo button.go { background: var(--amber); border-color: var(--amber); color: var(--black); }
+  #heat { display: flex; gap: 4px; height: 44px; align-items: flex-end; margin-bottom: 16px; }
+  #heat i { flex: 1; min-width: 5px; background: #1b1b1b; height: 18%; }
+  #heat i.done { background: var(--teal); height: 55%; }
+  #heat i.warm { background: var(--amber); height: 72%; }
+  #heat i.hot  { background: var(--orange); height: 88%; }
+  #heat i.sear { background: var(--red); height: 100%; }
+  #heat i.rest { background: #145f56; height: 38%; }
+  .readout { display: flex; gap: 20px; flex-wrap: wrap; font-size: 12px; align-items: center; }
+  .readout .lbl { color: var(--dim); }
+  .readout b { font-variant-numeric: tabular-nums; font-weight: 700; }
+  .chip { padding: 2px 10px; font-size: 11px; font-weight: 700; letter-spacing: 0.08em; }
+  .chip.NOMINAL { background: var(--green); color: var(--black); }
+  .chip.MODERATE { background: var(--amber); color: var(--black); }
+  .chip.HEAVY { background: var(--red); color: var(--black); }
+  .demo-note { margin-top: 14px; font-size: 12px; color: var(--dim); }
 
   /* ============ numbers ============ */
-  .constellation {
-    display: grid; grid-template-columns: repeat(2, 1fr);
-    gap: 1px; background: var(--line);
-    border: 1px solid var(--line);
+  .scores { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
+  @media (max-width: 640px) { .scores { grid-template-columns: 1fr; } }
+  .score {
+    border: 2px solid var(--border); background: var(--panel);
+    padding: 26px 22px; text-align: center;
   }
-  @media (max-width: 640px) { .constellation { grid-template-columns: 1fr; } }
-  .star {
-    background: var(--void-lift);
-    padding: 52px 40px 44px;
-    text-align: center;
-  }
-  .star .n {
-    font-size: clamp(52px, 7.5vw, 84px);
-    font-weight: 400;
-    line-height: 1;
-    color: var(--ivory);
-    font-variant-numeric: tabular-nums;
-    letter-spacing: 0.01em;
-    opacity: 0.25;
-    transition: opacity 1.1s ease, text-shadow 1.1s ease, color 1.1s ease;
-  }
-  .star.lit .n {
-    opacity: 1;
-    color: var(--amber-hot);
-    text-shadow: 0 0 32px var(--glow), 0 0 100px var(--glow-soft);
-  }
-  .star .d { margin-top: 16px; color: var(--dim); font-size: 14px; max-width: 34ch; margin-inline: auto; }
-  .provenance { text-align: center; margin-top: 26px; color: var(--dim); font-size: 13px; }
-  .provenance code { background: var(--card); padding: 2px 8px; border-radius: 4px; font-size: 12px; }
+  .score canvas { margin: 0 auto 12px; max-width: 100%; height: auto; }
+  .score p { color: var(--dim); font-size: 12.5px; max-width: 36ch; margin: 0 auto; }
+  .hiscore { text-align: center; margin-top: 20px; color: var(--dim); font-size: 12px; letter-spacing: 0.1em; }
+  .hiscore code { color: var(--teal); }
 
-  /* ============ craft ============ */
-  .relics { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
-  @media (max-width: 700px) { .relics { grid-template-columns: 1fr; } }
-  .relic {
-    background: var(--card);
-    border: 1px solid var(--line);
-    padding: 34px 30px;
-    position: relative;
-    transition: border-color 0.3s;
+  /* ============ inventory (features) ============ */
+  .inv { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 700px) { .inv { grid-template-columns: 1fr; } }
+  .item {
+    border: 2px solid var(--border); background: var(--panel);
+    padding: 22px; display: grid; grid-template-columns: 44px 1fr; gap: 16px;
   }
-  .relic:hover { border-color: rgba(242, 169, 68, 0.4); }
-  .relic .myth {
-    font-size: 11px; letter-spacing: 0.3em; text-transform: uppercase;
-    color: var(--amber);
-  }
-  .relic h3 { font-size: 19px; font-weight: 500; margin: 12px 0 10px; letter-spacing: 0.01em; }
-  .relic p { color: var(--dim); font-size: 14.5px; }
-  .relic code { background: var(--void); padding: 1px 7px; border-radius: 4px; font-size: 12.5px; color: var(--ivory); }
+  .item .art { width: 40px; height: 40px; margin-top: 3px; }
+  .item .slot { font-size: 10.5px; letter-spacing: 0.24em; text-transform: uppercase; color: var(--amber); }
+  .item h3 { font-size: 13.5px; text-transform: uppercase; letter-spacing: 0.05em; margin: 6px 0; }
+  .item p { color: var(--dim); font-size: 12.5px; }
+  .item code { color: var(--teal); font-size: 12px; }
 
-  /* ============ quickstart ============ */
-  .terminal {
-    background: #0d0c0b;
-    border: 1px solid var(--line);
-    box-shadow: 0 0 80px rgba(0,0,0,0.6), 0 0 50px var(--glow-soft);
+  /* ============ start ============ */
+  .term {
+    border: 2px solid var(--border); background: var(--panel);
   }
-  .tbar { display: flex; gap: 8px; padding: 15px 20px; border-bottom: 1px solid var(--line); }
-  .tbar i { width: 10px; height: 10px; border-radius: 50%; background: var(--line); }
-  .tbar i:first-child { background: var(--ember); }
-  .terminal pre { padding: 26px 28px; font-size: 13.5px; line-height: 1.9; color: var(--ivory); }
-  .terminal .c { color: var(--dim); }
-  .terminal .p { color: var(--amber); }
-  .terminal .ok { color: var(--amber-hot); }
+  .term-bar {
+    padding: 10px 16px; border-bottom: 2px solid var(--border);
+    color: var(--dim); font-size: 11px; letter-spacing: 0.14em;
+    display: flex; justify-content: space-between;
+  }
+  .term pre { padding: 22px; font-size: 13px; line-height: 2.0; }
+  .term .c { color: var(--dim); }
+  .term .p { color: var(--amber); }
+  .term .ok { color: var(--green); }
 
   footer {
-    margin-top: 140px; padding: 44px 0 70px;
-    border-top: 1px solid var(--line);
-    text-align: center; color: var(--dim); font-size: 13.5px;
+    margin-top: 100px; border-top: 2px solid var(--border);
+    padding: 34px 22px 60px; text-align: center; color: var(--dim); font-size: 12px;
   }
-  footer a { color: var(--amber); text-decoration: none; }
-  footer .ep { margin-top: 12px; font-size: 12px; font-style: italic; opacity: 0.7; }
+  footer .ep { margin-top: 10px; font-size: 11px; }
+  #footWing { margin: 0 auto 18px; }
 
-  .reveal { opacity: 0; transform: translateY(26px); transition: opacity 0.9s ease, transform 0.9s ease; }
+  .reveal { opacity: 0; transform: translateY(14px); transition: opacity 0.5s steps(5), transform 0.5s steps(5); }
   .reveal.in { opacity: 1; transform: none; }
   @media (prefers-reduced-motion: reduce) {
     .reveal { opacity: 1; transform: none; transition: none; }
-    .sun .core, .sun .halo, .wing-cross, .scroll-hint { animation: none; }
-    .star .n { transition: none; }
+    #wingCanvas { animation: none; left: 45%; }
+    .cursor { animation: none; }
     html { scroll-behavior: auto; }
   }
 </style>
 
 <nav>
-  <span class="brand">daedal<em>u</em>s</span>
+  <span class="brand">▓▓ DAEDALUS</span>
   <span class="links">
-    <a href="#flight">the flight</a>
-    <a href="#numbers">numbers</a>
-    <a href="#craft">craft</a>
-    <a href="#start">install</a>
+    <a href="#myth">[myth]</a>
+    <a href="#demo">[demo]</a>
+    <a href="#score">[score]</a>
+    <a href="#start">[start]</a>
   </span>
 </nav>
 
 <div class="hero">
-  <div class="sun" aria-hidden="true">
-    <div class="halo"></div>
-    <div class="halo h2"></div>
-    <div class="halo h3"></div>
-    <div class="core"></div>
-    <span class="wing-cross">=›»</span>
+  <canvas id="sunCanvas" width="0" height="0" aria-hidden="true"></canvas>
+  <div class="skyband" aria-hidden="true">
+    <canvas id="wingCanvas" width="0" height="0"></canvas>
   </div>
-  <p class="kicker">a thermally-governed inference engine for macbook air</p>
-  <h1 class="serif">Wings that<br><span class="melt">don't melt</span></h1>
-  <p class="sub">Coding agents hurl twenty-thousand-token prompts at your fanless laptop. Other
-  engines fly straight into the sun. daedalus flies the middle path — it remembers every league
-  already flown, and paces the burns it cannot avoid.</p>
+  <pre class="seaband" aria-hidden="true">▁▂▁ ▂▁▂ ▁▂▁ ▂▁▂ ▁▂▁ ▂▁▂ ▁▂▁ ▂▁▂ ▁▂▁ ▂▁▂ ▁▂▁</pre>
+
+  <canvas id="titleCanvas" aria-label="DAEDALUS"></canvas>
+  <div><canvas id="tagCanvas" aria-label="WINGS THAT DON'T MELT"></canvas><span class="cursor" aria-hidden="true"></span></div>
+
+  <p class="sub">A thermally-governed MLX inference engine for MacBook Air.
+  Coding agents fire <b>20,000-token prompts</b> at your fanless laptop — other engines fly
+  straight into the sun. daedalus <b>caches every league already flown</b> and
+  <b>paces the burns</b> it can't avoid.</p>
   <div class="cta-row">
-    <a class="btn solar" href="#start">Begin the flight</a>
-    <a class="btn night" href="#numbers">The evidence</a>
+    <a class="pxbtn" href="#start">▶ press start</a>
+    <a class="pxbtn alt" href="#score">view hi-score</a>
   </div>
-  <span class="scroll-hint" aria-hidden="true">descend</span>
 </div>
 
-<section class="wrap reveal" id="flight">
-  <p class="eyebrow">The oldest design document</p>
-  <h2 class="serif">Three ways to cross the Aegean</h2>
-  <p class="lede">Daedalus built wings of wax and feathers, and gave his son a single engineering
-  constraint: fly the middle course. Three thousand years later, it is still the correct thermal
-  policy.</p>
-  <div class="acts">
-    <div class="act doom">
-      <span class="num serif">I</span>
-      <h3 class="serif">Icarus flew high</h3>
-      <p>Full-power prefill, no pacing — every other MLX engine. The sun melts the wax: your Air
-      pins at HEAVY thermal pressure inside the first prompt, clocks throttle, and throughput
-      decays with every round. It never recovers mid-session.</p>
+<section class="wrap reveal" id="myth">
+  <p class="eyebrow">// select your pilot</p>
+  <h2>Three ways to cross the Aegean</h2>
+  <p class="lede">The oldest thermal-management document in history. Daedalus gave one engineering
+  constraint: fly the middle course.</p>
+  <div class="quests">
+    <div class="quest fail">
+      <canvas class="art" data-sprite="icarus" aria-hidden="true"></canvas>
+      <div>
+        <h3>Icarus — flew too high</h3>
+        <p>Full-power prefill, no pacing — every other MLX engine. The wax melts: your Air pins at
+        HEAVY thermal pressure inside the first prompt, clocks throttle, throughput decays every
+        round.</p>
+        <span class="status">✗ GAME OVER — MELTED</span>
+      </div>
     </div>
-    <div class="act doom">
-      <span class="num serif">II</span>
-      <h3 class="serif">Too low drowns</h3>
-      <p>Overcautious throttling wastes the sky. OpenCode kills any request at 300 seconds,
-      streamed or not — timidity without a cache is just a slower crash into the sea.</p>
+    <div class="quest fail">
+      <canvas class="art" data-sprite="sea" aria-hidden="true"></canvas>
+      <div>
+        <h3>The cautious — flew too low</h3>
+        <p>Throttle everything and the client drowns waiting: OpenCode kills any request at 300
+        seconds, streamed or not. Caution without a cache is a slower crash.</p>
+        <span class="status">✗ GAME OVER — DROWNED</span>
+      </div>
     </div>
-    <div class="act win">
-      <span class="num serif">III</span>
-      <h3 class="serif">Daedalus arrived</h3>
-      <p>Race while cool. Ease off as live thermal pressure rises. Never re-fly a league already
-      flown. Cool silicon runs faster when it runs — the middle path is the fast path.</p>
+    <div class="quest win">
+      <canvas class="art" data-sprite="wing" aria-hidden="true"></canvas>
+      <div>
+        <h3>Daedalus — the middle path</h3>
+        <p>Race while cool. Ease off as live thermal pressure rises. Never re-fly a league already
+        flown. Cool silicon runs faster when it runs.</p>
+        <span class="status">★ STAGE CLEAR</span>
+      </div>
     </div>
   </div>
 </section>
 
-<section class="wrap reveal" id="numbers">
-  <p class="eyebrow">Measured on a real M4 Air, not promised</p>
-  <h2 class="serif">The evidence</h2>
-  <p class="lede">Qwen3.5-9B, 4-bit, passively-cooled M4 MacBook Air with 16 GB — the exact machine
-  this engine exists for. Numbers ignite as they enter the sky.</p>
-  <div class="constellation">
-    <div class="star">
-      <div class="n serif" data-count="218" data-suffix="×">0×</div>
-      <p class="d">faster time-to-first-token on a warm agent turn — 52.2 s cold → 0.24 s from the
-      persistent cache, surviving restarts</p>
+<section class="wrap reveal" id="demo">
+  <p class="eyebrow">// insert coin to replay the benchmark</p>
+  <h2 class="teal">The burn, replayed</h2>
+  <p class="lede">A 20,049-token prefill. Each block is one chunk, colored by the heat it was
+  computed at — driven by the rates measured on a real M4 Air.</p>
+  <div class="demo">
+    <div class="demo-top">
+      <span class="demo-title">THERMAL_VALIDATION.PY · QWEN3.5-9B · M4 AIR 16GB</span>
+      <div class="ctrls">
+        <button id="gov" class="on" aria-pressed="true">governor:on</button>
+        <button id="run" class="go">▶ run</button>
+      </div>
     </div>
-    <div class="star">
-      <div class="n serif" data-count="20" data-prefix="−" data-suffix="%">−0%</div>
-      <p class="d">total GPU time for identical work — pacing keeps silicon unthrottled, so the
-      same 80k tokens cost less burn</p>
+    <div id="heat" aria-label="prefill chunks colored by thermal state"></div>
+    <div class="readout">
+      <span><span class="lbl">THERMAL</span> <span id="chip" class="chip NOMINAL">NOMINAL</span></span>
+      <span><span class="lbl">TOKENS</span> <b id="tok">0</b>/20,049</span>
+      <span><span class="lbl">RATE</span> <b id="rate">—</b> tok/s</span>
     </div>
-    <div class="star">
-      <div class="n serif" data-count="21" data-prefix="50→" data-suffix="%">50→50%</div>
-      <p class="d">of the run spent throttled at HEAVY pressure, governor off → on, four
-      back-to-back 20k-token prefills</p>
+    <p class="demo-note" id="note">&gt; governor on: hot blocks are followed by dark-teal rests —
+    the machine recovers instead of pinning at HEAVY.</p>
+  </div>
+</section>
+
+<section class="wrap reveal" id="score">
+  <p class="eyebrow">// hi-score table — measured on real hardware, not promised</p>
+  <h2>Hi-Score</h2>
+  <p class="lede">Qwen3.5-9B, 4-bit, passively-cooled M4 MacBook Air 16 GB — the exact machine this
+  engine exists for.</p>
+  <div class="scores">
+    <div class="score">
+      <canvas data-pixnum="218X" data-color="#ffb000"></canvas>
+      <p>faster warm turn — 52.2s → 0.24s time-to-first-token on an 8k-token agent prompt, cache
+      persisted across restarts</p>
     </div>
-    <div class="star">
-      <div class="n serif" data-count="157" data-suffix="">0</div>
-      <p class="d">tokens per second, sustained and undecaying — unpaced falls 133 → 119 and keeps
-      falling as the chassis heats</p>
+    <div class="score">
+      <canvas data-pixnum="-20%" data-color="#00e5c7"></canvas>
+      <p>total GPU time for identical work — pacing keeps silicon unthrottled, so the same 80k
+      tokens cost less burn</p>
+    </div>
+    <div class="score">
+      <canvas data-pixnum="50-21%" data-color="#3dff8c"></canvas>
+      <p>of the run spent throttled at HEAVY pressure, governor off → on, four back-to-back
+      20k-token prefills</p>
+    </div>
+    <div class="score">
+      <canvas data-pixnum="157/S" data-color="#ff6a00"></canvas>
+      <p>sustained prefill rate that never decays — unpaced falls 133 → 119 and keeps falling as
+      the chassis heats</p>
     </div>
   </div>
-  <p class="provenance">Raw traces in <code>bench/results/</code> · reproduce with
-  <code>bench/thermal_validation.py</code></p>
+  <p class="hiscore">RAW TRACES: <code>bench/results/</code> · REPLAY: <code>bench/thermal_validation.py</code></p>
 </section>
 
 <section class="wrap reveal" id="craft">
-  <p class="eyebrow">Τέχνη</p>
-  <h2 class="serif">Four inventions, one workshop</h2>
-  <p class="lede">Built on mlx-lm's public primitives — no monkey-patching, no forks to chase.</p>
-  <div class="relics">
-    <div class="relic">
-      <span class="myth">The Labyrinth</span>
-      <h3>A prefix cache that survives everything</h3>
-      <p>Your agent's giant system prompt is prefilled once, ever — persisted to disk as KV state
-      and recalled exactly on every later turn, across crashes and reboots. Correct even for
-      hybrid-attention models (Qwen3.5, Gemma 4) where stock servers silently miss every time.</p>
+  <p class="eyebrow">// inventory</p>
+  <h2 class="teal">Four items equipped</h2>
+  <p class="lede">Built on mlx-lm's public primitives. No monkey-patching, no forks to chase.</p>
+  <div class="inv">
+    <div class="item">
+      <canvas class="art" data-sprite="maze" aria-hidden="true"></canvas>
+      <div>
+        <span class="slot">ITEM 01 · THE LABYRINTH</span>
+        <h3>Persistent prefix cache</h3>
+        <p>The agent's giant system prompt is prefilled once, ever — saved to disk as KV state,
+        recalled exactly on every later turn, across crashes and reboots. Correct even for
+        hybrid-attention models (Qwen3.5, Gemma 4) where stock servers miss every time.</p>
+      </div>
     </div>
-    <div class="relic">
-      <span class="myth">The Thread</span>
-      <h3>Resumable prefill</h3>
-      <p>Checkpoints every 4k tokens. A timeout, a crash, or a client's hard deadline never sends
-      you back to the entrance — the retry picks up the thread exactly where it dropped.</p>
+    <div class="item">
+      <canvas class="art" data-sprite="thread" aria-hidden="true"></canvas>
+      <div>
+        <span class="slot">ITEM 02 · THE THREAD</span>
+        <h3>Resumable prefill</h3>
+        <p>Checkpoints every 4k tokens. A timeout, a crash, or a client's hard deadline never
+        restarts the maze — the retry picks up the thread exactly where it dropped.</p>
+      </div>
     </div>
-    <div class="relic">
-      <span class="myth">The Middle Path</span>
-      <h3>The first thermal governor in local inference</h3>
-      <p>Reads macOS's five-level thermal-pressure signal live, no <code>sudo</code> — including
-      the two levels Apple's public API hides — and duty-cycles prefill against it. Three tempers:
-      <code>performance · balanced · cool</code>.</p>
+    <div class="item">
+      <canvas class="art" data-sprite="gauge" aria-hidden="true"></canvas>
+      <div>
+        <span class="slot">ITEM 03 · THE GOVERNOR</span>
+        <h3>First thermal governor in local inference</h3>
+        <p>Reads macOS's five-level thermal-pressure signal live, no <code>sudo</code> — including
+        the two levels Apple's public API hides — and duty-cycles prefill against it.
+        <code>performance · balanced · cool</code>.</p>
+      </div>
     </div>
-    <div class="relic">
-      <span class="myth">The Herald</span>
-      <h3>Keepalives and tool calls that never hang</h3>
-      <p>SSE heartbeats carry progress, thermal state, and ETA from the first second of a long
-      prefill. Tool calls stream as strict OpenAI deltas — indexed, never empty — so pi, OpenCode,
-      and every OpenAI-compatible agent simply work.</p>
+    <div class="item">
+      <canvas class="art" data-sprite="scroll" aria-hidden="true"></canvas>
+      <div>
+        <span class="slot">ITEM 04 · THE HERALD</span>
+        <h3>Keepalives + clean tool calls</h3>
+        <p>SSE heartbeats with progress, thermal state, and ETA from second one. Reasoning is
+        split into <code>reasoning_content</code>; tool calls stream as strict OpenAI deltas —
+        indexed, never empty. pi, OpenCode, anything OpenAI-compatible just works.</p>
+      </div>
     </div>
   </div>
 </section>
 
 <section class="wrap reveal" id="start">
-  <p class="eyebrow">Take flight</p>
-  <h2 class="serif">Three commands</h2>
+  <p class="eyebrow">// press start</p>
+  <h2>Three commands</h2>
   <p class="lede">Apple Silicon · macOS 14+ · Python 3.12+</p>
-  <div class="terminal">
-    <div class="tbar" aria-hidden="true"><i></i><i></i><i></i></div>
+  <div class="term">
+    <div class="term-bar"><span>DAEDALUS.EXE</span><span>P1 · 1UP</span></div>
     <pre>
+<span class="c"># install — puts `daedalus` on your PATH</span>
+<span class="p">$</span> uv tool install --editable . --with "transformers&gt;=5.0,&lt;5.11"
+
 <span class="c"># check the wings — thermal sensor, Metal, mlx</span>
 <span class="p">$</span> daedalus doctor
-<span class="ok">thermal pressure (no sudo): NOMINAL — OK
-doctor: all good</span>
+<span class="ok">thermal pressure (no sudo): NOMINAL — OK · doctor: all good</span>
 
 <span class="c"># serve any MLX model behind an OpenAI-compatible API</span>
-<span class="p">$</span> daedalus serve --model mlx-community/Qwen3.5-9B-MLX-4bit --port 8484
-
-<span class="c"># point pi, OpenCode, or any OpenAI-compatible agent at it</span>
-<span class="p">$</span> curl http://127.0.0.1:8484/v1/chat/completions \
-    -d '{"messages":[{"role":"user","content":"fly"}],"stream":true}'</pre>
+<span class="p">$</span> daedalus serve --model mlx-community/Qwen3.5-9B-MLX-4bit --port 8484</pre>
   </div>
 </section>
 
 <footer>
-  <p>daedalus · Apache-2.0 · built on <a href="https://github.com/ml-explore/mlx-lm">mlx-lm</a> ·
-  validated on a real MacBook Air</p>
-  <p class="ep">No wax was melted in the making of this engine.</p>
+  <canvas id="footWing" aria-hidden="true"></canvas>
+  <p>DAEDALUS · APACHE-2.0 · BUILT ON <a href="https://github.com/ml-explore/mlx-lm">MLX-LM</a> ·
+  VALIDATED ON A REAL MACBOOK AIR</p>
+  <p class="ep">NO WAX WAS MELTED IN THE MAKING OF THIS ENGINE.</p>
 </footer>
 
 <script>
-  const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const REDUCED = matchMedia("(prefers-reduced-motion: reduce)").matches;
 
+  // ---------- pixel text: draw tiny, quantize, upscale ----------
+  function pixelText(canvas, text, { color = "#ffb000", basePx = 8, scale = 7, maxW } = {}) {
+    const off = document.createElement("canvas");
+    const octx = off.getContext("2d");
+    const font = `bold ${basePx}px Menlo, Monaco, monospace`;
+    octx.font = font;
+    const w = Math.ceil(octx.measureText(text).width) + 2;
+    const h = basePx + 4;
+    off.width = w; off.height = h;
+    octx.font = font;
+    octx.textBaseline = "top";
+    octx.fillStyle = "#fff";
+    octx.fillText(text, 1, 2);
+    // quantize to 1-bit: alpha > 96 becomes a solid pixel
+    const img = octx.getImageData(0, 0, w, h);
+    for (let i = 0; i < img.data.length; i += 4) {
+      img.data[i + 3] = img.data[i + 3] > 96 ? 255 : 0;
+    }
+    octx.putImageData(img, 0, 0);
+    canvas.width = w * scale; canvas.height = h * scale;
+    const ctx = canvas.getContext("2d");
+    ctx.imageSmoothingEnabled = false;
+    // tint: draw white glyphs, then composite color
+    ctx.drawImage(off, 0, 0, w, h, 0, 0, w * scale, h * scale);
+    ctx.globalCompositeOperation = "source-in";
+    ctx.fillStyle = color;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    if (maxW) { canvas.style.maxWidth = maxW; canvas.style.height = "auto"; }
+  }
+
+  pixelText(document.getElementById("titleCanvas"), "DAEDALUS", {
+    color: "#ffb000", basePx: 10, scale: 10, maxW: "min(92vw, 620px)",
+  });
+  pixelText(document.getElementById("tagCanvas"), "WINGS THAT DON'T MELT", {
+    color: "#e8e8e8", basePx: 8, scale: 4, maxW: "min(88vw, 460px)",
+  });
+  document.querySelectorAll("[data-pixnum]").forEach((c) =>
+    pixelText(c, c.dataset.pixnum, { color: c.dataset.color, basePx: 9, scale: 6 })
+  );
+
+  // ---------- sprites ----------
+  const P = { ".": null, o: "#ffb000", O: "#ff6a00", r: "#ff3355", t: "#00e5c7",
+              T: "#145f56", w: "#e8e8e8", g: "#3dff8c", b: "#23406e", d: "#7a7a7a" };
+  function drawSprite(canvas, rows, px) {
+    const h = rows.length, w = rows[0].length;
+    canvas.width = w * px; canvas.height = h * px;
+    const ctx = canvas.getContext("2d");
+    rows.forEach((row, y) => {
+      [...row].forEach((ch, x) => {
+        const col = P[ch];
+        if (!col) return;
+        ctx.fillStyle = col;
+        ctx.fillRect(x * px, y * px, px, px);
+      });
+    });
+  }
+
+  const SUN = [
+    "....o....o....",
+    ".o...OOOO...o.",
+    "...OOooooOO...",
+    "..OoooooooOo..",
+    "o.OooOOOOooO.o",
+    "..OoOooooOoO..",
+    "..OoOooooOoO..",
+    "o.OooOOOOooO.o",
+    "..OoooooooOo..",
+    "...OOooooOO...",
+    ".o...OOOO...o.",
+    "....o....o....",
+  ];
+  const WING_A = [
+    "........ww......",
+    "....wwwwww......",
+    "wwwwwwwwwwww....",
+    "..wwwwwwwwwwww..",
+    "....wwww....ww..",
+    "......ww........",
+  ];
+  const WING_B = [
+    "......ww........",
+    "....wwww....ww..",
+    "..wwwwwwwwwwww..",
+    "wwwwwwwwwwww....",
+    "....wwwwww......",
+    "........ww......",
+  ];
+  const ICARUS = [
+    "....oooo....",
+    "...oOOOOo...",
+    "..oOOrrOOo..",
+    "..oOrrrrOo..",
+    "..oOOrrOOo..",
+    "...oOOOOo...",
+    "....oooo....",
+    "..r......r..",
+    "...r....r...",
+  ];
+  const SEA = [
+    "............",
+    "..w.........",
+    ".www........",
+    "bbbbbbbbbbbb",
+    "bBbbBbbBbbBb".replaceAll("B", "b"),
+    "bbbbbbbbbbbb",
+    ".bbbbbbbbbb.",
+  ];
+  const MAZE = [
+    "tttttttttt",
+    "t........t",
+    "t.tttttt.t",
+    "t.t....t.t",
+    "t.t.tt.t.t",
+    "t.t.ot.t.t",
+    "t.t.tt.t.t",
+    "t.t....t.t",
+    "t.tttttt.t",
+    "tttttttttt",
+  ];
+  const THREAD = [
+    "o.........",
+    ".o........",
+    "..oo......",
+    "....o.....",
+    "..oo......",
+    ".o........",
+    "..oo......",
+    "....oo....",
+    "......oo..",
+    "........oo",
+  ];
+  const GAUGE = [
+    "..dddddd..",
+    ".d......d.",
+    "d..g.....d",
+    "d...g....d",
+    "d....g...d",
+    "d....o...d",
+    "d....O...d",
+    ".d..rr..d.",
+    "..dddddd..",
+  ];
+  const SCROLL = [
+    "wwwwwwww..",
+    "w......w..",
+    "w.tttt.w..",
+    "w......w..",
+    "w.ttt..w..",
+    "w......w..",
+    "w.tttt.w..",
+    "w......w..",
+    "wwwwwwww..",
+  ];
+  const SPRITES = { icarus: ICARUS, sea: SEA, wing: WING_A, maze: MAZE, thread: THREAD, gauge: GAUGE, scroll: SCROLL };
+
+  drawSprite(document.getElementById("sunCanvas"), SUN, 8);
+  document.querySelectorAll("canvas[data-sprite]").forEach((c) =>
+    drawSprite(c, SPRITES[c.dataset.sprite], c.classList.contains("art") ? 6 : 4)
+  );
+  drawSprite(document.getElementById("footWing"), WING_A, 4);
+
+  // flapping wing crossing the sky
+  const wingCv = document.getElementById("wingCanvas");
+  let flap = false;
+  drawSprite(wingCv, WING_A, 4);
+  if (!REDUCED) {
+    setInterval(() => {
+      flap = !flap;
+      drawSprite(wingCv, flap ? WING_B : WING_A, 4);
+    }, 220);
+    // sun palette shimmer
+    const sunCv = document.getElementById("sunCanvas");
+    let bright = false;
+    setInterval(() => {
+      bright = !bright;
+      P.o = bright ? "#ffc840" : "#ffb000";
+      drawSprite(sunCv, SUN, 8);
+      P.o = "#ffb000";
+    }, 900);
+  }
+
+  // ---------- reveals ----------
   const io = new IntersectionObserver(
     (es) => es.forEach((e) => e.isIntersecting && e.target.classList.add("in")),
     { threshold: 0.1 }
   );
   document.querySelectorAll(".reveal").forEach((el) => io.observe(el));
 
-  // numbers ignite + count up when scrolled into view
-  const starIO = new IntersectionObserver(
-    (entries) => {
-      entries.forEach((entry) => {
-        if (!entry.isIntersecting) return;
-        const star = entry.target;
-        starIO.unobserve(star);
-        star.classList.add("lit");
-        const el = star.querySelector(".n");
-        const target = parseInt(el.dataset.count, 10);
-        const prefix = el.dataset.prefix || "";
-        const suffix = el.dataset.suffix || "";
-        if (reduced) { el.textContent = prefix + target + suffix; return; }
-        const t0 = performance.now(), dur = 1400;
-        function step(t) {
-          const k = Math.min(1, (t - t0) / dur);
-          const eased = 1 - Math.pow(1 - k, 3);
-          el.textContent = prefix + Math.round(target * eased) + suffix;
-          if (k < 1) requestAnimationFrame(step);
-        }
-        requestAnimationFrame(step);
-      });
-    },
-    { threshold: 0.5 }
-  );
-  document.querySelectorAll(".star").forEach((el) => starIO.observe(el));
+  // ---------- demo ----------
+  const N = 40;
+  const heat = document.getElementById("heat");
+  const cells = [];
+  for (let i = 0; i < N; i++) {
+    const c = document.createElement("i");
+    heat.appendChild(c);
+    cells.push(c);
+  }
+  const govBtn = document.getElementById("gov");
+  const runBtn = document.getElementById("run");
+  const chip = document.getElementById("chip");
+  const tok = document.getElementById("tok");
+  const rateEl = document.getElementById("rate");
+  const note = document.getElementById("note");
+  let gov = true, running = false;
+
+  govBtn.addEventListener("click", () => {
+    gov = !gov;
+    govBtn.textContent = gov ? "governor:on" : "governor:off";
+    govBtn.className = gov ? "on" : "off";
+    govBtn.setAttribute("aria-pressed", String(gov));
+    note.textContent = gov
+      ? "> governor on: hot blocks are followed by dark-teal rests — the machine recovers instead of pinning at HEAVY."
+      : "> governor off: every chunk fires back-to-back. watch the blocks sear red and the rate decay — stock engine behavior.";
+  });
+
+  function setChip(l) { chip.textContent = l; chip.className = "chip " + l; }
+
+  runBtn.addEventListener("click", () => {
+    if (running) return;
+    running = true;
+    cells.forEach((c) => (c.className = ""));
+    setChip("NOMINAL"); tok.textContent = "0"; rateEl.textContent = "—";
+    const TOTAL = 20049;
+    let heatLvl = 10, i = 0;
+
+    function tick() {
+      if (i >= N) {
+        rateEl.textContent = gov ? "157 (STABLE)" : "119 (THROTTLED)";
+        note.textContent = gov
+          ? "> STAGE CLEAR: 20% less total GPU burn, machine back to NOMINAL. the middle path is the fast path."
+          : "> GAME OVER: pinned at HEAVY, next flight starts slower. this is what daedalus replaces.";
+        running = false;
+        return;
+      }
+      heatLvl += gov ? (heatLvl > 58 ? 1.5 : 3.2) : 4.6;
+      let rested = false;
+      if (gov && heatLvl > 62) { heatLvl -= 5.5; rested = true; }
+      heatLvl = Math.min(100, heatLvl);
+      cells[i].className = heatLvl > 80 ? "sear" : heatLvl > 60 ? "hot" : heatLvl > 40 ? "warm" : "done";
+      if (rested && i > 0) cells[i - 1].className = "rest";
+      setChip(heatLvl > 80 ? "HEAVY" : heatLvl > 55 ? "MODERATE" : "NOMINAL");
+      tok.textContent = Math.min(TOTAL, Math.round(((i + 1) * TOTAL) / N)).toLocaleString();
+      rateEl.textContent = gov ? "157" : String(Math.max(119, 152 - Math.round(heatLvl / 3)));
+      i++;
+      setTimeout(tick, REDUCED ? 0 : gov && heatLvl > 55 ? 170 : 70);
+    }
+    tick();
+  });
 </script>
