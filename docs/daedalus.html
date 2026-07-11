@@ -8,9 +8,9 @@
     --ink: #ededed;
     --gray: #a1a1a1;
     --gray-dark: #666666;
-    --blue-a: #007cf0; --blue-b: #00dfd8;
-    --purp-a: #7928ca; --purp-b: #ff0080;
-    --fire-a: #ff4d4d; --fire-b: #f9cb28;
+    --red-a: #ff0f0f; --red-b: #ff5a3c;
+    --orange-a: #ff6a00; --orange-b: #ffa32e;
+    --yellow-a: #ffce0a; --yellow-b: #ffef7a;
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html { scroll-behavior: smooth; }
@@ -51,11 +51,7 @@
     padding: 18px 32px;
   }
   .logo { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 15px; letter-spacing: -0.01em; }
-  .logo .mark {
-    width: 22px; height: 22px; display: inline-block;
-    background: conic-gradient(from 200deg, #007cf0, #7928ca, #ff0080, #ff4d4d, #f9cb28, #007cf0);
-    clip-path: polygon(50% 0%, 100% 100%, 0% 100%);
-  }
+  .logo .mark { display: inline-block; }
   nav .links { display: flex; align-items: center; gap: 26px; font-size: 14px; color: var(--gray); }
   nav .links a:hover { color: var(--ink); }
   .pill {
@@ -87,9 +83,9 @@
     opacity: 0; transform: translateY(14px);
     animation: rise 0.7s cubic-bezier(0.2, 0.7, 0.2, 1) forwards;
   }
-  .hero h1 .l1 { background-image: linear-gradient(90deg, var(--blue-a), var(--blue-b)); animation-delay: 0.05s; }
-  .hero h1 .l2 { background-image: linear-gradient(90deg, var(--purp-a), var(--purp-b)); animation-delay: 0.2s; }
-  .hero h1 .l3 { background-image: linear-gradient(90deg, var(--fire-a), var(--fire-b)); animation-delay: 0.35s; }
+  .hero h1 .l1 { background-image: linear-gradient(90deg, var(--red-a), var(--red-b)); animation-delay: 0.05s; }
+  .hero h1 .l2 { background-image: linear-gradient(90deg, var(--orange-a), var(--orange-b)); animation-delay: 0.2s; }
+  .hero h1 .l3 { background-image: linear-gradient(90deg, var(--yellow-a), var(--yellow-b)); animation-delay: 0.35s; }
   @keyframes rise { to { opacity: 1; transform: none; } }
   .hero .sub {
     margin: 34px auto 0; max-width: 640px;
@@ -172,8 +168,8 @@
     height: 100%; border-radius: 9999px; width: 0;
     transition: width 1.2s cubic-bezier(0.2, 0.7, 0.2, 1);
   }
-  .cbar.bad .fill { background: linear-gradient(90deg, var(--fire-a), var(--fire-b)); }
-  .cbar.good .fill { background: linear-gradient(90deg, var(--blue-a), var(--blue-b)); }
+  .cbar.bad .fill { background: linear-gradient(90deg, #4a4a4a, #6a6a6a); }
+  .cbar.good .fill { background: linear-gradient(90deg, var(--orange-a), var(--yellow-a)); }
   .cbar .note { margin-top: 8px; font-size: 12.5px; color: var(--gray-dark); }
   .footnote { margin-top: 30px; font-size: 13px; color: var(--gray-dark); }
   .footnote code { color: var(--gray); font-size: 12px; }
@@ -239,7 +235,7 @@
 
 <div class="shell">
   <nav>
-    <a class="logo" href="#"><span class="mark" aria-hidden="true"></span>daedalus</a>
+    <a class="logo" href="#"><svg class="mark" width="26" height="13" viewBox="0 0 10 5" shape-rendering="crispEdges" aria-hidden="true"><g fill="#ff0000"><rect x="8" y="0" width="2" height="1"/><rect x="4" y="1" width="6" height="1"/><rect x="0" y="2" width="9" height="1"/><rect x="1" y="3" width="6" height="1"/><rect x="3" y="4" width="2" height="1"/></g></svg>daedalus</a>
     <span class="links">
       <a href="#benchmarks">Benchmarks</a>
       <a href="#features">Features</a>
