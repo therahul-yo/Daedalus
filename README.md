@@ -151,6 +151,23 @@ python bench/regression.py baseline.json candidate.json
 The default gate allows at most 10% TTFT and 5% prefill-throughput regression;
 adjust the thresholds only with a documented hardware/model reason.
 
+For kernel investigation, capture a real model before changing MLX-LM internals:
+
+```bash
+python bench/bench.py --model <model> --prompt-tokens 20000 \
+  --metal-capture /tmp/daedalus.gputrace --out run.json
+```
+
+Only pursue a custom kernel when the capture identifies one operation as a
+material cold-prefill bottleneck. Qwen hybrid models already use MLX-LM Metal
+kernels for their recurrent path, so Daedalus keeps stock MLX-LM kernels by
+default.
+
+Speculative decoding is available experimentally with a tokenizer-compatible
+draft model: `--draft-model <id> --num-draft-tokens 2`. Benchmark memory,
+acceptance rate, and sustained thermals first; a draft model can slow a 16GB
+Air when its extra unified-memory use outweighs decode savings.
+
 For a persistent Mac service, copy and customize
 [`scripts/com.daedalus.server.plist.template`](scripts/com.daedalus.server.plist.template),
 then load it with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.daedalus.server.plist`.

@@ -96,6 +96,16 @@ class _Entry:
     path: Optional[Path] = None  # set when persisted
 
 
+@dataclass
+class _TrieNode:
+    children: dict[int, "_TrieNode"]
+    keys: set[str]
+
+    def __init__(self) -> None:
+        self.children = {}
+        self.keys = set()
+
+
 class PrefixCacheStore:
     def __init__(
         self,
@@ -124,11 +134,44 @@ class PrefixCacheStore:
         self.max_disk_bytes = max_disk_bytes
         self.min_persist_tokens = min_persist_tokens
         self._entries: dict[str, _Entry] = {}
+        self._trie = _TrieNode()
         self._lock = threading.Lock()
         self.hits = 0
         self.misses = 0
         self.copy_seconds = 0.0
+        self.lookup_seconds = 0.0
+        self.load_seconds = 0.0
         self._load_disk_index()
+
+    def _index(self, key: str, tokens: List[int]) -> None:
+        node = self._trie
+        for token in tokens:
+            node = node.children.setdefault(token, _TrieNode())
+        node.keys.add(key)
+
+    def _candidate_keys(self, tokens: List[int]) -> set[str]:
+        """Only inspect entries sharing a token prefix with the request."""
+        node = self._trie
+        keys: set[str] = set()
+        for token in tokens[:-1]:
+            child = node.children.get(token)
+            if child is None:
+                return keys | self._descendant_keys(node)
+            node = child
+            keys.update(node.keys)  # stored prefix of request
+        # Longer entries can be trimmed for regular KV caches. Descendants of
+        # the full request prefix are the only possible such candidates.
+        return keys | self._descendant_keys(node)
+
+    @staticmethod
+    def _descendant_keys(node: _TrieNode) -> set[str]:
+        keys: set[str] = set()
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            keys.update(current.keys)
+            stack.extend(current.children.values())
+        return keys
 
     # ---------------------------------------------------------------- fetch
 
@@ -139,9 +182,13 @@ class PrefixCacheStore:
         one token remains for the engine to process (decode needs a final
         input token). Superset/overlong entries are trimmed when possible.
         """
+        lookup_start = time.perf_counter()
         with self._lock:
             best_key, best_usable = None, 0
-            for key, entry in self._entries.items():
+            for key in self._candidate_keys(tokens):
+                entry = self._entries.get(key)
+                if entry is None:
+                    continue
                 lcp = _common_prefix_len(entry.tokens, tokens)
                 # Usable portion: the shared prefix, capped so one token remains.
                 usable = min(lcp, len(tokens) - 1)
@@ -158,8 +205,13 @@ class PrefixCacheStore:
                 self.misses += 1
                 return None
             entry = self._entries[best_key]
+        with self._lock:
+            self.lookup_seconds += time.perf_counter() - lookup_start
 
+        load_start = time.perf_counter()
         cache_obj, source = self._materialize(entry)
+        with self._lock:
+            self.load_seconds += time.perf_counter() - load_start
         if cache_obj is None:
             self.misses += 1
             return None
@@ -182,7 +234,10 @@ class PrefixCacheStore:
     ) -> Optional[CacheHit]:
         with self._lock:
             best_key, best_len = None, 0
-            for key, entry in self._entries.items():
+            for key in self._candidate_keys(tokens):
+                entry = self._entries.get(key)
+                if entry is None:
+                    continue
                 if key == exclude:
                     continue
                 lcp = _common_prefix_len(entry.tokens, tokens)
@@ -250,6 +305,7 @@ class PrefixCacheStore:
             if old is not None and old.path is not None:
                 entry.path = old.path
             self._entries[key] = entry
+            self._index(key, entry.tokens)
         if persist and len(tokens) >= self.min_persist_tokens:
             # MLX cache serialization is GPU-stream-bound, so it cannot run
             # on a generic writer thread. ``async_persist`` is retained for
@@ -294,6 +350,7 @@ class PrefixCacheStore:
             existing = self._entries.get(key)
             if existing is None or existing.cache is None:
                 self._entries[key] = entry
+                self._index(key, prefix)
         self._evict_disk()
 
     # ---------------------------------------------------------- persistence
@@ -360,6 +417,7 @@ class PrefixCacheStore:
                     last_used=data_path.stat().st_mtime,
                     path=data_path,
                 )
+                self._index(key, tokens)
             except Exception as exc:
                 logger.warning("skipping bad cache sidecar %s: %s", sidecar, exc)
 
@@ -413,6 +471,8 @@ class PrefixCacheStore:
                 "hits": self.hits,
                 "misses": self.misses,
                 "copy_seconds": self.copy_seconds,
+                "lookup_seconds": self.lookup_seconds,
+                "load_seconds": self.load_seconds,
             }
 
     def clear(self) -> int:

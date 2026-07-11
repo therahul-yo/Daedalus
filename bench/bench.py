@@ -33,6 +33,8 @@ def main():
     ap.add_argument("--governor", choices=["on", "off"], default="on")
     ap.add_argument("--kv-bits", type=int, default=8)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--metal-capture", default=None,
+                    help="write an MLX Metal capture to this path for Xcode analysis")
     args = ap.parse_args()
 
     monitor = ThermalMonitor(poll_interval=1.0).start()
@@ -82,17 +84,25 @@ def main():
     n_gen = 0
     gen_tps = 0.0
     peak_mem = 0.0
-    for resp in engine.generate(
-        tokens,
-        max_tokens=args.max_tokens,
-        temperature=0.0,
-        progress_cb=progress,
-    ):
-        if ttft is None:
-            ttft = time.perf_counter() - start
-        n_gen = resp.generation_tokens
-        gen_tps = resp.generation_tps
-        peak_mem = resp.peak_memory
+    if args.metal_capture:
+        import mlx.core as mx
+
+        mx.metal.start_capture(args.metal_capture)
+    try:
+        for resp in engine.generate(
+            tokens,
+            max_tokens=args.max_tokens,
+            temperature=0.0,
+            progress_cb=progress,
+        ):
+            if ttft is None:
+                ttft = time.perf_counter() - start
+            n_gen = resp.generation_tokens
+            gen_tps = resp.generation_tps
+            peak_mem = resp.peak_memory
+    finally:
+        if args.metal_capture:
+            mx.metal.stop_capture()
 
     wall = time.perf_counter() - start
     prefill_tokens = len(tokens) - 1

@@ -49,6 +49,9 @@ class PrefillReport:
     burn_seconds: float = 0.0
     idle_seconds: float = 0.0
     max_level: int = 0
+    model_seconds: float = 0.0
+    quantize_seconds: float = 0.0
+    eval_seconds: float = 0.0
 
 
 @dataclass
@@ -70,6 +73,9 @@ class EngineConfig:
     metal_cache_high_water_bytes: int = 1_536_000_000
     # Poll the abort hook at this interval while idling between chunks.
     idle_poll_seconds: float = 0.1
+    # Optional MLX-LM speculative decoding; only enable after a RAM/throughput
+    # benchmark confirms that the draft model helps this machine.
+    num_draft_tokens: int = 0
 
 
 class Engine:
@@ -79,6 +85,7 @@ class Engine:
         tokenizer: Any,
         governor: ThermalGovernor,
         config: Optional[EngineConfig] = None,
+        draft_model: Optional[Any] = None,
         clock: Callable[[], float] = time.perf_counter,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -86,6 +93,7 @@ class Engine:
         self.tokenizer = tokenizer
         self.governor = governor
         self.config = config or EngineConfig()
+        self.draft_model = draft_model
         self._clock = clock
         self._sleep = sleep
 
@@ -96,17 +104,26 @@ class Engine:
         monitor: Optional[ThermalMonitor] = None,
         governor: Optional[ThermalGovernor] = None,
         config: Optional[EngineConfig] = None,
+        draft_model_path: Optional[str] = None,
     ) -> "Engine":
         from mlx_lm import load
 
         model, tokenizer = load(model_path)
+        draft_model = None
+        if draft_model_path:
+            draft_model, draft_tokenizer = load(draft_model_path)
+            if draft_tokenizer.vocab_size != tokenizer.vocab_size:
+                raise ValueError("draft model tokenizer vocabulary does not match target model")
         if governor is None:
             monitor = (monitor or ThermalMonitor()).start()
             governor = ThermalGovernor(monitor)
-        return cls(model, tokenizer, governor, config)
+        return cls(model, tokenizer, governor, config, draft_model=draft_model)
 
     def make_cache(self) -> List[Any]:
-        return cache_mod.make_prompt_cache(self.model)
+        cache = cache_mod.make_prompt_cache(self.model)
+        if self.draft_model is not None:
+            cache += cache_mod.make_prompt_cache(self.draft_model)
+        return cache
 
     def active_memory_bytes(self) -> int:
         """Current MLX active allocation, used for conservative admission."""
@@ -161,13 +178,16 @@ class Engine:
             start = self._clock()
             with mx.stream(generation_stream):
                 self.model(mx.array(piece)[None], cache=prompt_cache)
+                model_end = self._clock()
                 maybe_quantize_kv_cache(
                     prompt_cache,
                     quantized_kv_start=self.config.quantized_kv_start,
                     kv_group_size=self.config.kv_group_size,
                     kv_bits=self.config.kv_bits,
                 )
+                quantize_end = self._clock()
                 mx.eval([c.state for c in prompt_cache])
+                eval_end = self._clock()
             burn = self._clock() - start
             if (
                 self.config.clear_metal_cache_between_chunks
@@ -178,6 +198,9 @@ class Engine:
             report.computed_tokens += n
             report.chunks += 1
             report.burn_seconds += burn
+            report.model_seconds += model_end - start
+            report.quantize_seconds += quantize_end - model_end
+            report.eval_seconds += eval_end - quantize_end
 
             if progress_cb:
                 progress_cb(report.computed_tokens, total)
@@ -254,4 +277,6 @@ class Engine:
             kv_bits=self.config.kv_bits,
             kv_group_size=self.config.kv_group_size,
             quantized_kv_start=self.config.quantized_kv_start,
+            draft_model=self.draft_model,
+            num_draft_tokens=self.config.num_draft_tokens,
         )
