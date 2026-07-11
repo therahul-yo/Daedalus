@@ -59,14 +59,28 @@ With the prefix cache, this cost is paid once per unique prefix, ever.
 Tool calling rides mlx-lm's auto-detected per-model parsers (Qwen, Gemma 4, …) behind a
 streaming marker filter, so any model mlx-lm can parse tools for works here too.
 
+## Install
+
+```bash
+# recommended: uv (or pipx) puts `daedalus` on your PATH
+uv tool install --editable . --with "transformers>=5.0,<5.11"
+# or: pipx install .
+```
+
 ## Usage
 
 ```bash
 daedalus doctor                      # verify thermal sensor + mlx setup
-daedalus serve --model mlx-community/Qwen3.5-9B-MLX-4bit --port 8080
-# point any OpenAI-compatible agent at http://127.0.0.1:8080/v1
+daedalus serve --model mlx-community/Qwen3.5-9B-MLX-4bit --port 8484
+# point any OpenAI-compatible agent at http://127.0.0.1:8484/v1
 daedalus warm --model ... --prompts prompts.json   # pre-prefill while cool
 ```
+
+`serve` prints a startup banner (model, memory, cache entries, thermal state)
+and logs every request: cache hit/miss, prefill progress with tok/s and
+thermal level, decode rate, and finish reason. Reasoning models' `<think>`
+output is separated into `reasoning_content` so it never leaks into the reply,
+and thermal transitions are logged as they happen.
 
 Target models: Qwen3.5-9B MLX 4-bit, Gemma 4 E4B / 12B MLX 4-bit — anything mlx-lm loads.
 
