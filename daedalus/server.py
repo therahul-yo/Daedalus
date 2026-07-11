@@ -21,6 +21,7 @@ Single-user engine: one request at a time; a queue lock serializes access.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import hmac
 import json
 import logging
@@ -47,6 +48,8 @@ logger = logging.getLogger(__name__)
 
 KEEPALIVE_INTERVAL_S = 1.0
 CHECKPOINT_EVERY_TOKENS = 4096
+CHECKPOINT_MIN_JOB_TOKENS = 8192
+CHECKPOINT_MIN_INTERVAL_S = 8.0
 
 
 @dataclass
@@ -62,7 +65,13 @@ class ServerState:
     admitted_requests: int = 0
     accepting: bool = True
     token_cache: "PromptTokenCache" = None
+    head_cache: "SharedHeadIndex" = None
     max_active_memory_bytes: Optional[int] = None
+    max_prompt_tokens: int = 65536
+    max_completion_tokens: int = 4096
+    requests_per_minute: int = 0
+    rate_windows: dict[str, tuple[float, int]] = None
+    max_request_bytes: int = 2 * 1024 * 1024
 
     def try_admit(self) -> bool:
         with self.admission_lock:
@@ -86,16 +95,37 @@ class ServerState:
             trim(0)
         return getattr(self.engine, "active_memory_bytes", lambda: 0)() < self.max_active_memory_bytes
 
+    def allow_client(self, key: str) -> bool:
+        if self.requests_per_minute <= 0:
+            return True
+        now = time.monotonic()
+        with self.admission_lock:
+            if len(self.rate_windows) > 1024:
+                self.rate_windows = {
+                    client: window for client, window in self.rate_windows.items()
+                    if now - window[0] < 60
+                }
+            started, count = self.rate_windows.get(key, (now, 0))
+            if now - started >= 60:
+                started, count = now, 0
+            if count >= self.requests_per_minute:
+                self.rate_windows[key] = (started, count)
+                return False
+            self.rate_windows[key] = (started, count + 1)
+            return True
+
 
 class PromptTokenCache:
     """Tiny LRU for repeated stateless-agent chat-template rendering."""
 
     def __init__(self, max_entries: int = 256) -> None:
         self.max_entries = max_entries
+        self.max_tokens = 200_000
         self._entries: OrderedDict[str, tuple[int, ...]] = OrderedDict()
         self._lock = threading.Lock()
         self.hits = 0
         self.misses = 0
+        self.tokens = 0
 
     def get_or_build(self, messages: List[dict], tools: Optional[List[dict]], build) -> List[int]:
         key = json.dumps({"messages": messages, "tools": tools}, sort_keys=True, separators=(",", ":"))
@@ -108,15 +138,53 @@ class PromptTokenCache:
             self.misses += 1
         tokens = list(build())
         with self._lock:
+            previous = self._entries.get(key)
+            if previous is not None:
+                self.tokens -= len(previous)
             self._entries[key] = tuple(tokens)
+            self.tokens += len(tokens)
             self._entries.move_to_end(key)
-            while len(self._entries) > self.max_entries:
-                self._entries.popitem(last=False)
+            while len(self._entries) > self.max_entries or self.tokens > self.max_tokens:
+                _, evicted = self._entries.popitem(last=False)
+                self.tokens -= len(evicted)
         return tokens
 
     def stats(self) -> dict:
         with self._lock:
-            return {"entries": len(self._entries), "hits": self.hits, "misses": self.misses}
+            return {"entries": len(self._entries), "tokens": self.tokens, "hits": self.hits, "misses": self.misses}
+
+
+class SharedHeadIndex:
+    """Memoize stable system/tool prefix boundaries across agent sessions."""
+
+    def __init__(self, max_entries: int = 128) -> None:
+        self._entries: OrderedDict[str, int] = OrderedDict()
+        self._lock = threading.Lock()
+        self.max_entries = max_entries
+        self.hits = 0
+
+    def key(self, messages: List[dict], tools: Optional[List[dict]]) -> str:
+        head = [m for m in messages if m.get("role") in ("system", "developer")] or messages[:1]
+        return json.dumps({"head": normalize_messages(head), "tools": tools}, sort_keys=True, separators=(",", ":"))
+
+    def get(self, key: str) -> Optional[int]:
+        with self._lock:
+            value = self._entries.get(key)
+            if value is not None:
+                self.hits += 1
+                self._entries.move_to_end(key)
+            return value
+
+    def put(self, key: str, boundary: int) -> None:
+        with self._lock:
+            self._entries[key] = boundary
+            self._entries.move_to_end(key)
+            while len(self._entries) > self.max_entries:
+                self._entries.popitem(last=False)
+
+    def stats(self) -> dict:
+        with self._lock:
+            return {"entries": len(self._entries), "hits": self.hits}
 
 
 _TEMPLATE_ROLES = {"system", "user", "assistant", "tool"}
@@ -214,17 +282,33 @@ def create_app(
     api_key: Optional[str] = None,
     token_cache_entries: int = 256,
     max_active_memory_bytes: Optional[int] = None,
+    max_prompt_tokens: int = 65536,
+    max_completion_tokens: int = 4096,
+    requests_per_minute: int = 0,
+    max_request_bytes: int = 2 * 1024 * 1024,
 ) -> FastAPI:
     if max_pending_requests < 1:
         raise ValueError("max_pending_requests must be at least 1")
     if token_cache_entries < 1:
         raise ValueError("token_cache_entries must be at least 1")
+    if max_prompt_tokens < 1 or max_completion_tokens < 1:
+        raise ValueError("token limits must be positive")
+    if requests_per_minute < 0:
+        raise ValueError("requests_per_minute cannot be negative")
+    if max_request_bytes < 1:
+        raise ValueError("max_request_bytes must be positive")
     state = ServerState(
         engine=engine, store=store, model_id=model_id, lock=FifoLock(),
         max_pending_requests=max_pending_requests, api_key=api_key,
         metrics=ServerMetrics(), admission_lock=threading.Lock(),
         token_cache=PromptTokenCache(token_cache_entries),
+        head_cache=SharedHeadIndex(),
         max_active_memory_bytes=max_active_memory_bytes,
+        max_prompt_tokens=max_prompt_tokens,
+        max_completion_tokens=max_completion_tokens,
+        requests_per_minute=requests_per_minute,
+        rate_windows={},
+        max_request_bytes=max_request_bytes,
     )
 
     @asynccontextmanager
@@ -272,7 +356,7 @@ def create_app(
         with state.admission_lock:
             active = state.admitted_requests
         return PlainTextResponse(state.metrics.render(active=active, limit=state.max_pending_requests,
-            cache={**state.store.stats(), "tokenization": state.token_cache.stats()}, thermal=state.engine.governor.effective_level.name), media_type="text/plain; version=0.0.4")
+            cache={**state.store.stats(), "tokenization": state.token_cache.stats(), "shared_head": state.head_cache.stats()}, thermal=state.engine.governor.effective_level.name), media_type="text/plain; version=0.0.4")
 
     @app.get("/v1/models")
     def models(authorization: Optional[str] = Header(default=None)):
@@ -309,6 +393,17 @@ def create_app(
     async def chat_completions(request: Request, authorization: Optional[str] = Header(default=None)):
         if not authorized(authorization):
             return error("invalid API key", 401, "authentication_error")
+        client_key = authorization or (request.client.host if request.client else "local")
+        if not state.allow_client(client_key):
+            state.metrics.inc_request("rate_limited")
+            return error("request rate limit exceeded", 429, "rate_limit_error")
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > state.max_request_bytes:
+                    return error("request body exceeds server limit", 413)
+            except ValueError:
+                return error("invalid Content-Length header", 400)
         try:
             body = await request.json()
         except Exception:
@@ -327,6 +422,8 @@ def create_app(
             return error("max_tokens, temperature, and top_p must be numeric", 400)
         if max_tokens < 1 or temperature < 0 or not 0 < top_p <= 1:
             return error("max_tokens must be positive, temperature non-negative, and top_p in (0, 1]", 400)
+        if max_tokens > state.max_completion_tokens:
+            return error(f"max_tokens exceeds server limit ({state.max_completion_tokens})", 400)
         tools = body.get("tools") or None
         if body.get("tool_choice") == "none":
             tools = None
@@ -337,7 +434,9 @@ def create_app(
             # Surface template/format problems as a proper 400 instead of an
             # opaque 500 the client silently retries.
             logger.warning("prompt build failed: %s", exc)
-            return error(f"prompt could not be templated: {exc}", 400)
+            return error("prompt could not be templated", 400)
+        if len(tokens) > state.max_prompt_tokens:
+            return error(f"prompt exceeds server limit ({state.max_prompt_tokens} tokens)", 413)
         if not state.try_admit():
             state.metrics.inc_request("rejected")
             return error("server queue is full; retry shortly", 429, "rate_limit_error")
@@ -362,21 +461,24 @@ def create_app(
         # cache exactly there lets a NEW session/branch reuse the head even
         # on non-trimmable hybrid models, where any divergence otherwise
         # forces a full cold prefill.
-        head_boundary = None
+        head_key = state.head_cache.key(messages, tools)
+        head_boundary = state.head_cache.get(head_key)
         try:
-            head_msgs = [
-                m for m in messages if m.get("role") in ("system", "developer")
-            ] or messages[:1]
-            probe = build_prompt_tokens(
-                state, head_msgs + [{"role": "user", "content": "†"}], tools
-            )
-            lcp = 0
-            for a, b in zip(tokens, probe):
-                if a != b:
-                    break
-                lcp += 1
-            if 256 <= lcp < len(tokens) - 1:
-                head_boundary = lcp
+            if head_boundary is None:
+                head_msgs = [
+                    m for m in messages if m.get("role") in ("system", "developer")
+                ] or messages[:1]
+                probe = build_prompt_tokens(
+                    state, head_msgs + [{"role": "user", "content": "†"}], tools
+                )
+                lcp = 0
+                for a, b in zip(tokens, probe):
+                    if a != b:
+                        break
+                    lcp += 1
+                if 256 <= lcp < len(tokens) - 1:
+                    head_boundary = lcp
+                    state.head_cache.put(head_key, lcp)
         except Exception:
             pass
 
@@ -547,6 +649,10 @@ class _Generation:
         state = self.state
         t_start = time.monotonic()
         with state.lock:
+            # A client can disconnect while its FIFO ticket is waiting. It
+            # still releases its turn, but never starts cache/model work.
+            if self.aborted.is_set():
+                return
             hit = state.store.fetch(self.tokens)
             if hit is not None:
                 prompt_cache = hit.cache
@@ -570,6 +676,7 @@ class _Generation:
                 )
 
             last_checkpoint = already
+            last_checkpoint_time = time.monotonic()
             deferred_persist_tokens: Optional[List[int]] = None
             last_progress_log = [time.monotonic()]
 
@@ -592,7 +699,7 @@ class _Generation:
                     last_progress_log[0] = now
 
             def checkpoint_cb(done: int, cache: List[Any]) -> None:
-                nonlocal last_checkpoint, deferred_persist_tokens
+                nonlocal last_checkpoint, last_checkpoint_time, deferred_persist_tokens
                 if done >= len(self.tokens) - 1:
                     # End-of-prefill snapshot keyed by the prompt: for
                     # non-trimmable (hybrid) caches this is the only state
@@ -606,9 +713,15 @@ class _Generation:
                     logger.info(
                         "  %s · head snapshot at %d tok", self.rid, done
                     )
-                elif done - last_checkpoint >= CHECKPOINT_EVERY_TOKENS:
+                elif (
+                    len(self.tokens) - already >= CHECKPOINT_MIN_JOB_TOKENS
+                    and done - last_checkpoint >= CHECKPOINT_EVERY_TOKENS
+                    and time.monotonic() - last_checkpoint_time >= CHECKPOINT_MIN_INTERVAL_S
+                    and len(self.tokens) - done > CHECKPOINT_EVERY_TOKENS
+                ):
                     state.store.checkpoint(self.tokens, done, cache)
                     last_checkpoint = done
+                    last_checkpoint_time = time.monotonic()
 
             think_filter = ThinkStreamFilter(
                 initially_thinking=self.prompt_in_think
@@ -756,24 +869,40 @@ async def _stream_response(
     request: Request,
 ) -> AsyncGenerator[str, None]:
     model = state.model_id
-    queue: asyncio.Queue = asyncio.Queue()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=64)
     loop = asyncio.get_running_loop()
+    closed = threading.Event()
+
+    def enqueue(event: dict) -> bool:
+        """Backpressure worker output instead of accumulating slow-client RAM."""
+        future = asyncio.run_coroutine_threadsafe(queue.put(event), loop)
+        while True:
+            try:
+                future.result(timeout=0.1)
+                return not closed.is_set()
+            except concurrent.futures.TimeoutError:
+                if closed.is_set():
+                    future.cancel()
+                    return False
 
     def worker():
         completed = False
         try:
             for event in gen._run_engine():
                 completed = completed or event["type"] == "done"
-                loop.call_soon_threadsafe(queue.put_nowait, event)
+                if not enqueue(event):
+                    break
         except Exception as exc:  # surface engine errors to the client
             logger.exception("engine error")
-            loop.call_soon_threadsafe(
-                queue.put_nowait, {"type": "error", "message": str(exc)}
-            )
+            enqueue({"type": "error", "message": str(exc)})
         finally:
             state.metrics.inc_request("completed" if completed else "cancelled")
+            # Idempotent slot release (leak fix from PR #4) + backpressured
+            # eof (bounded queue from PR #3): put_nowait could raise on a
+            # full queue, so eof goes through enqueue like every other event.
             gen.release_slot()
-            loop.call_soon_threadsafe(queue.put_nowait, {"type": "eof"})
+            if not closed.is_set():
+                enqueue({"type": "eof"})
 
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
@@ -841,5 +970,6 @@ async def _stream_response(
             elif event["type"] == "eof":
                 break
     finally:
+        closed.set()
         gen.aborted.set()
     yield "data: [DONE]\n\n"

@@ -320,6 +320,35 @@ def test_memory_guard_evicts_cache_then_rejects_when_still_over_limit():
     assert store.trimmed
 
 
+def test_server_enforces_prompt_and_completion_limits():
+    engine, store = FakeEngine(), FakeStore()
+    client = TestClient(create_app(
+        engine, store, model_id="test-model", max_prompt_tokens=10, max_completion_tokens=2
+    ))
+    assert client.post(
+        "/v1/chat/completions", json={"messages": [{"role": "user", "content": "long prompt"}], "max_tokens": 1}
+    ).status_code == 413
+    assert client.post(
+        "/v1/chat/completions", json={"messages": [{"role": "user", "content": "x"}], "max_tokens": 3}
+    ).status_code == 400
+
+
+def test_server_rate_limit():
+    engine, store = FakeEngine(), FakeStore()
+    client = TestClient(create_app(engine, store, model_id="test-model", requests_per_minute=1))
+    payload = {"messages": [{"role": "user", "content": "hi"}]}
+    assert client.post("/v1/chat/completions", json=payload).status_code == 200
+    assert client.post("/v1/chat/completions", json=payload).status_code == 429
+
+
+def test_server_rejects_oversized_content_length():
+    client = TestClient(create_app(FakeEngine(), FakeStore(), "test-model", max_request_bytes=10))
+    response = client.post(
+        "/v1/chat/completions", content="{}", headers={"Content-Length": "11"}
+    )
+    assert response.status_code == 413
+
+
 TOOLS = [
     {
         "type": "function",

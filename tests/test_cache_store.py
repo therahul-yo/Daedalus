@@ -51,6 +51,15 @@ def test_miss_on_empty_store(tmp_path):
     assert store.stats()["misses"] == 1
 
 
+def test_exclusive_store_lock_prevents_second_owner(tmp_path):
+    store = PrefixCacheStore("test-model", cache_dir=tmp_path, exclusive=True)
+    with pytest.raises(RuntimeError, match="already owned"):
+        PrefixCacheStore("test-model", cache_dir=tmp_path, exclusive=True)
+    store.close()
+    reopened = PrefixCacheStore("test-model", cache_dir=tmp_path, exclusive=True)
+    reopened.close()
+
+
 def test_deferred_persist_keeps_prefix_available_immediately(tmp_path):
     store = make_store(tmp_path)
     tokens = list(range(20))
