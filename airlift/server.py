@@ -210,7 +210,18 @@ class _Generation:
         self.aborted = threading.Event()
         self.prefill_done = 0
         self.prefill_total = len(tokens)
+        self.prefill_started = time.monotonic()
         self.cached_tokens = 0
+
+    def keepalive_line(self) -> str:
+        done, total = self.prefill_done, self.prefill_total
+        thermal = self.state.engine.governor.effective_level.name.lower()
+        elapsed = time.monotonic() - self.prefill_started
+        fresh = done - self.cached_tokens
+        if fresh > 0 and elapsed > 0 and done < total:
+            eta = (total - done) / (fresh / elapsed)
+            return f": prefill {done}/{total} thermal={thermal} eta={eta:.0f}s\n\n"
+        return f": prefill {done}/{total} thermal={thermal}\n\n"
 
     # ------------------------------------------------------------- sync path
 
@@ -377,7 +388,7 @@ async def _stream_response(
                     gen.aborted.set()
                     return
                 # SSE comment: resets idle timeouts, invisible to JSON parsers.
-                yield f": prefill {gen.prefill_done}/{gen.prefill_total}\n\n"
+                yield gen.keepalive_line()
                 continue
 
             if event["type"] == "delta":
