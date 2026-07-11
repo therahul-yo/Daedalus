@@ -102,6 +102,7 @@ class Engine:
         prompt_cache: List[Any],
         *,
         already_cached: int = 0,
+        snap_points: Optional[List[int]] = None,
         progress_cb: Optional[Callable[[int, int], None]] = None,
         checkpoint_cb: Optional[Callable[[int, List[Any]], None]] = None,
         should_abort: Optional[Callable[[], bool]] = None,
@@ -111,8 +112,14 @@ class Engine:
         ``already_cached`` counts tokens whose KV is already present (prefix
         cache hit or checkpoint resume). The final token is left uncomputed —
         the first decode step consumes it (mlx-lm convention).
+
+        ``snap_points`` are token offsets a chunk must end exactly on (e.g.
+        the shared system-prompt boundary), so ``checkpoint_cb`` observes a
+        cache state that non-trimmable (hybrid) models can reuse as-is.
         """
         total = len(tokens)
+        job_tokens = max(0, total - already_cached - 1)
+        snaps = sorted(s for s in (snap_points or []) if 0 < s < total - 1)
         report = PrefillReport(total_tokens=total, computed_tokens=already_cached)
         if progress_cb:
             progress_cb(report.computed_tokens, total)
@@ -125,6 +132,10 @@ class Engine:
                 )
 
             n = min(chunk_tokens, total - report.computed_tokens - 1)
+            for snap in snaps:
+                if report.computed_tokens < snap < report.computed_tokens + n:
+                    n = snap - report.computed_tokens
+                    break
             piece = tokens[report.computed_tokens : report.computed_tokens + n]
 
             start = self._clock()
@@ -149,7 +160,7 @@ class Engine:
             if checkpoint_cb:
                 checkpoint_cb(report.computed_tokens, prompt_cache)
 
-            decision = self.governor.pace(chunk_seconds=burn)
+            decision = self.governor.pace(chunk_seconds=burn, job_tokens=job_tokens)
             chunk_tokens = decision.next_chunk_tokens
             report.max_level = max(report.max_level, int(decision.effective_level))
             if decision.sleep_seconds > 0 and total - report.computed_tokens > 1:
@@ -183,6 +194,7 @@ class Engine:
         top_p: float = 1.0,
         prompt_cache: Optional[List[Any]] = None,
         already_cached: int = 0,
+        snap_points: Optional[List[int]] = None,
         progress_cb: Optional[Callable[[int, int], None]] = None,
         checkpoint_cb: Optional[Callable[[int, List[Any]], None]] = None,
         should_abort: Optional[Callable[[], bool]] = None,
@@ -196,6 +208,7 @@ class Engine:
                 tokens,
                 prompt_cache,
                 already_cached=already_cached,
+                snap_points=snap_points,
                 progress_cb=progress_cb,
                 checkpoint_cb=checkpoint_cb,
                 should_abort=should_abort,

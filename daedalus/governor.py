@@ -82,6 +82,10 @@ class GovernorConfig:
     max_sleep_seconds: float = 10.0
     # Optional global duty ceiling (e.g. user "quiet mode" = 0.5 even when cool).
     max_duty: float = 1.0
+    # Jobs smaller than this many fresh tokens are never paced (below
+    # TRAPPING): a few seconds of burn adds negligible heat, and pacing it
+    # triples an interactive turn's latency for nothing.
+    min_pace_job_tokens: int = 4096
 
 
 class ThermalGovernor:
@@ -115,14 +119,28 @@ class ThermalGovernor:
             # step_down_seconds per level.
             self._below_since = now if observed < self._effective else None
 
-    def pace(self, chunk_seconds: float) -> PaceDecision:
+    def pace(
+        self, chunk_seconds: float, job_tokens: Optional[int] = None
+    ) -> PaceDecision:
         """Decide the next chunk size and pre-chunk idle after a chunk that
-        took ``chunk_seconds`` of GPU time."""
+        took ``chunk_seconds`` of GPU time.
+
+        ``job_tokens`` is the total fresh tokens this prefill computes.
+        Small jobs skip the idle (they keep the level-appropriate chunk
+        size) unless the machine is at TRAPPING or worse — pacing a
+        4-second burn saves no meaningful heat but triples the latency of
+        an interactive turn.
+        """
         now = self._clock()
         self._update_effective(self._monitor.level, now)
         policy = self._config.policies[self._effective]
         duty = min(policy.duty, self._config.max_duty)
-        if duty >= 1.0 or chunk_seconds <= 0:
+        small_job = (
+            job_tokens is not None
+            and job_tokens < self._config.min_pace_job_tokens
+            and self._effective < ThermalLevel.TRAPPING
+        )
+        if duty >= 1.0 or chunk_seconds <= 0 or small_job:
             sleep = 0.0
         else:
             sleep = min(

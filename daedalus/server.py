@@ -214,11 +214,36 @@ def create_app(
             tail = ""
         prompt_in_think = tail.rstrip().endswith("<think>")
 
+        # Shared-head boundary: the token count of the prompt's stable head
+        # (system prompt + tool schemas), found by re-templating with a dummy
+        # conversation and taking the longest common prefix. Snapshotting the
+        # cache exactly there lets a NEW session/branch reuse the head even
+        # on non-trimmable hybrid models, where any divergence otherwise
+        # forces a full cold prefill.
+        head_boundary = None
+        try:
+            head_msgs = [
+                m for m in messages if m.get("role") in ("system", "developer")
+            ] or messages[:1]
+            probe = build_prompt_tokens(
+                state, head_msgs + [{"role": "user", "content": "†"}], tools
+            )
+            lcp = 0
+            for a, b in zip(tokens, probe):
+                if a != b:
+                    break
+                lcp += 1
+            if 256 <= lcp < len(tokens) - 1:
+                head_boundary = lcp
+        except Exception:
+            pass
+
         logger.info(
-            "→ %s · %d tok%s%s",
+            "→ %s · %d tok%s%s%s",
             request_id[-6:],
             len(tokens),
             f" · {len(tools)} tools" if tools else "",
+            f" · head {head_boundary}" if head_boundary else "",
             " · stream" if stream else "",
         )
 
@@ -231,6 +256,7 @@ def create_app(
             tools=tools,
             prompt_in_think=prompt_in_think,
             rid=request_id[-6:],
+            head_boundary=head_boundary,
         )
 
         if stream:
@@ -291,6 +317,7 @@ class _Generation:
         tools=None,
         prompt_in_think=False,
         rid="",
+        head_boundary=None,
     ):
         self.state = state
         self.tokens = tokens
@@ -300,6 +327,7 @@ class _Generation:
         self.tools = tools
         self.prompt_in_think = prompt_in_think
         self.rid = rid
+        self.head_boundary = head_boundary
         self.events: "asyncio.Queue[dict]" = None  # set in stream()
         self.aborted = threading.Event()
         self.prefill_done = 0
@@ -400,6 +428,13 @@ class _Generation:
                     # non-trimmable (hybrid) caches this is the only state
                     # the next stateless-client turn can reuse.
                     state.store.put(self.tokens[:done], cache)
+                elif done == self.head_boundary and done > already:
+                    # Shared-head snapshot: reused by NEW sessions/branches
+                    # whose conversation diverges after the system prompt.
+                    state.store.put(self.tokens[:done], cache)
+                    logger.info(
+                        "  %s · head snapshot at %d tok", self.rid, done
+                    )
                 elif done - last_checkpoint >= CHECKPOINT_EVERY_TOKENS:
                     state.store.checkpoint(self.tokens, done, cache)
                     last_checkpoint = done
@@ -448,6 +483,9 @@ class _Generation:
                     top_p=self.top_p,
                     prompt_cache=prompt_cache,
                     already_cached=already,
+                    snap_points=(
+                        [self.head_boundary] if self.head_boundary else None
+                    ),
                     progress_cb=progress_cb,
                     checkpoint_cb=checkpoint_cb,
                     should_abort=self.aborted.is_set,

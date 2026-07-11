@@ -63,6 +63,7 @@ class FakeEngine:
         top_p,
         prompt_cache,
         already_cached,
+        snap_points=None,
         checkpoint_cb=None,
         should_abort=None,
         progress_cb=None,
