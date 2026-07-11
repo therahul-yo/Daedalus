@@ -173,7 +173,7 @@ class PrefixCacheStore:
         for token in tokens[:-1]:
             child = node.children.get(token)
             if child is None:
-                return keys | self._descendant_keys(node)
+                return keys if node is self._trie else keys | self._descendant_keys(node)
             node = child
             keys.update(node.keys)  # stored prefix of request
         # Longer entries can be trimmed for regular KV caches. Descendants of

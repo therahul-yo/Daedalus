@@ -341,6 +341,14 @@ def test_server_rate_limit():
     assert client.post("/v1/chat/completions", json=payload).status_code == 429
 
 
+def test_server_rejects_oversized_content_length():
+    client = TestClient(create_app(FakeEngine(), FakeStore(), "test-model", max_request_bytes=10))
+    response = client.post(
+        "/v1/chat/completions", content="{}", headers={"Content-Length": "11"}
+    )
+    assert response.status_code == 413
+
+
 TOOLS = [
     {
         "type": "function",

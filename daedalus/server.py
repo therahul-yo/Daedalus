@@ -71,6 +71,7 @@ class ServerState:
     max_completion_tokens: int = 4096
     requests_per_minute: int = 0
     rate_windows: dict[str, tuple[float, int]] = None
+    max_request_bytes: int = 2 * 1024 * 1024
 
     def try_admit(self) -> bool:
         with self.admission_lock:
@@ -99,6 +100,11 @@ class ServerState:
             return True
         now = time.monotonic()
         with self.admission_lock:
+            if len(self.rate_windows) > 1024:
+                self.rate_windows = {
+                    client: window for client, window in self.rate_windows.items()
+                    if now - window[0] < 60
+                }
             started, count = self.rate_windows.get(key, (now, 0))
             if now - started >= 60:
                 started, count = now, 0
@@ -114,10 +120,12 @@ class PromptTokenCache:
 
     def __init__(self, max_entries: int = 256) -> None:
         self.max_entries = max_entries
+        self.max_tokens = 200_000
         self._entries: OrderedDict[str, tuple[int, ...]] = OrderedDict()
         self._lock = threading.Lock()
         self.hits = 0
         self.misses = 0
+        self.tokens = 0
 
     def get_or_build(self, messages: List[dict], tools: Optional[List[dict]], build) -> List[int]:
         key = json.dumps({"messages": messages, "tools": tools}, sort_keys=True, separators=(",", ":"))
@@ -130,15 +138,20 @@ class PromptTokenCache:
             self.misses += 1
         tokens = list(build())
         with self._lock:
+            previous = self._entries.get(key)
+            if previous is not None:
+                self.tokens -= len(previous)
             self._entries[key] = tuple(tokens)
+            self.tokens += len(tokens)
             self._entries.move_to_end(key)
-            while len(self._entries) > self.max_entries:
-                self._entries.popitem(last=False)
+            while len(self._entries) > self.max_entries or self.tokens > self.max_tokens:
+                _, evicted = self._entries.popitem(last=False)
+                self.tokens -= len(evicted)
         return tokens
 
     def stats(self) -> dict:
         with self._lock:
-            return {"entries": len(self._entries), "hits": self.hits, "misses": self.misses}
+            return {"entries": len(self._entries), "tokens": self.tokens, "hits": self.hits, "misses": self.misses}
 
 
 class SharedHeadIndex:
@@ -272,6 +285,7 @@ def create_app(
     max_prompt_tokens: int = 65536,
     max_completion_tokens: int = 4096,
     requests_per_minute: int = 0,
+    max_request_bytes: int = 2 * 1024 * 1024,
 ) -> FastAPI:
     if max_pending_requests < 1:
         raise ValueError("max_pending_requests must be at least 1")
@@ -281,6 +295,8 @@ def create_app(
         raise ValueError("token limits must be positive")
     if requests_per_minute < 0:
         raise ValueError("requests_per_minute cannot be negative")
+    if max_request_bytes < 1:
+        raise ValueError("max_request_bytes must be positive")
     state = ServerState(
         engine=engine, store=store, model_id=model_id, lock=FifoLock(),
         max_pending_requests=max_pending_requests, api_key=api_key,
@@ -292,6 +308,7 @@ def create_app(
         max_completion_tokens=max_completion_tokens,
         requests_per_minute=requests_per_minute,
         rate_windows={},
+        max_request_bytes=max_request_bytes,
     )
 
     @asynccontextmanager
@@ -380,6 +397,13 @@ def create_app(
         if not state.allow_client(client_key):
             state.metrics.inc_request("rate_limited")
             return error("request rate limit exceeded", 429, "rate_limit_error")
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > state.max_request_bytes:
+                    return error("request body exceeds server limit", 413)
+            except ValueError:
+                return error("invalid Content-Length header", 400)
         try:
             body = await request.json()
         except Exception:
@@ -410,7 +434,7 @@ def create_app(
             # Surface template/format problems as a proper 400 instead of an
             # opaque 500 the client silently retries.
             logger.warning("prompt build failed: %s", exc)
-            return error(f"prompt could not be templated: {exc}", 400)
+            return error("prompt could not be templated", 400)
         if len(tokens) > state.max_prompt_tokens:
             return error(f"prompt exceeds server limit ({state.max_prompt_tokens} tokens)", 413)
         if not state.try_admit():
