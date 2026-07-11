@@ -12,14 +12,17 @@ def cmd_serve(args) -> int:
 
     from airlift.cache.store import PrefixCacheStore
     from airlift.engine import Engine, EngineConfig
-    from airlift.governor import GovernorConfig, ThermalGovernor
+    from airlift.governor import PROFILES, GovernorConfig, ThermalGovernor
     from airlift.sensors import ThermalMonitor
     from airlift.server import create_app
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     monitor = ThermalMonitor().start()
     governor = ThermalGovernor(
-        monitor, GovernorConfig(max_duty=args.max_duty)
+        monitor,
+        GovernorConfig(
+            policies=dict(PROFILES[args.profile]), max_duty=args.max_duty
+        ),
     )
     print(f"loading {args.model} ...", flush=True)
     engine = Engine.from_pretrained(
@@ -119,6 +122,13 @@ def main() -> int:
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8080)
     serve.add_argument("--kv-bits", type=int, default=8)
+    serve.add_argument(
+        "--profile",
+        choices=["performance", "balanced", "cool"],
+        default="balanced",
+        help="thermal pacing profile: performance = full speed until real "
+        "throttling (HEAVY); balanced = ease off at MODERATE; cool = quiet/lap",
+    )
     serve.add_argument(
         "--max-duty",
         type=float,

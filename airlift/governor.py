@@ -38,6 +38,33 @@ DEFAULT_POLICIES: Mapping[ThermalLevel, LevelPolicy] = {
     ThermalLevel.SLEEPING: LevelPolicy(chunk_tokens=256, duty=0.05),
 }
 
+# Named profiles: how much wall-clock to trade for staying cool.
+#
+# - performance: full speed through MODERATE; intervene only at HEAVY, where
+#   the silicon is already losing ~10%+ to throttling anyway. Fastest cold
+#   prefill wall-clock, machine runs hot.
+# - balanced (default): start easing off at MODERATE so HEAVY is rarer;
+#   measured on an M4 Air: stable burn rate, 20% less total GPU time,
+#   HEAVY residency 50% -> 21%, at ~1.5x cold wall-clock.
+# - cool: lap-friendly. Never more than ~half duty even when cold.
+PROFILES: Mapping[str, Mapping[ThermalLevel, LevelPolicy]] = {
+    "performance": {
+        ThermalLevel.NOMINAL: LevelPolicy(chunk_tokens=2048, duty=1.0),
+        ThermalLevel.MODERATE: LevelPolicy(chunk_tokens=2048, duty=1.0),
+        ThermalLevel.HEAVY: LevelPolicy(chunk_tokens=1024, duty=0.5),
+        ThermalLevel.TRAPPING: LevelPolicy(chunk_tokens=512, duty=0.2),
+        ThermalLevel.SLEEPING: LevelPolicy(chunk_tokens=256, duty=0.1),
+    },
+    "balanced": DEFAULT_POLICIES,
+    "cool": {
+        ThermalLevel.NOMINAL: LevelPolicy(chunk_tokens=1024, duty=0.5),
+        ThermalLevel.MODERATE: LevelPolicy(chunk_tokens=512, duty=0.3),
+        ThermalLevel.HEAVY: LevelPolicy(chunk_tokens=256, duty=0.15),
+        ThermalLevel.TRAPPING: LevelPolicy(chunk_tokens=256, duty=0.08),
+        ThermalLevel.SLEEPING: LevelPolicy(chunk_tokens=256, duty=0.05),
+    },
+}
+
 
 @dataclass(frozen=True)
 class PaceDecision:
