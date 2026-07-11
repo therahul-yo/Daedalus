@@ -1,0 +1,698 @@
+<title>daedalus — wings that don't melt</title>
+<style>
+  :root {
+    --plaster: #edf1ef;
+    --plaster-deep: #e2e9e6;
+    --ink: #33424a;
+    --ink-soft: #5d7078;
+    --coral: #e0917f;
+    --coral-deep: #cf7a66;
+    --aegean: #8fb3c7;
+    --aegean-deep: #6d96ad;
+    --sage: #a9b998;
+    --wax: #d9be8c;
+    --line: #c8d2cd;
+    --card: #f4f7f5;
+    --terminal-bg: #2c3a41;
+    --terminal-ink: #dfe8e3;
+    --shadow: 0 2px 24px rgba(51, 66, 74, 0.08);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --plaster: #1d2529;
+      --plaster-deep: #171e22;
+      --ink: #dce5e1;
+      --ink-soft: #93a5ab;
+      --coral: #e8a291;
+      --coral-deep: #efb4a5;
+      --aegean: #85aabf;
+      --aegean-deep: #a3c4d6;
+      --sage: #9db28a;
+      --wax: #cdb387;
+      --line: #34434a;
+      --card: #232d32;
+      --terminal-bg: #141b1f;
+      --terminal-ink: #cfdcd6;
+      --shadow: 0 2px 24px rgba(0, 0, 0, 0.35);
+    }
+  }
+  :root[data-theme="light"] {
+    --plaster: #edf1ef; --plaster-deep: #e2e9e6; --ink: #33424a; --ink-soft: #5d7078;
+    --coral: #e0917f; --coral-deep: #cf7a66; --aegean: #8fb3c7; --aegean-deep: #6d96ad;
+    --sage: #a9b998; --wax: #d9be8c; --line: #c8d2cd; --card: #f4f7f5;
+    --terminal-bg: #2c3a41; --terminal-ink: #dfe8e3; --shadow: 0 2px 24px rgba(51,66,74,0.08);
+  }
+  :root[data-theme="dark"] {
+    --plaster: #1d2529; --plaster-deep: #171e22; --ink: #dce5e1; --ink-soft: #93a5ab;
+    --coral: #e8a291; --coral-deep: #efb4a5; --aegean: #85aabf; --aegean-deep: #a3c4d6;
+    --sage: #9db28a; --wax: #cdb387; --line: #34434a; --card: #232d32;
+    --terminal-bg: #141b1f; --terminal-ink: #cfdcd6; --shadow: 0 2px 24px rgba(0,0,0,0.35);
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--plaster);
+    color: var(--ink);
+    font-family: "Iowan Old Style", "Palatino", "Book Antiqua", Georgia, serif;
+    font-size: 17px;
+    line-height: 1.65;
+    overflow-x: hidden;
+  }
+  .display { font-family: "Optima", "Candara", "Segoe UI", "Gill Sans", sans-serif; }
+  pre, code, .mono {
+    font-family: "SF Mono", "Menlo", "Monaco", "Courier New", monospace;
+  }
+  pre { overflow-x: auto; }
+
+  .wrap { max-width: 980px; margin: 0 auto; padding: 0 24px; }
+
+  /* ------- meander divider ------- */
+  .meander {
+    color: var(--aegean);
+    text-align: center;
+    font-size: 13px;
+    line-height: 1.25;
+    user-select: none;
+    opacity: 0.75;
+    margin: 72px auto;
+  }
+
+  /* ------- hero ------- */
+  header { padding: 88px 0 40px; position: relative; }
+  .wordmark {
+    font-size: clamp(6px, 1.55vw, 14px);
+    line-height: 1.18;
+    letter-spacing: 0;
+    background: linear-gradient(105deg, var(--aegean-deep) 0%, var(--aegean) 30%, var(--sage) 55%, var(--wax) 78%, var(--coral) 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    margin-bottom: 34px;
+  }
+  .kicker {
+    color: var(--ink-soft);
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    font-size: 12px;
+    margin-bottom: 14px;
+  }
+  h1.tagline {
+    font-size: clamp(34px, 5.4vw, 58px);
+    line-height: 1.08;
+    font-weight: 550;
+    text-wrap: balance;
+    max-width: 15ch;
+  }
+  h1 .melt { color: var(--coral-deep); font-style: italic; }
+  .sub {
+    margin-top: 22px;
+    max-width: 58ch;
+    color: var(--ink-soft);
+    font-size: 19px;
+  }
+  .cta-row { display: flex; gap: 14px; margin-top: 34px; flex-wrap: wrap; align-items: center; }
+  .clone {
+    background: var(--terminal-bg);
+    color: var(--terminal-ink);
+    padding: 12px 18px;
+    border-radius: 6px;
+    font-size: 14px;
+    box-shadow: var(--shadow);
+    white-space: nowrap; overflow-x: auto; max-width: 100%;
+  }
+  .clone .dollar { color: var(--coral); }
+  a.ghost {
+    color: var(--ink);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 11px 18px;
+    text-decoration: none;
+    font-size: 15px;
+    transition: border-color 0.2s, background 0.2s;
+  }
+  a.ghost:hover, a.ghost:focus-visible { border-color: var(--aegean-deep); background: var(--card); outline: none; }
+
+  /* faint fresco wing behind hero */
+  .hero-wing {
+    position: absolute;
+    right: -40px; top: 30px;
+    font-size: clamp(7px, 1.1vw, 12px);
+    line-height: 1.1;
+    color: var(--aegean);
+    opacity: 0.35;
+    pointer-events: none;
+    user-select: none;
+  }
+  @media (max-width: 860px) { .hero-wing { display: none; } }
+
+  /* ------- sections ------- */
+  section { margin: 0 0 20px; }
+  .eyebrow {
+    color: var(--aegean-deep);
+    letter-spacing: 0.24em;
+    text-transform: uppercase;
+    font-size: 12.5px;
+    margin-bottom: 10px;
+  }
+  h2 {
+    font-size: clamp(26px, 3.4vw, 36px);
+    font-weight: 550;
+    margin-bottom: 14px;
+    text-wrap: balance;
+  }
+  .lede { color: var(--ink-soft); max-width: 62ch; margin-bottom: 36px; }
+
+  /* myth cards */
+  .flights { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+  @media (max-width: 760px) { .flights { grid-template-columns: 1fr; } }
+  .flight {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 24px 22px 22px;
+    box-shadow: var(--shadow);
+  }
+  .flight pre { font-size: 12px; line-height: 1.3; margin-bottom: 16px; }
+  .flight.too-high pre { color: var(--coral-deep); }
+  .flight.too-low pre { color: var(--aegean-deep); }
+  .flight.middle pre { color: var(--sage); }
+  .flight h3 { font-size: 17px; letter-spacing: 0.04em; margin-bottom: 8px; font-weight: 600; }
+  .flight p { font-size: 15px; color: var(--ink-soft); }
+  .flight .moral { display: block; margin-top: 12px; font-size: 13.5px; color: var(--ink); font-style: italic; }
+  .flight.middle { border-color: var(--sage); }
+
+  /* ------- the forge (demo) ------- */
+  .forge {
+    background: var(--terminal-bg);
+    border-radius: 12px;
+    padding: 28px 26px 24px;
+    color: var(--terminal-ink);
+    box-shadow: var(--shadow);
+  }
+  .forge-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
+  .forge-title { font-size: 13px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--aegean); }
+  .forge-controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .forge button {
+    font-family: inherit;
+    font-size: 13.5px;
+    padding: 8px 16px;
+    border-radius: 6px;
+    border: 1px solid var(--aegean-deep);
+    background: transparent;
+    color: var(--terminal-ink);
+    cursor: pointer;
+    transition: background 0.2s, color 0.2s;
+  }
+  .forge button:hover, .forge button:focus-visible { background: var(--aegean-deep); color: var(--terminal-bg); outline: none; }
+  .forge button[aria-pressed="true"] { background: var(--sage); border-color: var(--sage); color: var(--terminal-bg); }
+  #wing {
+    font-size: clamp(8px, 1.35vw, 13px);
+    line-height: 1.22;
+    margin: 6px 0 14px;
+  }
+  #wing span { transition: color 0.5s; color: var(--aegean); }
+  #wing span.hot { color: var(--coral); }
+  #wing span.searing { color: var(--coral-deep); }
+  #wing span.resting { color: var(--aegean-deep); }
+  .forge-status { display: flex; gap: 18px; flex-wrap: wrap; font-size: 13.5px; align-items: baseline; }
+  .chip { padding: 3px 10px; border-radius: 999px; font-size: 12px; letter-spacing: 0.08em; }
+  .chip.nominal { background: var(--sage); color: var(--terminal-bg); }
+  .chip.moderate { background: var(--wax); color: var(--terminal-bg); }
+  .chip.heavy { background: var(--coral-deep); color: var(--terminal-bg); }
+  .forge-status .num { font-variant-numeric: tabular-nums; }
+  .forge-note { margin-top: 14px; font-size: 13px; color: var(--aegean); font-style: italic; }
+
+  /* ------- steles (numbers) ------- */
+  .steles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+  @media (max-width: 860px) { .steles { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 480px) { .steles { grid-template-columns: 1fr; } }
+  .stele {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-top: 4px solid var(--aegean);
+    border-radius: 4px 4px 10px 10px;
+    padding: 22px 18px 18px;
+    text-align: center;
+    box-shadow: var(--shadow);
+  }
+  .stele:nth-child(2) { border-top-color: var(--sage); }
+  .stele:nth-child(3) { border-top-color: var(--wax); }
+  .stele:nth-child(4) { border-top-color: var(--coral); }
+  .stele .big {
+    font-size: clamp(30px, 4vw, 42px);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.1;
+  }
+  .stele .what { font-size: 13.5px; color: var(--ink-soft); margin-top: 8px; }
+  .provenance { margin-top: 18px; font-size: 13px; color: var(--ink-soft); font-style: italic; text-align: center; }
+
+  /* ------- craft (features w/ columns) ------- */
+  .temple { display: grid; grid-template-columns: auto 1fr auto; gap: 26px; align-items: stretch; }
+  .column-art { color: var(--line); font-size: 11px; line-height: 1.25; user-select: none; align-self: stretch; display: flex; flex-direction: column; justify-content: space-between; }
+  @media (max-width: 760px) { .column-art { display: none; } }
+  .craft-list { display: grid; gap: 0; }
+  .craft {
+    display: grid; grid-template-columns: 150px 1fr; gap: 20px;
+    padding: 26px 4px;
+    border-bottom: 1px solid var(--line);
+  }
+  .craft:last-child { border-bottom: none; }
+  @media (max-width: 640px) { .craft { grid-template-columns: 1fr; gap: 8px; } }
+  .craft .myth-name { color: var(--aegean-deep); font-size: 13px; letter-spacing: 0.14em; text-transform: uppercase; padding-top: 3px; }
+  .craft h3 { font-size: 18px; font-weight: 600; margin-bottom: 6px; }
+  .craft p { font-size: 15px; color: var(--ink-soft); max-width: 58ch; }
+  .craft code { font-size: 13px; background: var(--plaster-deep); padding: 1px 6px; border-radius: 4px; }
+
+  /* labyrinth */
+  .labyrinth-row { display: grid; grid-template-columns: auto 1fr; gap: 30px; align-items: center; margin-top: 40px; }
+  @media (max-width: 760px) { .labyrinth-row { grid-template-columns: 1fr; } }
+  #labyrinth { font-size: 13px; line-height: 1.3; color: var(--line); }
+  #labyrinth .thread { color: var(--coral); }
+  .labyrinth-caption { font-size: 15px; color: var(--ink-soft); max-width: 44ch; }
+  .labyrinth-caption strong { color: var(--ink); }
+
+  /* ------- quickstart ------- */
+  .terminal {
+    background: var(--terminal-bg);
+    color: var(--terminal-ink);
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+  .term-bar { display: flex; gap: 7px; padding: 13px 16px; border-bottom: 1px solid rgba(255,255,255,0.07); }
+  .term-bar i { width: 11px; height: 11px; border-radius: 50%; display: block; }
+  .term-bar i:nth-child(1) { background: var(--coral); }
+  .term-bar i:nth-child(2) { background: var(--wax); }
+  .term-bar i:nth-child(3) { background: var(--sage); }
+  .terminal pre { padding: 22px 24px; font-size: 13.5px; line-height: 1.75; }
+  .terminal .c { color: var(--aegean); }
+  .terminal .d { color: var(--coral); }
+  .terminal .o { color: var(--sage); }
+
+  /* ------- footer ------- */
+  footer {
+    margin-top: 30px;
+    padding: 40px 0 64px;
+    text-align: center;
+    color: var(--ink-soft);
+    font-size: 14px;
+  }
+  footer .epitaph { font-style: italic; margin-top: 10px; font-size: 13px; }
+
+  /* reveal animation */
+  .reveal { opacity: 0; transform: translateY(18px); transition: opacity 0.7s ease, transform 0.7s ease; }
+  .reveal.in { opacity: 1; transform: none; }
+  @media (prefers-reduced-motion: reduce) {
+    .reveal { opacity: 1; transform: none; transition: none; }
+    #wing span { transition: none; }
+    html { scroll-behavior: auto; }
+  }
+</style>
+
+<header class="wrap">
+  <pre class="wordmark display" aria-label="DAEDALUS">
+██████╗   █████╗  ███████╗ ██████╗   █████╗  ██╗      ██╗   ██╗ ███████╗
+██╔══██╗ ██╔══██╗ ██╔════╝ ██╔══██╗ ██╔══██╗ ██║      ██║   ██║ ██╔════╝
+██║  ██║ ███████║ █████╗   ██║  ██║ ███████║ ██║      ██║   ██║ ███████╗
+██║  ██║ ██╔══██║ ██╔══╝   ██║  ██║ ██╔══██║ ██║      ██║   ██║ ╚════██║
+██████╔╝ ██║  ██║ ███████╗ ██████╔╝ ██║  ██║ ███████╗ ╚██████╔╝ ███████║
+╚═════╝  ╚═╝  ╚═╝ ╚══════╝ ╚═════╝  ╚═╝  ╚═╝ ╚══════╝  ╚═════╝  ╚══════╝</pre>
+  <pre class="hero-wing" aria-hidden="true">
+                                        _
+                                    .-' `.
+                                _.-'      \
+                          &nbsp;&nbsp;_.-'  .-.      \
+                      _.-'    .'ew`.      |
+                 _.-'      .-'      `.    |
+            _.-'        .-'    .-.    \   |
+       _.-'          .-'     .'   `.   \  |
+   .-'            .-'      .'       \   \ |
+  (            .-'       .'    .--.  \   \|
+   `-._     .-'        .'    .'    \  \   \
+       `-._'         .'    .'      |   \   \
+           `-._    .'    .'   .-.  |    \   |
+               `-.'     /    /   \ |     |  |
+                   `-._ |   |     ||     |  |
+                       `|   |     ||     |  |</pre>
+  <p class="kicker display">an inference engine for macbook air · μηδὲν ἄγαν — nothing in excess</p>
+  <h1 class="tagline display">Wings that <span class="melt">don't melt</span>.</h1>
+  <p class="sub">Coding agents hurl 20,000-token prompts at your fanless laptop. Other engines fly
+  straight at the sun — full GPU burn until the chassis throttles and the request times out.
+  <strong>daedalus</strong> is an MLX inference engine that flies the middle path: it caches what was
+  already flown, paces what must be, and never repeats a league of sky.</p>
+  <div class="cta-row">
+    <div class="clone mono"><span class="dollar">$</span> git clone https://github.com/therahul-yo/daedalus</div>
+    <a class="ghost display" href="#numbers">Read the measured numbers ↓</a>
+  </div>
+</header>
+
+<pre class="meander" aria-hidden="true">
+┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐
+┘   └───┘   └───┘   └───┘   └───┘   └───┘   └───┘   └───┘   └───┘   └──</pre>
+
+<section class="wrap reveal" id="myth">
+  <p class="eyebrow display">The myth is the design document</p>
+  <h2 class="display">Three ways to cross the Aegean</h2>
+  <p class="lede">Daedalus built wings of wax and feathers for himself and his son, and gave exactly one
+  engineering constraint: fly the middle course. The story is 3,000 years old and it is a thermal
+  management paper.</p>
+  <div class="flights">
+    <div class="flight too-high">
+      <pre aria-hidden="true">
+      \   |   /
+       \  |  /
+    ‒‒   (☉)   ‒‒
+       /  |  \
+      ˙ drip ˙
+        ` ' `</pre>
+      <h3 class="display">Icarus flew high</h3>
+      <p>Full-power prefill, no pacing. The sun melts the wax: your Air hits HEAVY thermal
+      pressure inside the first prompt, the clocks throttle, throughput decays every round —
+      and it never recovers.</p>
+      <span class="moral">This is every other MLX engine.</span>
+    </div>
+    <div class="flight too-low">
+      <pre aria-hidden="true">
+
+   . ~ . ~ . ~ .
+  ~ . ~ . ~ . ~ .
+ ≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈
+ ≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈</pre>
+      <h3 class="display">Too low drowns</h3>
+      <p>Overcautious throttling wastes the sky: idle so long the client gives up. OpenCode
+      kills any request at 300 seconds, streaming or not. Timidity is just a slower crash.</p>
+      <span class="moral">Pacing without a cache is not enough.</span>
+    </div>
+    <div class="flight middle">
+      <pre aria-hidden="true">
+      \   |   /
+    ‒‒   (☉)   ‒‒
+ →→ =¡{›❯❯❯❯›}¡= →→
+  ~ . ~ . ~ . ~ .
+ ≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈</pre>
+      <h3 class="display">Daedalus arrived</h3>
+      <p>Race while cool, ease off as pressure rises, hold before the melt. The engine reads
+      macOS's five-level thermal signal live and duty-cycles the burn — cool silicon runs
+      <em>faster</em> when it runs.</p>
+      <span class="moral">The middle path is the fast path.</span>
+    </div>
+  </div>
+</section>
+
+<pre class="meander" aria-hidden="true">
+┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐
+┘   └───┘   └───┘   └───┘   └───┘   └───┘   └───┘   └───┘   └───┘   └──</pre>
+
+<section class="wrap reveal" id="forge">
+  <p class="eyebrow display">The workshop</p>
+  <h2 class="display">Watch the wax</h2>
+  <p class="lede">A 20,000-token prefill, simulated with the numbers we actually measured on an M4 Air.
+  Each feather is a chunk of prompt. Run it both ways.</p>
+  <div class="forge">
+    <div class="forge-head">
+      <span class="forge-title mono">~ the forge of daedalus ~</span>
+      <div class="forge-controls mono">
+        <button id="govToggle" aria-pressed="true">governor: on</button>
+        <button id="runBtn">run prefill</button>
+      </div>
+    </div>
+    <pre id="wing" aria-label="ASCII wing whose feathers heat up as the simulated prefill runs"></pre>
+    <div class="forge-status mono">
+      <span>thermal <span id="thermChip" class="chip nominal">NOMINAL</span></span>
+      <span class="num">prefill <span id="prog">0</span>/20,049 tok</span>
+      <span class="num">burn rate <span id="rate">—</span> tok/s</span>
+    </div>
+    <p class="forge-note" id="forgeNote">governor on: feathers rest between beats — the wing stays cool and every beat is strong.</p>
+  </div>
+</section>
+
+<pre class="meander" aria-hidden="true">
+┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐
+┘   └───┘   └───┘   └───┘   └───┘   └───┘   └───┘   └───┘   └───┘   └──</pre>
+
+<section class="wrap reveal" id="numbers">
+  <p class="eyebrow display">Carved after the flight, not before</p>
+  <h2 class="display">The numbers, from a real M4 Air</h2>
+  <p class="lede">Every figure below was measured on a passively-cooled M4 MacBook Air (16 GB) running
+  Qwen3.5-9B in 4-bit — the exact machine class this engine exists for.</p>
+  <div class="steles">
+    <div class="stele">
+      <div class="big display">218×</div>
+      <p class="what">faster time-to-first-token on an agent's next turn — 52.2 s cold → 0.24 s warm,
+      8,027-token prompt, cache persisted across restarts</p>
+    </div>
+    <div class="stele">
+      <div class="big display">−20%</div>
+      <p class="what">total GPU time for the same 80k tokens of prefill — cool silicon runs unthrottled,
+      so pacing <em>reduces</em> the work</p>
+    </div>
+    <div class="stele">
+      <div class="big display">50→21%</div>
+      <p class="what">time spent throttled at HEAVY thermal pressure, governor off → on, four
+      back-to-back 20k prefills</p>
+    </div>
+    <div class="stele">
+      <div class="big display">157</div>
+      <p class="what">tok/s sustained burn rate that <em>does not decay</em> round over round —
+      unpaced decays 133 → 119</p>
+    </div>
+  </div>
+  <p class="provenance">Raw traces live in <code class="mono">bench/results/</code>. Reproduce with
+  <code class="mono">bench/thermal_validation.py</code>.</p>
+</section>
+
+<pre class="meander" aria-hidden="true">
+┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐
+┘   └───┘   └───┘   └───┘   └───┘   └───┘   └───┘   └───┘   └───┘   └──</pre>
+
+<section class="wrap reveal" id="craft">
+  <p class="eyebrow display">Τέχνη — the craft</p>
+  <h2 class="display">What the craftsman actually built</h2>
+  <div class="temple">
+    <pre class="column-art" aria-hidden="true">
+.-==-.
+|::::|
+|::::|
+|::::|
+|::::|
+|::::|
+|::::|
+_|::::|_
+&#9601;&#9601;&#9601;&#9601;&#9601;&#9601;&#9601;&#9601;</pre>
+    <div class="craft-list">
+      <div class="craft">
+        <span class="myth-name display">The Labyrinth</span>
+        <div>
+          <h3 class="display">A prefix cache that survives everything</h3>
+          <p>Daedalus built the Labyrinth once; only he kept the map. Your agent's giant system prompt
+          is prefilled once, ever — persisted to disk as KV state, matched exactly on every later
+          turn, alive across crashes and reboots. Correct even for hybrid-attention models
+          (Qwen3.5, Gemma 4) whose caches cannot be trimmed — where stock servers silently miss.</p>
+        </div>
+      </div>
+      <div class="craft">
+        <span class="myth-name display">The Thread</span>
+        <div>
+          <h3 class="display">Resumable prefill</h3>
+          <p>Ariadne's thread marks the path already walked. Mid-prefill checkpoints every 4k tokens
+          mean a client timeout, a crash, or OpenCode's hard 300-second deadline never sends you back
+          to the entrance — the retry picks up the thread where it dropped.</p>
+        </div>
+      </div>
+      <div class="craft">
+        <span class="myth-name display">The Middle Path</span>
+        <div>
+          <h3 class="display">A thermal governor, the first of its kind</h3>
+          <p>Reads macOS's five-level thermal-pressure signal (no <code>sudo</code>) — including the
+          two levels Apple's public API hides — and duty-cycles prefill against it. Escalates
+          instantly, cools with hysteresis, because a fanless chassis forgives slowly. Three tempers:
+          <code>--profile performance | balanced | cool</code>.</p>
+        </div>
+      </div>
+      <div class="craft">
+        <span class="myth-name display">The Herald</span>
+        <div>
+          <h3 class="display">Keepalives that carry news, tools that don't hang</h3>
+          <p>SSE heartbeats flow from the first second of a long prefill, carrying progress, thermal
+          state, and an ETA. Streamed tool calls are strictly well-formed OpenAI deltas — indexed,
+          never empty — because one malformed array hangs an agent forever. Any
+          OpenAI-compatible client just works: pi, OpenCode, Hermes.</p>
+        </div>
+      </div>
+    </div>
+    <pre class="column-art" aria-hidden="true">
+.-==-.
+|::::|
+|::::|
+|::::|
+|::::|
+|::::|
+|::::|
+_|::::|_
+&#9601;&#9601;&#9601;&#9601;&#9601;&#9601;&#9601;&#9601;</pre>
+  </div>
+
+  <div class="labyrinth-row">
+    <pre id="labyrinth" aria-hidden="true">
+┏━━━━━━━━━━━━━━━━━━━┓
+┃<span class="thread">●●●●●●●●●●●●●●●●</span>┓ ┃
+┃ ┏━━━━━━━━━━━━━━<span class="thread">●</span>┃ ┃
+┃ ┃ ┏━━━━━━━━━━┓ <span class="thread">●</span>┃ ┃
+┃ ┃ ┃ ┏━━━━━━┓ ┃ <span class="thread">●</span>┃ ┃
+┃ ┃ ┃ ┃ <span class="thread">☗ ←●</span> ┃ ┃ <span class="thread">●</span>┃ ┃
+┃ ┃ ┃ ┗━━━━<span class="thread">●</span>━┛ ┃ <span class="thread">●</span>┃ ┃
+┃ ┃ ┗━━━━━━<span class="thread">●</span>━━━┛ <span class="thread">●</span>┃ ┃
+┃ ┗━━━━━━━━<span class="thread">●●●●●●●●</span>┛ ┃
+┗━━━━━━━━━━━━━━━━━━━┛</pre>
+    <p class="labyrinth-caption"><strong>The thread through the maze is the cache.</strong> A stateless
+    agent re-sends the whole conversation every turn — other engines re-walk the entire labyrinth.
+    daedalus follows the thread: 8,026 of 8,027 tokens recalled instantly, one token walked fresh.</p>
+  </div>
+</section>
+
+<pre class="meander" aria-hidden="true">
+┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐
+┘   └───┘   └───┘   └───┘   └───┘   └───┘   └───┘   └───┘   └───┘   └──</pre>
+
+<section class="wrap reveal" id="quickstart">
+  <p class="eyebrow display">Take flight</p>
+  <h2 class="display">Three commands to the middle path</h2>
+  <p class="lede">Python 3.12+, Apple Silicon, macOS 14+. Everything else is <code class="mono">pip</code>.</p>
+  <div class="terminal mono">
+    <div class="term-bar" aria-hidden="true"><i></i><i></i><i></i></div>
+    <pre>
+<span class="c"># check the wings — thermal sensor, Metal, mlx</span>
+<span class="d">$</span> daedalus doctor
+<span class="o">thermal pressure (no sudo): NOMINAL — OK
+doctor: all good</span>
+
+<span class="c"># serve any MLX model with an OpenAI-compatible API</span>
+<span class="d">$</span> daedalus serve --model mlx-community/Qwen3.5-9B-MLX-4bit --port 8484
+
+<span class="c"># point any agent at it — pi, OpenCode, anything OpenAI-compatible</span>
+<span class="d">$</span> curl http://127.0.0.1:8484/v1/chat/completions \
+    -d '{"messages":[{"role":"user","content":"fly"}], "stream":true}'</pre>
+  </div>
+</section>
+
+<footer>
+  <pre class="meander" aria-hidden="true">
+┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐
+┘   └───┘   └───┘   └───┘   └───┘   └───┘   └───┘   └───┘   └───┘   └──</pre>
+  <p class="display">daedalus · Apache-2.0 · built on <a href="https://github.com/ml-explore/mlx-lm" style="color:var(--aegean-deep)">mlx-lm</a> · validated on a real MacBook Air</p>
+  <p class="epitaph">No wax was melted in the making of this engine.</p>
+</footer>
+
+<script>
+  // ---- scroll reveals ----
+  const io = new IntersectionObserver(
+    (entries) => entries.forEach((e) => e.isIntersecting && e.target.classList.add("in")),
+    { threshold: 0.12 }
+  );
+  document.querySelectorAll(".reveal").forEach((el) => io.observe(el));
+
+  // ---- the forge: ASCII wing thermal demo ----
+  const WING_ROWS = [
+    "  =¡{›❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯›}¡=",
+    "   `-❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯-'",
+    "     `-❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯-'",
+    "        `-❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯❯-'",
+    "            `-❯❯❯❯❯❯❯❯❯❯❯❯❯-'",
+    "                 `-❯❯❯❯❯❯❯-'",
+    "                     `-❯❯❯-'",
+  ];
+  const wing = document.getElementById("wing");
+  const feathers = [];
+  WING_ROWS.forEach((row, r) => {
+    [...row].forEach((ch) => {
+      const s = document.createElement("span");
+      s.textContent = ch;
+      if (ch === "❯") feathers.push(s);
+      wing.appendChild(s);
+    });
+    if (r < WING_ROWS.length - 1) wing.appendChild(document.createTextNode("\n"));
+  });
+
+  const govBtn = document.getElementById("govToggle");
+  const runBtn = document.getElementById("runBtn");
+  const chip = document.getElementById("thermChip");
+  const prog = document.getElementById("prog");
+  const rate = document.getElementById("rate");
+  const note = document.getElementById("forgeNote");
+  let governorOn = true;
+  let running = false;
+
+  govBtn.addEventListener("click", () => {
+    governorOn = !governorOn;
+    govBtn.textContent = "governor: " + (governorOn ? "on" : "off");
+    govBtn.setAttribute("aria-pressed", String(governorOn));
+    note.textContent = governorOn
+      ? "governor on: feathers rest between beats — the wing stays cool and every beat is strong."
+      : "governor off: every feather burns at once — watch the wing sear and the rate decay.";
+  });
+
+  function setThermal(level) {
+    chip.textContent = level;
+    chip.className = "chip " + level.toLowerCase();
+  }
+
+  function resetWing() {
+    feathers.forEach((f) => (f.className = ""));
+    setThermal("NOMINAL");
+    prog.textContent = "0";
+    rate.textContent = "—";
+  }
+
+  runBtn.addEventListener("click", () => {
+    if (running) return;
+    running = true;
+    resetWing();
+    const total = 20049;
+    const n = feathers.length;
+    let heat = 0; // 0..100
+    let done = 0;
+    let i = 0;
+    const stepTokens = total / n;
+
+    function tick() {
+      if (i >= n) {
+        rate.textContent = governorOn ? "157 (stable)" : "119 (throttled)";
+        note.textContent = governorOn
+          ? "arrived. 20% less total burn, wing intact — the middle path is the fast path."
+          : "arrived, singed. thermal pressure pinned at HEAVY; the next flight starts slower.";
+        running = false;
+        return;
+      }
+      const f = feathers[i];
+      heat += governorOn ? (heat > 55 ? 1.4 : 2.6) : 4.0;
+      if (governorOn && heat > 62) heat -= 3.2; // duty-cycle cooling
+      heat = Math.min(100, heat);
+      f.className = heat > 78 ? "searing" : heat > 45 ? "hot" : "";
+      if (governorOn && i > 0 && i % 6 === 0)
+        for (let k = Math.max(0, i - 12); k < i; k++)
+          if (feathers[k].className === "hot") feathers[k].className = "resting";
+      setThermal(heat > 78 ? "HEAVY" : heat > 45 ? "MODERATE" : "NOMINAL");
+      done = Math.min(total, Math.round((i + 1) * stepTokens));
+      prog.textContent = done.toLocaleString();
+      rate.textContent = governorOn ? "157" : String(Math.max(119, 152 - Math.round(heat / 3)));
+      i++;
+      const pause = governorOn && heat > 55 ? 150 : 45;
+      setTimeout(tick, matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : pause);
+    }
+    tick();
+  });
+
+  // idle shimmer: gentle ambient warmth drifting across the wing
+  if (!matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    let shimmer = 0;
+    setInterval(() => {
+      if (running) return;
+      feathers.forEach((f, k) => {
+        f.className = (k + shimmer) % 23 === 0 ? "resting" : "";
+      });
+      shimmer++;
+    }, 400);
+  }
+</script>
