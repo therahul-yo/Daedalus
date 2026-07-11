@@ -72,6 +72,7 @@ def cmd_serve(args) -> int:
         args.model, kv_bits=args.kv_bits or None,
         tokenizer_id=getattr(engine.tokenizer, "name_or_path", args.model),
         model_revision=args.model_revision,
+        draft_model=args.draft_model,
     )
     api_key = args.api_key or (os.environ.get(args.api_key_env) if args.api_key_env else None)
     if args.api_key_file:

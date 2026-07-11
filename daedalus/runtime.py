@@ -6,7 +6,8 @@ import platform
 
 
 def cache_identity(model: str, *, kv_bits: int | None, kv_group_size: int = 64,
-                   tokenizer_id: str | None = None, model_revision: str | None = None) -> str:
+                   tokenizer_id: str | None = None, model_revision: str | None = None,
+                   draft_model: str | None = None) -> str:
     """Return a cache namespace that cannot cross incompatible runtimes."""
     try:
         import mlx
@@ -20,6 +21,9 @@ def cache_identity(model: str, *, kv_bits: int | None, kv_group_size: int = 64,
         "model": model,
         "model_revision": model_revision or "unresolved",
         "tokenizer": tokenizer_id or model,
+        # A draft model adds a second cache layout; never share its snapshots
+        # with target-only inference or a different draft model.
+        "draft_model": draft_model or "none",
         "kv_bits": kv_bits or 16,
         "kv_group": kv_group_size,
         "mlx": mlx_version,
