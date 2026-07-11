@@ -34,6 +34,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from airlift.cache.store import PrefixCacheStore
 from airlift.engine import Engine, PrefillAborted
+from airlift.tools import make_stream_filter
 
 logger = logging.getLogger(__name__)
 
@@ -49,10 +50,13 @@ class ServerState:
     lock: threading.Lock
 
 
-def build_prompt_tokens(state: ServerState, messages: List[dict]) -> List[int]:
-    return state.engine.tokenizer.apply_chat_template(
-        messages, add_generation_prompt=True
-    )
+def build_prompt_tokens(
+    state: ServerState, messages: List[dict], tools: Optional[List[dict]] = None
+) -> List[int]:
+    kwargs = {"add_generation_prompt": True}
+    if tools:
+        kwargs["tools"] = tools
+    return state.engine.tokenizer.apply_chat_template(messages, **kwargs)
 
 
 def _sse(data: dict) -> str:
@@ -130,8 +134,11 @@ def create_app(
         )
         temperature = float(body.get("temperature", 0.7))
         top_p = float(body.get("top_p", 1.0))
+        tools = body.get("tools") or None
+        if body.get("tool_choice") == "none":
+            tools = None
 
-        tokens = build_prompt_tokens(state, messages)
+        tokens = build_prompt_tokens(state, messages, tools)
         request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
 
@@ -141,6 +148,7 @@ def create_app(
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            tools=tools,
         )
 
         if stream:
@@ -154,6 +162,13 @@ def create_app(
             )
 
         result = await asyncio.to_thread(gen.run_to_completion)
+        message: dict = {"role": "assistant", "content": result["text"] or None}
+        if result["tool_calls"]:
+            # Response-format tool calls carry no "index" field.
+            message["tool_calls"] = [
+                {k: v for k, v in c.items() if k != "index"}
+                for c in result["tool_calls"]
+            ]
         return JSONResponse(
             {
                 "id": request_id,
@@ -163,7 +178,7 @@ def create_app(
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": result["text"]},
+                        "message": message,
                         "finish_reason": result["finish_reason"],
                     }
                 ],
@@ -182,12 +197,15 @@ class _Generation:
     queue so keepalives can be emitted while prefill is still running.
     """
 
-    def __init__(self, state: ServerState, tokens, max_tokens, temperature, top_p):
+    def __init__(
+        self, state: ServerState, tokens, max_tokens, temperature, top_p, tools=None
+    ):
         self.state = state
         self.tokens = tokens
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.top_p = top_p
+        self.tools = tools
         self.events: "asyncio.Queue[dict]" = None  # set in stream()
         self.aborted = threading.Event()
         self.prefill_done = 0
@@ -198,17 +216,21 @@ class _Generation:
 
     def run_to_completion(self) -> dict:
         text_parts: List[str] = []
+        tool_calls: List[dict] = []
         finish_reason = "stop"
         usage = {}
         for event in self._run_engine():
             if event["type"] == "delta":
                 text_parts.append(event["text"])
+            elif event["type"] == "tool_calls":
+                tool_calls.extend(event["calls"])
             elif event["type"] == "done":
                 finish_reason = event["finish_reason"]
                 usage = event["usage"]
         return {
             "text": "".join(text_parts),
-            "finish_reason": finish_reason,
+            "tool_calls": tool_calls,
+            "finish_reason": "tool_calls" if tool_calls else finish_reason,
             "usage": usage,
         }
 
@@ -247,6 +269,9 @@ class _Generation:
                     state.store.checkpoint(self.tokens, done, cache)
                     last_checkpoint = done
 
+            tool_filter = make_stream_filter(state.engine.tokenizer, self.tools)
+            call_index = 0
+            emitted_calls = False
             finish_reason = "stop"
             n_generated = 0
             try:
@@ -264,7 +289,19 @@ class _Generation:
                         finish_reason = "abort"
                         break
                     if resp.text:
-                        yield {"type": "delta", "text": resp.text}
+                        content, calls = tool_filter.feed(resp.text)
+                        if content:
+                            yield {"type": "delta", "text": content}
+                        if calls:
+                            emitted_calls = True
+                            yield {
+                                "type": "tool_calls",
+                                "calls": [
+                                    c.as_openai(call_index + i)
+                                    for i, c in enumerate(calls)
+                                ],
+                            }
+                            call_index += len(calls)
                     n_generated = resp.generation_tokens
                     if resp.finish_reason is not None:
                         finish_reason = resp.finish_reason
@@ -272,6 +309,20 @@ class _Generation:
                 logger.info("prefill aborted at %d tokens", self.prefill_done)
                 return
 
+            content, calls = tool_filter.finalize()
+            if content:
+                yield {"type": "delta", "text": content}
+            if calls:
+                emitted_calls = True
+                yield {
+                    "type": "tool_calls",
+                    "calls": [
+                        c.as_openai(call_index + i) for i, c in enumerate(calls)
+                    ],
+                }
+
+            if emitted_calls:
+                finish_reason = "tool_calls"
             yield {
                 "type": "done",
                 "finish_reason": finish_reason or "stop",
@@ -332,6 +383,13 @@ async def _stream_response(
             if event["type"] == "delta":
                 yield _sse(
                     _chunk(request_id, model, created, {"content": event["text"]})
+                )
+            elif event["type"] == "tool_calls" and event["calls"]:
+                # Guarded non-empty: an empty tool_calls array hangs OpenCode.
+                yield _sse(
+                    _chunk(
+                        request_id, model, created, {"tool_calls": event["calls"]}
+                    )
                 )
             elif event["type"] == "done":
                 yield _sse(

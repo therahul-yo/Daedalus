@@ -9,9 +9,17 @@ from airlift.server import create_app
 
 
 class FakeTokenizer:
-    def apply_chat_template(self, messages, add_generation_prompt=True):
+    has_tool_calling = True
+    tool_call_start = "<tool_call>"
+    tool_call_end = "</tool_call>"
+
+    @staticmethod
+    def tool_parser(text, tools=None):
+        return json.loads(text)
+
+    def apply_chat_template(self, messages, add_generation_prompt=True, tools=None):
         # Deterministic: token ids derived from the serialized messages.
-        text = json.dumps(messages)
+        text = json.dumps(messages) + (json.dumps(tools) if tools else "")
         return [ord(c) % 1000 for c in text]
 
 
@@ -30,10 +38,12 @@ class FakeGovernor:
 
 
 class FakeEngine:
-    def __init__(self):
+    def __init__(self, script=None):
         self.tokenizer = FakeTokenizer()
         self.governor = FakeGovernor()
         self.generate_calls = []
+        # script: list of text segments to emit instead of the default.
+        self.script = script
 
     def make_cache(self):
         return ["fresh-cache"]
@@ -56,7 +66,7 @@ class FakeEngine:
         )
         if checkpoint_cb:
             checkpoint_cb(len(tokens) - 1, prompt_cache)  # end-of-prefill snapshot
-        words = ["Hello", " world", "!"]
+        words = self.script or ["Hello", " world", "!"]
         for i, w in enumerate(words):
             yield FakeResponse(
                 w, i + 1, "stop" if i == len(words) - 1 else None
@@ -173,3 +183,92 @@ def test_missing_messages_400(client_and_fakes):
 def test_cache_stats_endpoint(client_and_fakes):
     client, _, _ = client_and_fakes
     assert "entries" in client.get("/v1/cache/stats").json()
+
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {"name": "read_file", "parameters": {"type": "object"}},
+    }
+]
+
+TOOL_SCRIPT = [
+    "Let me check. ",
+    '<tool_call>{"name": "read_file", ',
+    '"arguments": {"path": "/etc/hosts"}}</tool_call>',
+]
+
+
+def make_tool_client(script):
+    engine, store = FakeEngine(script=script), FakeStore()
+    app = create_app(engine, store, model_id="test-model")
+    return TestClient(app), engine, store
+
+
+def test_non_streaming_tool_call():
+    client, _, _ = make_tool_client(TOOL_SCRIPT)
+    r = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], "tools": TOOLS},
+    )
+    body = r.json()
+    choice = body["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    calls = choice["message"]["tool_calls"]
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "read_file"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"path": "/etc/hosts"}
+    assert calls[0]["id"].startswith("call_")
+    assert "index" not in calls[0]  # response format carries no index
+    assert choice["message"]["content"] == "Let me check. "
+
+
+def test_streaming_tool_call_deltas():
+    client, _, _ = make_tool_client(TOOL_SCRIPT)
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": TOOLS,
+            "stream": True,
+        },
+    ) as r:
+        raw = "".join(r.iter_text())
+    lines = [l for l in raw.split("\n") if l.startswith("data: ")]
+    chunks = [json.loads(l[6:]) for l in lines[:-1]]
+
+    tool_chunks = [
+        c for c in chunks if "tool_calls" in c["choices"][0]["delta"]
+    ]
+    assert len(tool_chunks) == 1
+    tc = tool_chunks[0]["choices"][0]["delta"]["tool_calls"][0]
+    assert tc["index"] == 0
+    assert tc["function"]["name"] == "read_file"
+    # OpenCode compat: no chunk anywhere may carry empty tool_calls.
+    for c in chunks:
+        assert c["choices"][0]["delta"].get("tool_calls") != []
+    assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_tool_choice_none_disables_tools():
+    client, engine, _ = make_tool_client(TOOL_SCRIPT)
+    r = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": TOOLS,
+            "tool_choice": "none",
+        },
+    )
+    # Tools stripped: the tool-call markup streams through as plain content.
+    assert r.json()["choices"][0]["message"].get("tool_calls") is None
+
+
+def test_no_tools_means_no_filter_interference():
+    client, _, _ = make_tool_client(["plain <tool text", " passes"])
+    r = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.json()["choices"][0]["message"]["content"] == "plain <tool text passes"
