@@ -63,6 +63,11 @@ class EngineConfig:
     # the next chunk. Keep allocations during a request by default; expose the
     # old behavior for tight-memory machines.
     clear_metal_cache_between_chunks: bool = False
+    # Retained allocations must still be bounded: a 30k-token prefill can
+    # otherwise accumulate buffer-cache into swap on a 16GB Air. When MLX's
+    # cache exceeds this high-water mark, it is cleared at the next chunk
+    # boundary regardless of the flag above.
+    metal_cache_high_water_bytes: int = 1_536_000_000
     # Poll the abort hook at this interval while idling between chunks.
     idle_poll_seconds: float = 0.1
 
@@ -164,7 +169,10 @@ class Engine:
                 )
                 mx.eval([c.state for c in prompt_cache])
             burn = self._clock() - start
-            if self.config.clear_metal_cache_between_chunks:
+            if (
+                self.config.clear_metal_cache_between_chunks
+                or mx.get_cache_memory() > self.config.metal_cache_high_water_bytes
+            ):
                 mx.clear_cache()
 
             report.computed_tokens += n

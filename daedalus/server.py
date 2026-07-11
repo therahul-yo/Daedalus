@@ -34,6 +34,7 @@ from typing import Any, AsyncGenerator, List, Optional
 
 from fastapi import FastAPI, Header, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 from daedalus.cache.store import PrefixCacheStore
 from daedalus.engine import Engine, PrefillAborted
@@ -408,6 +409,9 @@ def create_app(
                     "Cache-Control": "no-cache",
                     "X-Accel-Buffering": "no",
                 },
+                # Runs after the response cycle ends on every path, including
+                # a disconnect before the generator is first iterated.
+                background=BackgroundTask(gen.release_slot),
             )
 
         try:
@@ -417,7 +421,7 @@ def create_app(
             state.metrics.inc_request("failed")
             raise
         finally:
-            state.release()
+            gen.release_slot()
         message: dict = {"role": "assistant", "content": result["text"] or None}
         if result["reasoning"]:
             message["reasoning_content"] = result["reasoning"]
@@ -482,6 +486,23 @@ class _Generation:
         self.prefill_total = len(tokens)
         self.prefill_started = time.monotonic()
         self.cached_tokens = 0
+        self._release_lock = threading.Lock()
+        self._released = False
+
+    def release_slot(self) -> None:
+        """Idempotently release this request's admission slot.
+
+        Called from the engine worker's ``finally``, the non-streaming
+        handler, AND the StreamingResponse background task — the last one is
+        the guarantee: if a client disconnects before the response generator
+        is ever iterated, the worker never starts, and without this the slot
+        would leak until the server rejected everything.
+        """
+        with self._release_lock:
+            if self._released:
+                return
+            self._released = True
+        self.state.release()
 
     def keepalive_line(self) -> str:
         done, total = self.prefill_done, self.prefill_total
@@ -751,7 +772,7 @@ async def _stream_response(
             )
         finally:
             state.metrics.inc_request("completed" if completed else "cancelled")
-            state.release()
+            gen.release_slot()
             loop.call_soon_threadsafe(queue.put_nowait, {"type": "eof"})
 
     thread = threading.Thread(target=worker, daemon=True)
