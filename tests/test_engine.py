@@ -110,6 +110,32 @@ def test_prefill_can_clear_metal_allocator_between_chunks(monkeypatch):
     assert len(clears) == report.chunks
 
 
+def test_metal_cache_high_water_forces_clear(monkeypatch):
+    """Retained allocations are bounded: above the high-water mark the Metal
+    cache is cleared at chunk boundaries even with retention enabled —
+    a long prefill must not accumulate buffers into swap on a 16GB Air."""
+    engine, model, _, _, _ = make_engine()
+    assert engine.config.clear_metal_cache_between_chunks is False
+    clears = []
+    monkeypatch.setattr(engine_module.mx, "clear_cache", lambda: clears.append(True))
+    monkeypatch.setattr(
+        engine_module.mx,
+        "get_cache_memory",
+        lambda: engine.config.metal_cache_high_water_bytes + 1,
+    )
+    report = engine.paced_prefill(list(range(5000)), cache_for(model))
+    assert len(clears) == report.chunks
+
+
+def test_metal_cache_below_high_water_not_cleared(monkeypatch):
+    engine, model, _, _, _ = make_engine()
+    clears = []
+    monkeypatch.setattr(engine_module.mx, "clear_cache", lambda: clears.append(True))
+    monkeypatch.setattr(engine_module.mx, "get_cache_memory", lambda: 1024)
+    engine.paced_prefill(list(range(5000)), cache_for(model))
+    assert clears == []
+
+
 def test_tuned_nominal_chunk_is_used_until_thermal_pressure(monkeypatch):
     engine, model, _, state, monitor = make_engine()
     engine.config.prefill_chunk_tokens = 1024

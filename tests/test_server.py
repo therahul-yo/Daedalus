@@ -264,6 +264,39 @@ def test_bounded_admission_rejects_overloaded_server():
     assert response.json()["error"]["type"] == "rate_limit_error"
 
 
+def test_release_slot_is_idempotent():
+    """A slot is released exactly once even when multiple guaranteed-release
+    paths (worker finally + StreamingResponse background task) both fire."""
+    from daedalus.server import _Generation
+
+    engine, store = FakeEngine(), FakeStore()
+    app = create_app(engine, store, model_id="test-model", max_pending_requests=4)
+    state = app.state.daedalus
+    assert state.try_admit() and state.try_admit()  # two admitted
+    gen = _Generation(
+        state=state, tokens=[1, 2, 3], max_tokens=8, temperature=0.0, top_p=1.0
+    )
+    gen.release_slot()
+    gen.release_slot()  # double-fire must not release the second request's slot
+    assert state.admitted_requests == 1
+
+
+def test_admission_slot_returns_to_zero_after_requests(client_and_fakes):
+    client, _, _ = client_and_fakes
+    state = client.app.state.daedalus
+    client.post(
+        "/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}
+    )
+    assert state.admitted_requests == 0
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], "stream": True},
+    ) as r:
+        "".join(r.iter_text())
+    assert state.admitted_requests == 0  # background task + worker: still exactly zero
+
+
 def test_memory_guard_evicts_cache_then_rejects_when_still_over_limit():
     class MemoryEngine(FakeEngine):
         def active_memory_bytes(self):
