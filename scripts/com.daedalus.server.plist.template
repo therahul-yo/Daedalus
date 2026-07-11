@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.daedalus.server</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/ABSOLUTE/PATH/TO/uv</string>
+    <string>run</string>
+    <string>daedalus</string>
+    <string>serve</string>
+    <string>--model</string><string>mlx-community/Qwen3.5-9B-MLX-4bit</string>
+    <string>--api-key-env</string><string>DAEDALUS_API_KEY</string>
+    <string>--max-active-memory-gb</string><string>12</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>DAEDALUS_API_KEY</key><string>replace-with-secret</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/tmp/daedalus.log</string>
+  <key>StandardErrorPath</key><string>/tmp/daedalus-error.log</string>
+</dict>
+</plist>

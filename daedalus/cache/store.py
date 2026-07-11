@@ -426,3 +426,20 @@ class PrefixCacheStore:
             path.unlink(missing_ok=True)
             Path(str(path) + ".json").unlink(missing_ok=True)
         return count
+
+    def trim_ram(self, target_bytes: int = 0) -> int:
+        """Drop least-recently-used RAM copies until at or below target."""
+        with self._lock:
+            resident = [e for e in self._entries.values() if e.cache is not None]
+            before = sum(e.nbytes for e in resident)
+            resident.sort(key=lambda e: e.last_used)
+            total = before
+            for entry in resident:
+                if total <= target_bytes:
+                    break
+                total -= entry.nbytes
+                entry.cache = None
+                entry.nbytes = 0
+                if entry.path is None:
+                    self._entries.pop(_tokens_digest(entry.tokens), None)
+            return before - total

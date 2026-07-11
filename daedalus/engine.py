@@ -103,6 +103,10 @@ class Engine:
     def make_cache(self) -> List[Any]:
         return cache_mod.make_prompt_cache(self.model)
 
+    def active_memory_bytes(self) -> int:
+        """Current MLX active allocation, used for conservative admission."""
+        return int(mx.get_active_memory())
+
     def paced_prefill(
         self,
         tokens: List[int],

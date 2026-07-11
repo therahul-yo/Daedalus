@@ -21,6 +21,7 @@ Single-user engine: one request at a time; a queue lock serializes access.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import threading
@@ -38,6 +39,7 @@ from daedalus.cache.store import PrefixCacheStore
 from daedalus.engine import Engine, PrefillAborted
 from daedalus.metrics import ServerMetrics
 from daedalus.reasoning import ThinkStreamFilter
+from daedalus.scheduler import FifoLock
 from daedalus.tools import make_stream_filter
 
 logger = logging.getLogger(__name__)
@@ -51,7 +53,7 @@ class ServerState:
     engine: Engine
     store: PrefixCacheStore
     model_id: str
-    lock: threading.Lock
+    lock: FifoLock
     max_pending_requests: int
     api_key: Optional[str]
     metrics: ServerMetrics
@@ -59,6 +61,7 @@ class ServerState:
     admitted_requests: int = 0
     accepting: bool = True
     token_cache: "PromptTokenCache" = None
+    max_active_memory_bytes: Optional[int] = None
 
     def try_admit(self) -> bool:
         with self.admission_lock:
@@ -70,6 +73,17 @@ class ServerState:
     def release(self) -> None:
         with self.admission_lock:
             self.admitted_requests = max(0, self.admitted_requests - 1)
+
+    def memory_available(self) -> bool:
+        if self.max_active_memory_bytes is None:
+            return True
+        active = getattr(self.engine, "active_memory_bytes", lambda: 0)()
+        if active < self.max_active_memory_bytes:
+            return True
+        trim = getattr(self.store, "trim_ram", None)
+        if trim:
+            trim(0)
+        return getattr(self.engine, "active_memory_bytes", lambda: 0)() < self.max_active_memory_bytes
 
 
 class PromptTokenCache:
@@ -198,16 +212,18 @@ def create_app(
     max_pending_requests: int = 8,
     api_key: Optional[str] = None,
     token_cache_entries: int = 256,
+    max_active_memory_bytes: Optional[int] = None,
 ) -> FastAPI:
     if max_pending_requests < 1:
         raise ValueError("max_pending_requests must be at least 1")
     if token_cache_entries < 1:
         raise ValueError("token_cache_entries must be at least 1")
     state = ServerState(
-        engine=engine, store=store, model_id=model_id, lock=threading.Lock(),
+        engine=engine, store=store, model_id=model_id, lock=FifoLock(),
         max_pending_requests=max_pending_requests, api_key=api_key,
         metrics=ServerMetrics(), admission_lock=threading.Lock(),
         token_cache=PromptTokenCache(token_cache_entries),
+        max_active_memory_bytes=max_active_memory_bytes,
     )
 
     @asynccontextmanager
@@ -227,7 +243,9 @@ def create_app(
         return JSONResponse({"error": {"message": message, "type": kind}}, status_code=status_code)
 
     def authorized(authorization: Optional[str]) -> bool:
-        return state.api_key is None or authorization == f"Bearer {state.api_key}"
+        return state.api_key is None or hmac.compare_digest(
+            authorization or "", f"Bearer {state.api_key}"
+        )
 
     @app.get("/health")
     def health():
@@ -235,6 +253,7 @@ def create_app(
             "status": "ok",
             "model": state.model_id,
             "thermal": state.engine.governor.effective_level.name,
+            "active_memory_bytes": getattr(state.engine, "active_memory_bytes", lambda: 0)(),
         }
 
     @app.get("/readyz")
@@ -244,6 +263,7 @@ def create_app(
             pending = state.admitted_requests
         status = 200 if ready else 503
         return JSONResponse({"status": "ready" if ready else "busy", "pending_requests": pending,
+                             "queue_depth": state.lock.queued,
                              "max_pending_requests": state.max_pending_requests}, status_code=status)
 
     @app.get("/metrics")
@@ -320,6 +340,10 @@ def create_app(
         if not state.try_admit():
             state.metrics.inc_request("rejected")
             return error("server queue is full; retry shortly", 429, "rate_limit_error")
+        if not state.memory_available():
+            state.release()
+            state.metrics.inc_request("memory_rejected")
+            return error("insufficient free model memory; retry after active requests finish", 503, "server_overloaded_error")
         request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
 

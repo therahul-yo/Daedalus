@@ -264,6 +264,29 @@ def test_bounded_admission_rejects_overloaded_server():
     assert response.json()["error"]["type"] == "rate_limit_error"
 
 
+def test_memory_guard_evicts_cache_then_rejects_when_still_over_limit():
+    class MemoryEngine(FakeEngine):
+        def active_memory_bytes(self):
+            return 100
+
+    class MemoryStore(FakeStore):
+        def __init__(self):
+            super().__init__()
+            self.trimmed = False
+
+        def trim_ram(self, target):
+            self.trimmed = True
+            return 0
+
+    engine, store = MemoryEngine(), MemoryStore()
+    client = TestClient(create_app(engine, store, model_id="test-model", max_active_memory_bytes=50))
+    response = client.post(
+        "/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}
+    )
+    assert response.status_code == 503
+    assert store.trimmed
+
+
 TOOLS = [
     {
         "type": "function",

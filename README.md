@@ -93,6 +93,12 @@ required explicitly:
 daedalus serve --model ... --host 0.0.0.0 --api-key "replace-with-a-long-secret"
 ```
 
+For a service, avoid putting a key in shell history: use
+`--api-key-env DAEDALUS_API_KEY` or `--api-key-file /path/to/secret` instead.
+Terminate TLS at a local reverse proxy before making the service reachable on a
+LAN. See [agent integrations](docs/integrations.md) for compatible-client and
+deployment notes.
+
 Use `Authorization: Bearer <key>` with `/v1` endpoints. The server admits at
 most eight active-or-queued requests by default (change with
 `--max-pending-requests`) and returns a standard 429 response when full rather
@@ -106,7 +112,12 @@ Operational endpoints:
 - `GET /metrics` — Prometheus text metrics for cache, queue, request outcomes,
   and thermal level
 - `GET /v1/cache/stats` and `DELETE /v1/cache` — authenticated cache inspection
-  and maintenance when the server is idle
+and maintenance when the server is idle
+
+Persistent caches are automatically isolated by model, tokenizer, MLX/MLX-LM
+versions, KV layout, and machine architecture. This prevents an upgrade from
+loading an incompatible KV snapshot. Pass `--model-revision <immutable-id>`
+when a model name may resolve to mutable upstream weights.
 
 ## Tune for speed
 
@@ -130,6 +141,21 @@ Full-prompt tokenization is memoized for repeated stateless agent requests,
 and final cache snapshots are held in RAM immediately then written after the
 first streamed output. `/metrics` exposes token-cache hits and KV-copy time so
 you can verify whether those optimizations help your workload.
+
+For release-performance gating, compare two real-model benchmark artifacts:
+
+```bash
+python bench/regression.py baseline.json candidate.json
+```
+
+The default gate allows at most 10% TTFT and 5% prefill-throughput regression;
+adjust the thresholds only with a documented hardware/model reason.
+
+For a persistent Mac service, copy and customize
+[`scripts/com.daedalus.server.plist.template`](scripts/com.daedalus.server.plist.template),
+then load it with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.daedalus.server.plist`.
+Keep the API secret in a root-readable environment file or secret manager rather
+than committing it into the plist.
 
 Design lineage: runtime = mlx-lm public primitives (no monkey-patching of internals);
 cache design informed by vllm-mlx and Rapid-MLX (Apache-2.0); prefix-cache semantics
