@@ -1,0 +1,32 @@
+[project]
+name = "airlift"
+version = "0.0.1"
+description = "MacBook-Air-first MLX inference engine: thermally-governed prefill, persistent prefix cache, OpenAI-compatible server"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "mlx>=0.29",
+    "mlx-lm>=0.31",
+    # transformers 5.11+ breaks mlx_lm 0.31.x tokenizer registration
+    # (AutoTokenizer.register with str key -> AttributeError on import)
+    "transformers>=5.0,<5.11",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "httpx>=0.27"]
+
+[project.scripts]
+airlift = "airlift.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["airlift*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
