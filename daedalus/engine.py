@@ -34,7 +34,7 @@ from mlx_lm.models import cache as cache_mod
 from mlx_lm.sample_utils import make_sampler
 
 from daedalus.governor import ThermalGovernor
-from daedalus.sensors import ThermalMonitor
+from daedalus.sensors import ThermalLevel, ThermalMonitor
 
 
 class PrefillAborted(Exception):
@@ -56,6 +56,13 @@ class EngineConfig:
     kv_bits: Optional[int] = 8
     kv_group_size: int = 64
     quantized_kv_start: int = 4096
+    # A measured best nominal prefill chunk. Thermal policies still take over
+    # as soon as pressure rises, so tuning cannot disable thermal protection.
+    prefill_chunk_tokens: Optional[int] = None
+    # Clearing Metal's allocator after every chunk can force reallocation on
+    # the next chunk. Keep allocations during a request by default; expose the
+    # old behavior for tight-memory machines.
+    clear_metal_cache_between_chunks: bool = False
     # Poll the abort hook at this interval while idling between chunks.
     idle_poll_seconds: float = 0.1
 
@@ -124,7 +131,11 @@ class Engine:
         if progress_cb:
             progress_cb(report.computed_tokens, total)
 
-        chunk_tokens = self.governor.initial_chunk_tokens()
+        thermal_chunk_tokens = self.governor.initial_chunk_tokens()
+        chunk_tokens = min(
+            self.config.prefill_chunk_tokens or thermal_chunk_tokens,
+            thermal_chunk_tokens,
+        )
         while total - report.computed_tokens > 1:
             if should_abort and should_abort():
                 raise PrefillAborted(
@@ -149,7 +160,8 @@ class Engine:
                 )
                 mx.eval([c.state for c in prompt_cache])
             burn = self._clock() - start
-            mx.clear_cache()
+            if self.config.clear_metal_cache_between_chunks:
+                mx.clear_cache()
 
             report.computed_tokens += n
             report.chunks += 1
@@ -161,7 +173,12 @@ class Engine:
                 checkpoint_cb(report.computed_tokens, prompt_cache)
 
             decision = self.governor.pace(chunk_seconds=burn, job_tokens=job_tokens)
-            chunk_tokens = decision.next_chunk_tokens
+            chunk_tokens = (
+                self.config.prefill_chunk_tokens
+                if self.config.prefill_chunk_tokens
+                and decision.effective_level == ThermalLevel.NOMINAL
+                else decision.next_chunk_tokens
+            )
             report.max_level = max(report.max_level, int(decision.effective_level))
             if decision.sleep_seconds > 0 and total - report.computed_tokens > 1:
                 report.idle_seconds += self._idle(

@@ -26,14 +26,17 @@ import logging
 import threading
 import time
 import uuid
+from collections import OrderedDict
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, List, Optional
 
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import FastAPI, Header, Request
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 from daedalus.cache.store import PrefixCacheStore
 from daedalus.engine import Engine, PrefillAborted
+from daedalus.metrics import ServerMetrics
 from daedalus.reasoning import ThinkStreamFilter
 from daedalus.tools import make_stream_filter
 
@@ -49,6 +52,56 @@ class ServerState:
     store: PrefixCacheStore
     model_id: str
     lock: threading.Lock
+    max_pending_requests: int
+    api_key: Optional[str]
+    metrics: ServerMetrics
+    admission_lock: threading.Lock
+    admitted_requests: int = 0
+    accepting: bool = True
+    token_cache: "PromptTokenCache" = None
+
+    def try_admit(self) -> bool:
+        with self.admission_lock:
+            if not self.accepting or self.admitted_requests >= self.max_pending_requests:
+                return False
+            self.admitted_requests += 1
+            return True
+
+    def release(self) -> None:
+        with self.admission_lock:
+            self.admitted_requests = max(0, self.admitted_requests - 1)
+
+
+class PromptTokenCache:
+    """Tiny LRU for repeated stateless-agent chat-template rendering."""
+
+    def __init__(self, max_entries: int = 256) -> None:
+        self.max_entries = max_entries
+        self._entries: OrderedDict[str, tuple[int, ...]] = OrderedDict()
+        self._lock = threading.Lock()
+        self.hits = 0
+        self.misses = 0
+
+    def get_or_build(self, messages: List[dict], tools: Optional[List[dict]], build) -> List[int]:
+        key = json.dumps({"messages": messages, "tools": tools}, sort_keys=True, separators=(",", ":"))
+        with self._lock:
+            cached = self._entries.get(key)
+            if cached is not None:
+                self._entries.move_to_end(key)
+                self.hits += 1
+                return list(cached)
+            self.misses += 1
+        tokens = list(build())
+        with self._lock:
+            self._entries[key] = tuple(tokens)
+            self._entries.move_to_end(key)
+            while len(self._entries) > self.max_entries:
+                self._entries.popitem(last=False)
+        return tokens
+
+    def stats(self) -> dict:
+        with self._lock:
+            return {"entries": len(self._entries), "hits": self.hits, "misses": self.misses}
 
 
 _TEMPLATE_ROLES = {"system", "user", "assistant", "tool"}
@@ -104,8 +157,10 @@ def build_prompt_tokens(
     kwargs = {"add_generation_prompt": True}
     if tools:
         kwargs["tools"] = tools
-    return state.engine.tokenizer.apply_chat_template(
-        normalize_messages(messages), **kwargs
+    normalized = normalize_messages(messages)
+    return state.token_cache.get_or_build(
+        normalized, tools,
+        lambda: state.engine.tokenizer.apply_chat_template(normalized, **kwargs),
     )
 
 
@@ -136,13 +191,43 @@ def _chunk(
 
 
 def create_app(
-    engine: Engine, store: PrefixCacheStore, model_id: str
+    engine: Engine,
+    store: PrefixCacheStore,
+    model_id: str,
+    *,
+    max_pending_requests: int = 8,
+    api_key: Optional[str] = None,
+    token_cache_entries: int = 256,
 ) -> FastAPI:
-    app = FastAPI(title="daedalus")
+    if max_pending_requests < 1:
+        raise ValueError("max_pending_requests must be at least 1")
+    if token_cache_entries < 1:
+        raise ValueError("token_cache_entries must be at least 1")
     state = ServerState(
-        engine=engine, store=store, model_id=model_id, lock=threading.Lock()
+        engine=engine, store=store, model_id=model_id, lock=threading.Lock(),
+        max_pending_requests=max_pending_requests, api_key=api_key,
+        metrics=ServerMetrics(), admission_lock=threading.Lock(),
+        token_cache=PromptTokenCache(token_cache_entries),
     )
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        yield
+        with state.admission_lock:
+            state.accepting = False
+        close = getattr(state.store, "close", None)
+        if close:
+            close()
+
+    app = FastAPI(title="daedalus", lifespan=lifespan)
     app.state.daedalus = state
+
+    def error(message: str, status_code: int, kind: str = "invalid_request_error"):
+        state.metrics.inc_error(kind)
+        return JSONResponse({"error": {"message": message, "type": kind}}, status_code=status_code)
+
+    def authorized(authorization: Optional[str]) -> bool:
+        return state.api_key is None or authorization == f"Bearer {state.api_key}"
 
     @app.get("/health")
     def health():
@@ -152,8 +237,26 @@ def create_app(
             "thermal": state.engine.governor.effective_level.name,
         }
 
+    @app.get("/readyz")
+    def readyz():
+        with state.admission_lock:
+            ready = state.accepting and state.admitted_requests < state.max_pending_requests
+            pending = state.admitted_requests
+        status = 200 if ready else 503
+        return JSONResponse({"status": "ready" if ready else "busy", "pending_requests": pending,
+                             "max_pending_requests": state.max_pending_requests}, status_code=status)
+
+    @app.get("/metrics")
+    def metrics():
+        with state.admission_lock:
+            active = state.admitted_requests
+        return PlainTextResponse(state.metrics.render(active=active, limit=state.max_pending_requests,
+            cache={**state.store.stats(), "tokenization": state.token_cache.stats()}, thermal=state.engine.governor.effective_level.name), media_type="text/plain; version=0.0.4")
+
     @app.get("/v1/models")
-    def models():
+    def models(authorization: Optional[str] = Header(default=None)):
+        if not authorized(authorization):
+            return error("invalid API key", 401, "authentication_error")
         return {
             "object": "list",
             "data": [
@@ -166,24 +269,43 @@ def create_app(
         }
 
     @app.get("/v1/cache/stats")
-    def cache_stats():
+    def cache_stats(authorization: Optional[str] = Header(default=None)):
+        if not authorized(authorization):
+            return error("invalid API key", 401, "authentication_error")
         return state.store.stats()
 
+    @app.delete("/v1/cache")
+    def clear_cache(authorization: Optional[str] = Header(default=None)):
+        if not authorized(authorization):
+            return error("invalid API key", 401, "authentication_error")
+        if state.admitted_requests:
+            return error("cache cannot be cleared while requests are active", 409, "conflict_error")
+        removed = state.store.clear()
+        state.metrics.inc_cache_admin("clear")
+        return {"removed_entries": removed}
+
     @app.post("/v1/chat/completions")
-    async def chat_completions(request: Request):
-        body = await request.json()
+    async def chat_completions(request: Request, authorization: Optional[str] = Header(default=None)):
+        if not authorized(authorization):
+            return error("invalid API key", 401, "authentication_error")
+        try:
+            body = await request.json()
+        except Exception:
+            return error("request body must be valid JSON", 400)
+        if not isinstance(body, dict):
+            return error("request body must be a JSON object", 400)
         messages = body.get("messages", [])
-        if not messages:
-            return JSONResponse(
-                {"error": {"message": "messages required", "type": "invalid_request_error"}},
-                status_code=400,
-            )
+        if not isinstance(messages, list) or not messages:
+            return error("messages must be a non-empty array", 400)
         stream = bool(body.get("stream", False))
-        max_tokens = int(
-            body.get("max_tokens") or body.get("max_completion_tokens") or 2048
-        )
-        temperature = float(body.get("temperature", 0.7))
-        top_p = float(body.get("top_p", 1.0))
+        try:
+            max_tokens = int(body.get("max_tokens") or body.get("max_completion_tokens") or 2048)
+            temperature = float(body.get("temperature", 0.7))
+            top_p = float(body.get("top_p", 1.0))
+        except (TypeError, ValueError):
+            return error("max_tokens, temperature, and top_p must be numeric", 400)
+        if max_tokens < 1 or temperature < 0 or not 0 < top_p <= 1:
+            return error("max_tokens must be positive, temperature non-negative, and top_p in (0, 1]", 400)
         tools = body.get("tools") or None
         if body.get("tool_choice") == "none":
             tools = None
@@ -194,15 +316,10 @@ def create_app(
             # Surface template/format problems as a proper 400 instead of an
             # opaque 500 the client silently retries.
             logger.warning("prompt build failed: %s", exc)
-            return JSONResponse(
-                {
-                    "error": {
-                        "message": f"prompt could not be templated: {exc}",
-                        "type": "invalid_request_error",
-                    }
-                },
-                status_code=400,
-            )
+            return error(f"prompt could not be templated: {exc}", 400)
+        if not state.try_admit():
+            state.metrics.inc_request("rejected")
+            return error("server queue is full; retry shortly", 429, "rate_limit_error")
         request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
 
@@ -269,7 +386,14 @@ def create_app(
                 },
             )
 
-        result = await asyncio.to_thread(gen.run_to_completion)
+        try:
+            result = await asyncio.to_thread(gen.run_to_completion)
+            state.metrics.inc_request("completed")
+        except Exception:
+            state.metrics.inc_request("failed")
+            raise
+        finally:
+            state.release()
         message: dict = {"role": "assistant", "content": result["text"] or None}
         if result["reasoning"]:
             message["reasoning_content"] = result["reasoning"]
@@ -401,6 +525,7 @@ class _Generation:
                 )
 
             last_checkpoint = already
+            deferred_persist_tokens: Optional[List[int]] = None
             last_progress_log = [time.monotonic()]
 
             def progress_cb(done: int, total: int) -> None:
@@ -422,12 +547,13 @@ class _Generation:
                     last_progress_log[0] = now
 
             def checkpoint_cb(done: int, cache: List[Any]) -> None:
-                nonlocal last_checkpoint
+                nonlocal last_checkpoint, deferred_persist_tokens
                 if done >= len(self.tokens) - 1:
                     # End-of-prefill snapshot keyed by the prompt: for
                     # non-trimmable (hybrid) caches this is the only state
                     # the next stateless-client turn can reuse.
-                    state.store.put(self.tokens[:done], cache)
+                    state.store.put(self.tokens[:done], cache, persist=False)
+                    deferred_persist_tokens = self.tokens[:done]
                 elif done == self.head_boundary and done > already:
                     # Shared-head snapshot: reused by NEW sessions/branches
                     # whose conversation diverges after the system prompt.
@@ -496,7 +622,16 @@ class _Generation:
                     if t_first_token is None:
                         t_first_token = time.monotonic()
                     if resp.text:
-                        yield from route(resp.text)
+                        output_events = route(resp.text)
+                        yield from output_events
+                    # Generator yields above before continuing here, so the
+                    # client can receive first content before disk I/O. MLX
+                    # cache serialization must remain on this engine thread.
+                    if deferred_persist_tokens is not None and resp.text and output_events:
+                        persist = getattr(state.store, "persist", None)
+                        if persist:
+                            persist(deferred_persist_tokens)
+                        deferred_persist_tokens = None
                     n_generated = resp.generation_tokens
                     decode_tps = resp.generation_tps
                     if resp.finish_reason is not None:
@@ -510,6 +645,10 @@ class _Generation:
                 return
 
             reasoning, content = think_filter.finalize()
+            if deferred_persist_tokens is not None:
+                persist = getattr(state.store, "persist", None)
+                if persist:
+                    persist(deferred_persist_tokens)
             if reasoning:
                 yield {"type": "reasoning", "text": reasoning}
             if content:
@@ -576,8 +715,10 @@ async def _stream_response(
     loop = asyncio.get_running_loop()
 
     def worker():
+        completed = False
         try:
             for event in gen._run_engine():
+                completed = completed or event["type"] == "done"
                 loop.call_soon_threadsafe(queue.put_nowait, event)
         except Exception as exc:  # surface engine errors to the client
             logger.exception("engine error")
@@ -585,6 +726,8 @@ async def _stream_response(
                 queue.put_nowait, {"type": "error", "message": str(exc)}
             )
         finally:
+            state.metrics.inc_request("completed" if completed else "cancelled")
+            state.release()
             loop.call_soon_threadsafe(queue.put_nowait, {"type": "eof"})
 
     thread = threading.Thread(target=worker, daemon=True)

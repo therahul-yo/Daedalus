@@ -15,6 +15,9 @@ class FakeTokenizer:
     # Simulates whether the chat template left the prompt inside <think>.
     prompt_tail = ""
 
+    def __init__(self):
+        self.template_calls = 0
+
     @staticmethod
     def tool_parser(text, tools=None):
         return json.loads(text)
@@ -23,6 +26,7 @@ class FakeTokenizer:
         return self.prompt_tail
 
     def apply_chat_template(self, messages, add_generation_prompt=True, tools=None):
+        self.template_calls += 1
         # Deterministic: token ids derived from the serialized messages.
         text = json.dumps(messages) + (json.dumps(tools) if tools else "")
         return [ord(c) % 1000 for c in text]
@@ -95,7 +99,7 @@ class FakeStore:
             )
         return None
 
-    def put(self, tokens, cache, persist=True):
+    def put(self, tokens, cache, persist=True, async_persist=False):
         self.put_calls.append(len(tokens))
         self.entries[tuple(tokens)] = cache
 
@@ -181,6 +185,16 @@ def test_second_identical_request_hits_cache(client_and_fakes):
     assert engine.generate_calls[1]["already_cached"] > 0
 
 
+def test_prompt_tokenization_is_memoized(client_and_fakes):
+    client, engine, _ = client_and_fakes
+    payload = {"messages": [{"role": "user", "content": "same prompt"}]}
+    client.post("/v1/chat/completions", json=payload)
+    client.post("/v1/chat/completions", json=payload)
+    # The request and shared-head probe are independently memoized; the second
+    # stateless resend should not invoke the tokenizer again.
+    assert engine.tokenizer.template_calls == 2
+
+
 def test_missing_messages_400(client_and_fakes):
     client, _, _ = client_and_fakes
     r = client.post("/v1/chat/completions", json={})
@@ -190,6 +204,64 @@ def test_missing_messages_400(client_and_fakes):
 def test_cache_stats_endpoint(client_and_fakes):
     client, _, _ = client_and_fakes
     assert "entries" in client.get("/v1/cache/stats").json()
+
+
+def test_readiness_and_metrics(client_and_fakes):
+    client, _, _ = client_and_fakes
+    ready = client.get("/readyz")
+    assert ready.status_code == 200
+    assert ready.json()["status"] == "ready"
+    metrics = client.get("/metrics")
+    assert metrics.status_code == 200
+    assert "daedalus_queue_limit 8" in metrics.text
+    assert "daedalus_cache_entries" in metrics.text
+
+
+def test_request_validation(client_and_fakes):
+    client, _, _ = client_and_fakes
+    assert client.post("/v1/chat/completions", content="not-json").status_code == 400
+    assert client.post("/v1/chat/completions", json={"messages": "nope"}).status_code == 400
+    assert client.post(
+        "/v1/chat/completions", json={"messages": [{"role": "user", "content": "x"}], "top_p": 0}
+    ).status_code == 400
+
+
+def test_api_key_protects_v1_endpoints():
+    engine, store = FakeEngine(), FakeStore()
+    client = TestClient(create_app(engine, store, model_id="test-model", api_key="secret"))
+    assert client.get("/v1/models").status_code == 401
+    assert client.post(
+        "/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}
+    ).status_code == 401
+    assert client.get("/v1/models", headers={"Authorization": "Bearer secret"}).status_code == 200
+
+
+def test_clear_cache_requires_idle_and_authorization():
+    class ClearableStore(FakeStore):
+        def clear(self):
+            count = len(self.entries)
+            self.entries.clear()
+            return count
+
+    engine, store = FakeEngine(), ClearableStore()
+    client = TestClient(create_app(engine, store, model_id="test-model", api_key="secret"))
+    store.entries[(1, 2)] = ["cached"]
+    response = client.delete("/v1/cache", headers={"Authorization": "Bearer secret"})
+    assert response.status_code == 200
+    assert response.json() == {"removed_entries": 1}
+
+
+def test_bounded_admission_rejects_overloaded_server():
+    engine, store = FakeEngine(), FakeStore()
+    app = create_app(engine, store, model_id="test-model", max_pending_requests=1)
+    app.state.daedalus.admitted_requests = 1
+    client = TestClient(app)
+    assert client.get("/readyz").status_code == 503
+    response = client.post(
+        "/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}
+    )
+    assert response.status_code == 429
+    assert response.json()["error"]["type"] == "rate_limit_error"
 
 
 TOOLS = [
