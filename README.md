@@ -6,17 +6,35 @@ is a multi-minute full-power GPU burn that thermally throttles the machine and t
 client. airlift is a local OpenAI-compatible server built on [mlx-lm](https://github.com/ml-explore/mlx-lm)
 that treats the Air's thermal envelope as a first-class scheduling constraint.
 
-## Measured (M4 Air, 16GB)
+## Measured (M4 Air 16GB, Qwen3.5-9B MLX 4-bit)
 
-6,026-token prompt (OpenCode-scale first hit), Qwen3-0.6B-4bit, real HTTP streaming:
+**Prefix cache** — 8,027-token prompt (OpenCode-scale first hit), real HTTP streaming:
 
 | request | TTFT | cached tokens |
 |---|---|---|
-| cold (first ever) | 5.63 s | 0 |
-| warm (agent's next turn) | **0.09 s** | 6,025 |
+| cold (first ever) | 52.2 s | 0 |
+| warm (agent's next turn) | **0.24 s** | 8,026 |
 
 Coding agents are stateless — they resend the whole conversation every turn. After the
 first prefill, the Air never re-burns the GPU for that prefix, **even across restarts**.
+
+**Thermal governor** — 4 consecutive distinct 20k-token prefills (80,196 tokens total,
+cache disabled; the unavoidable cold-prefill worst case), same machine, cooled to
+Nominal before each arm:
+
+| | governor OFF | governor ON |
+|---|---|---|
+| wall clock | 647 s | 1012 s |
+| GPU burn time | 647 s | **515 s (−20%)** |
+| burn-rate per round (tok/s) | 133 → 119 → 121 → 124 | **152 → 157 → 157 → 157** |
+| time at HEAVY (throttled) | **50%** | 21% |
+| thermal state after rounds | HEAVY, HEAVY, MODERATE, HEAVY | NOMINAL, MODERATE, MODERATE, NOMINAL |
+
+Unpaced, the Air hits HEAVY pressure inside the first prefill, throttles ~10% immediately,
+and keeps degrading. Paced, the silicon runs unthrottled whenever it runs — the same work
+takes 20% fewer GPU-seconds (less total heat) at a stable rate that does not decay, in
+exchange for longer wall-clock spread across idle gaps that keep the machine usable.
+With the prefix cache, this cost is paid once per unique prefix, ever.
 
 ## How it works
 
