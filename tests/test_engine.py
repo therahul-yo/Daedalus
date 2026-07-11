@@ -3,6 +3,7 @@
 import mlx.core as mx
 import pytest
 
+import daedalus.engine as engine_module
 from daedalus.engine import Engine, EngineConfig, PrefillAborted
 from daedalus.governor import GovernorConfig, LevelPolicy, ThermalGovernor
 from daedalus.sensors import ThermalLevel, ThermalMonitor
@@ -90,6 +91,35 @@ def test_prefill_nominal_never_sleeps():
     engine, model, sleeps, _, _ = make_engine()
     engine.paced_prefill(list(range(6000)), cache_for(model))
     assert sleeps == []
+
+
+def test_prefill_keeps_metal_allocator_by_default(monkeypatch):
+    engine, model, _, _, _ = make_engine()
+    clears = []
+    monkeypatch.setattr(engine_module.mx, "clear_cache", lambda: clears.append(True))
+    engine.paced_prefill(list(range(5000)), cache_for(model))
+    assert not clears
+
+
+def test_prefill_can_clear_metal_allocator_between_chunks(monkeypatch):
+    engine, model, _, _, _ = make_engine()
+    engine.config.clear_metal_cache_between_chunks = True
+    clears = []
+    monkeypatch.setattr(engine_module.mx, "clear_cache", lambda: clears.append(True))
+    report = engine.paced_prefill(list(range(5000)), cache_for(model))
+    assert len(clears) == report.chunks
+
+
+def test_tuned_nominal_chunk_is_used_until_thermal_pressure(monkeypatch):
+    engine, model, _, state, monitor = make_engine()
+    engine.config.prefill_chunk_tokens = 1024
+    engine.paced_prefill(list(range(3500)), cache_for(model))
+    assert model.chunk_sizes[:3] == [1024, 1024, 1024]
+    state["level"] = ThermalLevel.HEAVY
+    monitor.refresh()
+    hot_model = engine.model
+    engine.paced_prefill(list(range(1200)), cache_for(hot_model))
+    assert hot_model.chunk_sizes[-1] <= 512
 
 
 def test_prefill_heavy_duty_cycles():

@@ -51,6 +51,17 @@ def test_miss_on_empty_store(tmp_path):
     assert store.stats()["misses"] == 1
 
 
+def test_deferred_persist_keeps_prefix_available_immediately(tmp_path):
+    store = make_store(tmp_path)
+    tokens = list(range(20))
+    store.put(tokens, [kv_cache_with(20)], persist=False)
+    assert store.fetch(tokens + [99]) is not None
+    store.persist(tokens)
+    reloaded = make_store(tmp_path)
+    assert reloaded.fetch(tokens + [99]) is not None
+    assert store.stats()["copy_seconds"] >= 0
+
+
 def test_exact_prefix_hit_trimmable(tmp_path):
     store = make_store(tmp_path)
     prefix = list(range(100))

@@ -127,6 +127,7 @@ class PrefixCacheStore:
         self._lock = threading.Lock()
         self.hits = 0
         self.misses = 0
+        self.copy_seconds = 0.0
         self._load_disk_index()
 
     # ---------------------------------------------------------------- fetch
@@ -203,7 +204,7 @@ class PrefixCacheStore:
     def _materialize(self, entry: _Entry) -> tuple[Optional[List[Any]], str]:
         """Deep copy of the entry's cache, loading from disk if needed."""
         if entry.cache is not None:
-            return copy.deepcopy(entry.cache), "ram"
+            return self._copy_cache(entry.cache), "ram"
         try:
             loaded = load_prompt_cache(str(entry.path))
         except Exception as exc:  # corrupt/stale file: drop the entry
@@ -217,18 +218,27 @@ class PrefixCacheStore:
         entry.cache = loaded
         entry.nbytes = cache_nbytes(loaded)
         self._evict_ram()
-        return copy.deepcopy(loaded), "disk"
+        return self._copy_cache(loaded), "disk"
+
+    def _copy_cache(self, prompt_cache: List[Any]) -> List[Any]:
+        """Time the required isolated copy used by mutable generation caches."""
+        start = time.perf_counter()
+        copied = copy.deepcopy(prompt_cache)
+        with self._lock:
+            self.copy_seconds += time.perf_counter() - start
+        return copied
 
     # ------------------------------------------------------------------ put
 
     def put(
-        self, tokens: List[int], prompt_cache: List[Any], persist: bool = True
+        self, tokens: List[int], prompt_cache: List[Any], persist: bool = True,
+        async_persist: bool = False,
     ) -> None:
         """Store (a deep copy of) ``prompt_cache`` for ``tokens``."""
         if len(tokens) == 0:
             return
         key = _tokens_digest(tokens)
-        stored = copy.deepcopy(prompt_cache)
+        stored = self._copy_cache(prompt_cache)
         entry = _Entry(
             tokens=list(tokens),
             cache=stored,
@@ -241,9 +251,27 @@ class PrefixCacheStore:
                 entry.path = old.path
             self._entries[key] = entry
         if persist and len(tokens) >= self.min_persist_tokens:
-            self._persist(key, entry)
+            # MLX cache serialization is GPU-stream-bound, so it cannot run
+            # on a generic writer thread. ``async_persist`` is retained for
+            # compatibility; callers should use ``persist()`` after first
+            # token to defer write latency safely on the engine thread.
+            if not async_persist:
+                self._persist(key, entry)
         self._evict_ram()
         self._evict_disk()
+
+    def persist(self, tokens: List[int]) -> None:
+        """Synchronously persist an already-stored immutable snapshot."""
+        key = _tokens_digest(tokens)
+        with self._lock:
+            entry = self._entries.get(key)
+        if entry is not None and entry.cache is not None and len(tokens) >= self.min_persist_tokens:
+            self._persist(key, entry)
+            self._evict_disk()
+
+    def close(self, timeout: float = 10.0) -> None:
+        """Compatibility lifecycle hook; current persistence is stream-bound."""
+        return None
 
     def checkpoint(self, tokens: List[int], done: int, prompt_cache: List[Any]) -> None:
         """Persist the live cache state for ``tokens[:done]`` (no deep copy in
@@ -384,4 +412,34 @@ class PrefixCacheStore:
                 "resident_bytes": sum(e.nbytes for e in resident),
                 "hits": self.hits,
                 "misses": self.misses,
+                "copy_seconds": self.copy_seconds,
             }
+
+    def clear(self) -> int:
+        """Remove all cached prefixes for this model and return their count."""
+        with self._lock:
+            count = len(self._entries)
+            self._entries.clear()
+            self.hits = 0
+            self.misses = 0
+        for path in self.dir.glob("*.safetensors"):
+            path.unlink(missing_ok=True)
+            Path(str(path) + ".json").unlink(missing_ok=True)
+        return count
+
+    def trim_ram(self, target_bytes: int = 0) -> int:
+        """Drop least-recently-used RAM copies until at or below target."""
+        with self._lock:
+            resident = [e for e in self._entries.values() if e.cache is not None]
+            before = sum(e.nbytes for e in resident)
+            resident.sort(key=lambda e: e.last_used)
+            total = before
+            for entry in resident:
+                if total <= target_bytes:
+                    break
+                total -= entry.nbytes
+                entry.cache = None
+                entry.nbytes = 0
+                if entry.path is None:
+                    self._entries.pop(_tokens_digest(entry.tokens), None)
+            return before - total
