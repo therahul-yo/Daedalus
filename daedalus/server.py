@@ -50,13 +50,62 @@ class ServerState:
     lock: threading.Lock
 
 
+_TEMPLATE_ROLES = {"system", "user", "assistant", "tool"}
+
+
+def normalize_messages(messages: List[dict]) -> List[dict]:
+    """Map OpenAI wire-format quirks onto what HF chat templates accept.
+
+    - role "developer" (newer OpenAI convention, sent by pi) -> "system";
+      other unknown roles -> "user" (templates raise on unknown roles)
+    - content parts [{type: "text", text: ...}] -> flattened string
+    - assistant tool_calls function.arguments JSON string -> dict (Qwen-style
+      templates iterate arguments as a mapping)
+    - content: null -> ""
+    """
+    out = []
+    for msg in messages:
+        m = dict(msg)
+        role = m.get("role")
+        if role not in _TEMPLATE_ROLES:
+            m["role"] = "system" if role == "developer" else "user"
+            if role != "developer":
+                logger.warning("unknown message role %r -> user", role)
+        content = m.get("content")
+        if isinstance(content, list):
+            m["content"] = "".join(
+                part.get("text", "")
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+        elif content is None:
+            m["content"] = ""
+        if m.get("tool_calls"):
+            calls = []
+            for call in m["tool_calls"]:
+                call = json.loads(json.dumps(call))  # deep copy
+                fn = call.get("function", {})
+                args = fn.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        fn["arguments"] = json.loads(args) if args.strip() else {}
+                    except json.JSONDecodeError:
+                        fn["arguments"] = {"_raw": args}
+                calls.append(call)
+            m["tool_calls"] = calls
+        out.append(m)
+    return out
+
+
 def build_prompt_tokens(
     state: ServerState, messages: List[dict], tools: Optional[List[dict]] = None
 ) -> List[int]:
     kwargs = {"add_generation_prompt": True}
     if tools:
         kwargs["tools"] = tools
-    return state.engine.tokenizer.apply_chat_template(messages, **kwargs)
+    return state.engine.tokenizer.apply_chat_template(
+        normalize_messages(messages), **kwargs
+    )
 
 
 def _sse(data: dict) -> str:
@@ -138,7 +187,21 @@ def create_app(
         if body.get("tool_choice") == "none":
             tools = None
 
-        tokens = build_prompt_tokens(state, messages, tools)
+        try:
+            tokens = build_prompt_tokens(state, messages, tools)
+        except Exception as exc:
+            # Surface template/format problems as a proper 400 instead of an
+            # opaque 500 the client silently retries.
+            logger.warning("prompt build failed: %s", exc)
+            return JSONResponse(
+                {
+                    "error": {
+                        "message": f"prompt could not be templated: {exc}",
+                        "type": "invalid_request_error",
+                    }
+                },
+                status_code=400,
+            )
         request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
 
