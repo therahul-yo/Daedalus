@@ -1,0 +1,442 @@
+<title>daedalus — the thermal inference engine for MacBook Air</title>
+<style>
+  :root {
+    --bg: #000000;
+    --panel: #0a0a0a;
+    --border: #1f1f1f;
+    --border-lit: #333333;
+    --ink: #ededed;
+    --gray: #a1a1a1;
+    --gray-dark: #666666;
+    --blue-a: #007cf0; --blue-b: #00dfd8;
+    --purp-a: #7928ca; --purp-b: #ff0080;
+    --fire-a: #ff4d4d; --fire-b: #f9cb28;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+  pre, code, .mono { font-family: "SF Mono", Menlo, Monaco, "Courier New", monospace; }
+  pre { overflow-x: auto; }
+  a { color: inherit; text-decoration: none; }
+  ::selection { background: #333; color: #fff; }
+
+  /* ---------- shell: vercel-style guide rails with + intersections ---------- */
+  .shell { max-width: 1024px; margin: 0 auto; position: relative; }
+  @media (min-width: 1080px) {
+    .shell { border-left: 1px solid var(--border); border-right: 1px solid var(--border); }
+  }
+  .band { border-top: 1px solid var(--border); position: relative; }
+  @media (min-width: 1080px) {
+    .band::before, .band::after {
+      content: "+"; position: absolute; top: -11px; color: #444;
+      font: 400 14px/1 "SF Mono", Menlo, monospace; background: var(--bg); z-index: 2;
+    }
+    .band::before { left: -7px; }
+    .band::after { right: -7px; }
+  }
+  .pad { padding: 0 32px; }
+  @media (max-width: 600px) { .pad { padding: 0 20px; } }
+
+  /* ---------- nav ---------- */
+  nav {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 18px 32px;
+  }
+  .logo { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 15px; letter-spacing: -0.01em; }
+  .logo .mark {
+    width: 22px; height: 22px; display: inline-block;
+    background: conic-gradient(from 200deg, #007cf0, #7928ca, #ff0080, #ff4d4d, #f9cb28, #007cf0);
+    clip-path: polygon(50% 0%, 100% 100%, 0% 100%);
+  }
+  nav .links { display: flex; align-items: center; gap: 26px; font-size: 14px; color: var(--gray); }
+  nav .links a:hover { color: var(--ink); }
+  .pill {
+    display: inline-block; font-size: 14px; font-weight: 500;
+    padding: 8px 18px; border-radius: 9999px;
+    background: var(--ink); color: #000;
+    transition: background 0.15s;
+  }
+  .pill:hover { background: #cccccc; }
+  .pill.ghost {
+    background: transparent; color: var(--ink);
+    border: 1px solid var(--border-lit);
+    transition: border-color 0.15s;
+  }
+  .pill.ghost:hover { border-color: var(--ink); background: transparent; }
+
+  /* ---------- hero ---------- */
+  .hero { text-align: center; padding: 108px 24px 96px; }
+  .hero h1 {
+    font-size: clamp(52px, 9.5vw, 104px);
+    font-weight: 800;
+    letter-spacing: -0.055em;
+    line-height: 1.04;
+  }
+  .hero h1 span {
+    display: block;
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    padding-bottom: 0.06em;
+    opacity: 0; transform: translateY(14px);
+    animation: rise 0.7s cubic-bezier(0.2, 0.7, 0.2, 1) forwards;
+  }
+  .hero h1 .l1 { background-image: linear-gradient(90deg, var(--blue-a), var(--blue-b)); animation-delay: 0.05s; }
+  .hero h1 .l2 { background-image: linear-gradient(90deg, var(--purp-a), var(--purp-b)); animation-delay: 0.2s; }
+  .hero h1 .l3 { background-image: linear-gradient(90deg, var(--fire-a), var(--fire-b)); animation-delay: 0.35s; }
+  @keyframes rise { to { opacity: 1; transform: none; } }
+  .hero .sub {
+    margin: 34px auto 0; max-width: 640px;
+    font-size: 19px; color: var(--gray); line-height: 1.65;
+    opacity: 0; animation: rise 0.7s 0.5s cubic-bezier(0.2, 0.7, 0.2, 1) forwards;
+  }
+  .hero .sub b { color: var(--ink); font-weight: 600; }
+  .hero .ctas {
+    margin-top: 40px; display: flex; gap: 14px; justify-content: center; flex-wrap: wrap;
+    opacity: 0; animation: rise 0.7s 0.62s cubic-bezier(0.2, 0.7, 0.2, 1) forwards;
+  }
+  .hero .pill { padding: 12px 28px; font-size: 15px; }
+
+  /* ---------- terminal panel ---------- */
+  .shot { padding: 0 32px 88px; }
+  @media (max-width: 600px) { .shot { padding: 0 16px 64px; } }
+  .term {
+    max-width: 780px; margin: 0 auto;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 0 0 1px rgba(255,255,255,0.02), 0 24px 80px rgba(0,0,0,0.8);
+  }
+  .term-bar {
+    display: flex; align-items: center; gap: 8px;
+    padding: 12px 16px; border-bottom: 1px solid var(--border);
+  }
+  .term-bar i { width: 11px; height: 11px; border-radius: 50%; background: #2e2e2e; }
+  .term-bar span { margin-left: 10px; font-size: 12px; color: var(--gray-dark); font-family: "SF Mono", Menlo, monospace; }
+  .term pre { padding: 20px 22px; font-size: 12.5px; line-height: 1.95; color: var(--gray); }
+  .term .t { color: var(--gray-dark); }
+  .term .ok { color: #50e3c2; }
+  .term .hot { color: #f5a623; }
+  .term .req { color: var(--ink); }
+
+  /* ---------- stats ---------- */
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); }
+  @media (max-width: 720px) { .stats { grid-template-columns: repeat(2, 1fr); } }
+  .stat {
+    padding: 44px 28px; text-align: center;
+    border-left: 1px solid var(--border);
+  }
+  .stat:first-child { border-left: 0; }
+  @media (max-width: 720px) {
+    .stat { border-left: 0; border-top: 1px solid var(--border); }
+    .stat:nth-child(1), .stat:nth-child(2) { border-top: 0; }
+    .stat:nth-child(even) { border-left: 1px solid var(--border); }
+  }
+  .stat .n {
+    font-size: clamp(36px, 5vw, 52px); font-weight: 700; letter-spacing: -0.04em;
+    font-variant-numeric: tabular-nums; color: var(--ink); line-height: 1.1;
+  }
+  .stat .d { margin-top: 10px; font-size: 13.5px; color: var(--gray); }
+  .stat .d b { color: var(--gray); font-weight: 400; }
+
+  /* ---------- section headers ---------- */
+  .sec { padding: 96px 32px; }
+  @media (max-width: 600px) { .sec { padding: 72px 20px; } }
+  .kicker {
+    font-family: "SF Mono", Menlo, monospace;
+    font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--gray-dark); margin-bottom: 18px;
+  }
+  h2 {
+    font-size: clamp(30px, 4.6vw, 44px); font-weight: 700; letter-spacing: -0.04em;
+    line-height: 1.15; max-width: 640px; text-wrap: balance;
+  }
+  .lede { margin-top: 18px; max-width: 560px; color: var(--gray); font-size: 16.5px; }
+
+  /* ---------- comparison bars ---------- */
+  .compare { margin-top: 52px; display: grid; gap: 26px; max-width: 720px; }
+  .cbar .label {
+    display: flex; justify-content: space-between; font-size: 13.5px; margin-bottom: 10px;
+  }
+  .cbar .label .who { color: var(--ink); font-weight: 500; }
+  .cbar .label .val { color: var(--gray); font-family: "SF Mono", Menlo, monospace; font-size: 12.5px; }
+  .cbar .track { height: 10px; border-radius: 9999px; background: #141414; overflow: hidden; }
+  .cbar .fill {
+    height: 100%; border-radius: 9999px; width: 0;
+    transition: width 1.2s cubic-bezier(0.2, 0.7, 0.2, 1);
+  }
+  .cbar.bad .fill { background: linear-gradient(90deg, var(--fire-a), var(--fire-b)); }
+  .cbar.good .fill { background: linear-gradient(90deg, var(--blue-a), var(--blue-b)); }
+  .cbar .note { margin-top: 8px; font-size: 12.5px; color: var(--gray-dark); }
+  .footnote { margin-top: 30px; font-size: 13px; color: var(--gray-dark); }
+  .footnote code { color: var(--gray); font-size: 12px; }
+
+  /* ---------- features ---------- */
+  .grid {
+    display: grid; grid-template-columns: repeat(3, 1fr);
+    border-top: 1px solid var(--border);
+  }
+  @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } }
+  .cell {
+    padding: 34px 30px 38px;
+    border-left: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+    transition: background 0.2s;
+  }
+  .cell:nth-child(3n+1) { border-left: 0; }
+  @media (max-width: 860px) { .cell { border-left: 0 !important; } }
+  .cell:hover { background: #0d0d0d; }
+  .cell .ic { font-size: 18px; margin-bottom: 16px; color: var(--gray); }
+  .cell h3 { font-size: 15.5px; font-weight: 600; letter-spacing: -0.01em; margin-bottom: 8px; }
+  .cell p { font-size: 14px; color: var(--gray); line-height: 1.65; }
+  .cell code { font-size: 12.5px; color: var(--ink); background: #161616; padding: 1px 6px; border-radius: 5px; }
+
+  /* ---------- install ---------- */
+  .install { text-align: center; }
+  .install h2 { margin: 0 auto; }
+  .cmd {
+    margin: 36px auto 0; max-width: 620px;
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 15px 20px; font-family: "SF Mono", Menlo, monospace; font-size: 13.5px;
+    color: var(--ink); text-align: left;
+  }
+  .cmd .dollar { color: var(--gray-dark); margin-right: 10px; }
+  .cmd button {
+    font: inherit; font-size: 12px; color: var(--gray); background: none;
+    border: 1px solid var(--border-lit); border-radius: 6px; padding: 4px 12px; cursor: pointer;
+    flex-shrink: 0;
+  }
+  .cmd button:hover { color: var(--ink); border-color: var(--ink); }
+  .install .then { margin-top: 26px; color: var(--gray); font-size: 14.5px; }
+  .install .then code { color: var(--ink); background: #161616; padding: 2px 8px; border-radius: 6px; font-size: 13px; }
+
+  /* ---------- footer ---------- */
+  footer {
+    padding: 36px 32px 60px;
+    display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap;
+    color: var(--gray-dark); font-size: 13.5px;
+  }
+  footer a { color: var(--gray); }
+  footer a:hover { color: var(--ink); }
+
+  .reveal { opacity: 0; transform: translateY(18px); transition: opacity 0.7s ease, transform 0.7s ease; }
+  .reveal.in { opacity: 1; transform: none; }
+  @media (prefers-reduced-motion: reduce) {
+    .hero h1 span, .hero .sub, .hero .ctas { animation: none; opacity: 1; transform: none; }
+    .reveal { opacity: 1; transform: none; transition: none; }
+    .cbar .fill { transition: none; }
+    html { scroll-behavior: auto; }
+  }
+</style>
+
+<div class="shell">
+  <nav>
+    <a class="logo" href="#"><span class="mark" aria-hidden="true"></span>daedalus</a>
+    <span class="links">
+      <a href="#benchmarks">Benchmarks</a>
+      <a href="#features">Features</a>
+      <a href="https://github.com/ml-explore/mlx-lm">MLX</a>
+      <a class="pill" href="#install">Install</a>
+    </span>
+  </nav>
+
+  <div class="band">
+    <div class="hero">
+      <h1>
+        <span class="l1">Cache.</span>
+        <span class="l2">Pace.</span>
+        <span class="l3">Fly.</span>
+      </h1>
+      <p class="sub">daedalus is the thermally-governed inference engine for MacBook&nbsp;Air.
+      Your agent's <b>20,000-token prompt</b> is prefilled <b>once</b>, paced under thermal
+      pressure, and <b>never times out again</b>.</p>
+      <div class="ctas">
+        <a class="pill" href="#install">Get Started</a>
+        <a class="pill ghost" href="#benchmarks">Read the Benchmarks</a>
+      </div>
+    </div>
+  </div>
+
+  <div class="band">
+    <div class="shot" style="padding-top: 72px;">
+      <div class="term">
+        <div class="term-bar"><i></i><i></i><i></i><span>daedalus serve — 127.0.0.1:8484</span></div>
+        <pre>
+<span class="t">──────────────────────────────────────────────────</span>
+  daedalus v0.1 — wings that don't melt
+<span class="t">──────────────────────────────────────────────────</span>
+  model    mlx-community/Qwen3.5-9B-MLX-4bit
+  loaded   4.2s · 6.10 GB weights · kv cache 8-bit
+  thermal  <span class="ok">NOMINAL</span> · profile balanced
+  api      http://127.0.0.1:8484/v1
+
+<span class="t">10:41:22 │</span> <span class="req">→ f3ab21 · 8,027 tok · 4 tools · stream</span>
+<span class="t">10:41:22 │</span>   f3ab21 · <span class="ok">cache hit 8,026/8,027 (disk)</span> — prefilling 1
+<span class="t">10:41:24 │</span> <span class="req">← f3ab21 · 2.4s</span> · decode 48 tok @ 20.4 tok/s · <span class="ok">NOMINAL</span>
+<span class="t">10:44:07 │</span> <span class="req">→ 9c11e0 · 21,458 tok · cold prefill</span>
+<span class="t">10:44:39 │</span>   9c11e0 · prefill 52% @ 157 tok/s · <span class="hot">MODERATE — pacing</span>
+<span class="t">10:46:12 │</span> <span class="req">← 9c11e0 · 124.8s</span> · checkpointed · thermal recovered → <span class="ok">NOMINAL</span></pre>
+      </div>
+    </div>
+  </div>
+
+  <div class="band">
+    <div class="stats">
+      <div class="stat">
+        <div class="n">218×</div>
+        <p class="d">faster warm turns<br>0.24s vs 52.2s TTFT</p>
+      </div>
+      <div class="stat">
+        <div class="n">−20%</div>
+        <p class="d">total GPU time<br>for identical work</p>
+      </div>
+      <div class="stat">
+        <div class="n">21%</div>
+        <p class="d">time throttled,<br>down from 50%</p>
+      </div>
+      <div class="stat">
+        <div class="n">157</div>
+        <p class="d">tok/s sustained,<br>zero decay</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="band" id="benchmarks">
+    <div class="sec reveal">
+      <p class="kicker">Benchmarks — M4 MacBook Air 16GB, Qwen3.5-9B 4-bit</p>
+      <h2>The middle path is the fast path.</h2>
+      <p class="lede">Four consecutive 20k-token prefills, cooled to nominal before each arm.
+      Unpaced, the Air throttles inside the first prompt and keeps degrading. Paced, the silicon
+      never throttles — the same work costs 20% fewer GPU-seconds.</p>
+      <div class="compare">
+        <div class="cbar bad">
+          <div class="label"><span class="who">Stock engine (governor off)</span><span class="val">647s GPU · rate decays 133 → 119 tok/s</span></div>
+          <div class="track"><div class="fill" data-w="100%"></div></div>
+          <p class="note">50% of the run throttled at HEAVY thermal pressure. Every round slower than the last.</p>
+        </div>
+        <div class="cbar good">
+          <div class="label"><span class="who">daedalus (governor on)</span><span class="val">515s GPU · stable 157 tok/s</span></div>
+          <div class="track"><div class="fill" data-w="79.6%"></div></div>
+          <p class="note">21% throttled. Recovers to NOMINAL between rounds. Rate never decays.</p>
+        </div>
+      </div>
+      <p class="footnote">Every number measured on real hardware — raw traces in
+      <code>bench/results/</code>, reproduce with <code>bench/thermal_validation.py</code>.
+      With the prefix cache, a given prompt pays its cold prefill exactly once, ever.</p>
+    </div>
+  </div>
+
+  <div class="band" id="features">
+    <div class="sec reveal" style="padding-bottom: 0;">
+      <p class="kicker">Why it exists</p>
+      <h2>Built for the machine everyone actually owns.</h2>
+      <p class="lede">Every other MLX engine is benchmarked on fan-cooled Studios and Maxes.
+      daedalus treats the fanless Air's thermal envelope as the design constraint.</p>
+    </div>
+    <div class="grid" style="margin-top: 56px;">
+      <div class="cell">
+        <div class="ic mono">▲▲</div>
+        <h3>Persistent prefix cache</h3>
+        <p>Your agent's system prompt is prefilled once, ever — saved to disk as KV state,
+        recalled on every later turn, across restarts. Correct even for hybrid-attention models
+        (Qwen3.5, Gemma&nbsp;4) where stock servers silently miss.</p>
+      </div>
+      <div class="cell">
+        <div class="ic mono">⟲</div>
+        <h3>Resumable prefill</h3>
+        <p>Checkpoints every 4k tokens. A timeout, crash, or a client's hard 300-second deadline
+        never repeats completed work — the retry resumes exactly where it stopped.</p>
+      </div>
+      <div class="cell">
+        <div class="ic mono">◐</div>
+        <h3>Thermal governor</h3>
+        <p>Reads macOS's five-level thermal-pressure signal live — no <code>sudo</code> — and
+        duty-cycles prefill against it. Three profiles: <code>performance</code>,
+        <code>balanced</code>, <code>cool</code>. The first of its kind in local inference.</p>
+      </div>
+      <div class="cell">
+        <div class="ic mono">≋</div>
+        <h3>Keepalives with telemetry</h3>
+        <p>SSE heartbeats stream progress, thermal state, and ETA from the first second of a
+        long prefill, so idle-timeout clients never disconnect.</p>
+      </div>
+      <div class="cell">
+        <div class="ic mono">ƒ</div>
+        <h3>Strict tool-call streaming</h3>
+        <p>OpenAI-format deltas with explicit indexes, never an empty <code>tool_calls</code>
+        array — the malformed shapes that hang agents are structurally impossible.</p>
+      </div>
+      <div class="cell">
+        <div class="ic mono">◔</div>
+        <h3>Reasoning separation</h3>
+        <p>Chain-of-thought from thinking models is split into <code>reasoning_content</code> —
+        it never leaks into the visible reply. pi, OpenCode, and any OpenAI-compatible client
+        just work.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="band" id="install">
+    <div class="sec install reveal">
+      <p class="kicker">Install</p>
+      <h2>Up in three commands.</h2>
+      <div class="cmd">
+        <span><span class="dollar">$</span>uv tool install --editable . --with "transformers&gt;=5.0,&lt;5.11"</span>
+        <button data-copy='uv tool install --editable . --with "transformers>=5.0,<5.11"'>Copy</button>
+      </div>
+      <div class="cmd">
+        <span><span class="dollar">$</span>daedalus serve --model mlx-community/Qwen3.5-9B-MLX-4bit --port 8484</span>
+        <button data-copy="daedalus serve --model mlx-community/Qwen3.5-9B-MLX-4bit --port 8484">Copy</button>
+      </div>
+      <p class="then">Then point pi, OpenCode, or any OpenAI-compatible agent at
+      <code>http://127.0.0.1:8484/v1</code></p>
+    </div>
+  </div>
+
+  <div class="band">
+    <footer>
+      <span>daedalus — Apache-2.0</span>
+      <span>Built on <a href="https://github.com/ml-explore/mlx-lm">mlx-lm</a> · Validated on a real MacBook Air · No wax was melted</span>
+    </footer>
+  </div>
+</div>
+
+<script>
+  const io = new IntersectionObserver(
+    (es) => es.forEach((e) => e.isIntersecting && e.target.classList.add("in")),
+    { threshold: 0.12 }
+  );
+  document.querySelectorAll(".reveal").forEach((el) => io.observe(el));
+
+  // comparison bars animate to width when visible
+  const bars = new IntersectionObserver(
+    (es) =>
+      es.forEach((e) => {
+        if (!e.isIntersecting) return;
+        e.target.querySelectorAll(".fill").forEach((f) => (f.style.width = f.dataset.w));
+        bars.unobserve(e.target);
+      }),
+    { threshold: 0.4 }
+  );
+  document.querySelectorAll(".compare").forEach((el) => bars.observe(el));
+
+  // copy buttons
+  document.querySelectorAll("[data-copy]").forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(btn.dataset.copy);
+        const old = btn.textContent;
+        btn.textContent = "Copied";
+        setTimeout(() => (btn.textContent = old), 1200);
+      } catch {}
+    })
+  );
+</script>
