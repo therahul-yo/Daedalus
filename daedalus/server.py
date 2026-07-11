@@ -69,6 +69,8 @@ class ServerState:
     max_active_memory_bytes: Optional[int] = None
     max_prompt_tokens: int = 65536
     max_completion_tokens: int = 4096
+    requests_per_minute: int = 0
+    rate_windows: dict[str, tuple[float, int]] = None
 
     def try_admit(self) -> bool:
         with self.admission_lock:
@@ -91,6 +93,20 @@ class ServerState:
         if trim:
             trim(0)
         return getattr(self.engine, "active_memory_bytes", lambda: 0)() < self.max_active_memory_bytes
+
+    def allow_client(self, key: str) -> bool:
+        if self.requests_per_minute <= 0:
+            return True
+        now = time.monotonic()
+        with self.admission_lock:
+            started, count = self.rate_windows.get(key, (now, 0))
+            if now - started >= 60:
+                started, count = now, 0
+            if count >= self.requests_per_minute:
+                self.rate_windows[key] = (started, count)
+                return False
+            self.rate_windows[key] = (started, count + 1)
+            return True
 
 
 class PromptTokenCache:
@@ -255,6 +271,7 @@ def create_app(
     max_active_memory_bytes: Optional[int] = None,
     max_prompt_tokens: int = 65536,
     max_completion_tokens: int = 4096,
+    requests_per_minute: int = 0,
 ) -> FastAPI:
     if max_pending_requests < 1:
         raise ValueError("max_pending_requests must be at least 1")
@@ -262,6 +279,8 @@ def create_app(
         raise ValueError("token_cache_entries must be at least 1")
     if max_prompt_tokens < 1 or max_completion_tokens < 1:
         raise ValueError("token limits must be positive")
+    if requests_per_minute < 0:
+        raise ValueError("requests_per_minute cannot be negative")
     state = ServerState(
         engine=engine, store=store, model_id=model_id, lock=FifoLock(),
         max_pending_requests=max_pending_requests, api_key=api_key,
@@ -271,6 +290,8 @@ def create_app(
         max_active_memory_bytes=max_active_memory_bytes,
         max_prompt_tokens=max_prompt_tokens,
         max_completion_tokens=max_completion_tokens,
+        requests_per_minute=requests_per_minute,
+        rate_windows={},
     )
 
     @asynccontextmanager
@@ -355,6 +376,10 @@ def create_app(
     async def chat_completions(request: Request, authorization: Optional[str] = Header(default=None)):
         if not authorized(authorization):
             return error("invalid API key", 401, "authentication_error")
+        client_key = authorization or (request.client.host if request.client else "local")
+        if not state.allow_client(client_key):
+            state.metrics.inc_request("rate_limited")
+            return error("request rate limit exceeded", 429, "rate_limit_error")
         try:
             body = await request.json()
         except Exception:

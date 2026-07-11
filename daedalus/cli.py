@@ -91,6 +91,7 @@ def cmd_serve(args) -> int:
         max_active_memory_bytes=args.max_active_memory_gb * 1024**3 if args.max_active_memory_gb else None,
         max_prompt_tokens=args.max_prompt_tokens,
         max_completion_tokens=args.max_completion_tokens,
+        requests_per_minute=args.requests_per_minute,
     )
 
     bar = "─" * 62
@@ -290,6 +291,8 @@ def main() -> int:
     )
     serve.add_argument("--max-prompt-tokens", type=int, default=65536)
     serve.add_argument("--max-completion-tokens", type=int, default=4096)
+    serve.add_argument("--requests-per-minute", type=int, default=0,
+                       help="per-client LAN limit; 0 disables rate limiting")
     serve.add_argument("--kv-bits", type=int, default=8)
     serve.add_argument(
         "--prefill-chunk-tokens", type=int,
@@ -359,6 +362,8 @@ def main() -> int:
             ap.error("--max-active-memory-gb must be positive")
         if args.max_prompt_tokens < 1 or args.max_completion_tokens < 1:
             ap.error("token limits must be positive")
+        if args.requests_per_minute < 0:
+            ap.error("--requests-per-minute cannot be negative")
         if args.num_draft_tokens < 0:
             ap.error("--num-draft-tokens cannot be negative")
         if args.num_draft_tokens and not args.draft_model:

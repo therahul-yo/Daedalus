@@ -333,6 +333,14 @@ def test_server_enforces_prompt_and_completion_limits():
     ).status_code == 400
 
 
+def test_server_rate_limit():
+    engine, store = FakeEngine(), FakeStore()
+    client = TestClient(create_app(engine, store, model_id="test-model", requests_per_minute=1))
+    payload = {"messages": [{"role": "user", "content": "hi"}]}
+    assert client.post("/v1/chat/completions", json=payload).status_code == 200
+    assert client.post("/v1/chat/completions", json=payload).status_code == 429
+
+
 TOOLS = [
     {
         "type": "function",
