@@ -150,6 +150,7 @@ def cmd_serve(args) -> int:
         audit_log_path=args.audit_log_path,
         governor=governor,
         monitor=monitor,
+        stream_interval=args.stream_interval,
     )
 
     try:
@@ -922,6 +923,12 @@ def main() -> int:
         "--audit-log-path",
         type=str,
         help="path to audit log file (JSON lines); stderr if omitted",
+    )
+    serve.add_argument(
+        "--stream-interval",
+        type=int,
+        default=1,
+        help="tokens per SSE yield; batch tokens to reduce Python overhead (default: 1, vllm-mlx uses 16)",
     )
     serve.add_argument(
         "--log-level",

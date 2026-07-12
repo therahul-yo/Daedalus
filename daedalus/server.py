@@ -468,6 +468,7 @@ def create_app(
     audit_log_path: Optional[str] = None,
     governor: Optional[ThermalGovernor] = None,
     monitor: Optional[ThermalMonitor] = None,
+    stream_interval: int = 1,  # NEW: tokens per SSE yield
 ) -> FastAPI:
     if max_pending_requests < 1:
         raise ValueError("max_pending_requests must be at least 1")
@@ -899,6 +900,7 @@ def create_app(
                 head_boundary=head_boundary,
                 request_id=request_id,
                 created=created,
+                stream_interval=stream_interval,
             )
 
             if stream:
@@ -973,6 +975,7 @@ class _Generation:
         head_boundary: Optional[int] = None,
         request_id: str = "",
         created: int = 0,
+        stream_interval: int = 1,
     ):
         self.state = state
         self.tokens = tokens
@@ -984,6 +987,7 @@ class _Generation:
         self.head_boundary = head_boundary
         self.request_id = request_id
         self.created = created
+        self.stream_interval = stream_interval
         self.cached_tokens = 0
         self.prefill_done = 0
         self.aborted = threading.Event()
@@ -1128,6 +1132,7 @@ class _Generation:
 
                 t_start = time.monotonic()
                 try:
+                    tokens_since_yield = 0
                     for resp in state.engine.generate(
                         self.tokens,
                         max_tokens=self.max_tokens,
@@ -1149,7 +1154,14 @@ class _Generation:
                             t_first_token = time.monotonic()
                         if resp.text:
                             output_events = route(resp.text)
-                            yield from output_events
+                            # Yield tokens in batches based on stream_interval
+                            for event in output_events:
+                                yield event
+                                if event.get("type") == "delta":
+                                    tokens_since_yield += 1
+                                    if tokens_since_yield >= self.stream_interval:
+                                        # Force yield control to allow other coroutines
+                                        tokens_since_yield = 0
                         # Generator yields above before continuing here, so the
                         # client can receive first content before disk I/O. MLX
                         # cache serialization must remain on this engine thread.
