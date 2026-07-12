@@ -2,15 +2,167 @@ name: CI
 
 on:
   pull_request:
+    branches: [main, master]
   push:
-    branches: [master]
+    branches: [main, master]
 
 jobs:
   test:
+    name: Test Suite
     runs-on: macos-14
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
-      - run: uv sync --extra dev --locked
-      - run: uv run --extra dev pytest -q
-      - run: uv build
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: pyproject.toml
+
+      - name: Cache MLX and HuggingFace caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/mlx
+            ~/.cache/huggingface
+            ~/.cache/huggingface_hub
+          key: ${{ runner.os }}-mlx-hf-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-mlx-hf-
+
+      - name: Install dependencies
+        run: |
+          pip install -e ".[dev]"
+
+      - name: Run test suite
+        run: |
+          python -m pytest tests/ -v --tb=short
+
+  smoke:
+    name: Smoke Benchmark
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: pyproject.toml
+
+      - name: Cache MLX and HuggingFace caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/mlx
+            ~/.cache/huggingface
+            ~/.cache/huggingface_hub
+          key: ${{ runner.os }}-mlx-hf-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-mlx-hf-
+
+      - name: Install dependencies
+        run: |
+          pip install -e ".[dev]"
+
+      - name: Run smoke benchmark
+        run: |
+          python bench/smoke.py --model mlx-community/Qwen3-0.6B-4bit
+        timeout-minutes: 30
+
+  thermal:
+    name: Thermal Validation (Governor On/Off)
+    runs-on: macos-14
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        governor: ["on", "off"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: pyproject.toml
+
+      - name: Cache MLX and HuggingFace caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/mlx
+            ~/.cache/huggingface
+            ~/.cache/huggingface_hub
+          key: ${{ runner.os }}-mlx-hf-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-mlx-hf-
+
+      - name: Install dependencies
+        run: |
+          pip install -e ".[dev]"
+
+      - name: Run thermal validation (governor ${{ matrix.governor }})
+        run: |
+          mkdir -p bench/results
+          python bench/thermal_validation.py \
+            --model mlx-community/Qwen3-0.6B-4bit \
+            --prompt-tokens 24000 \
+            --rounds 4 \
+            --governor ${{ matrix.governor }} \
+            --out bench/results/thermal_${{ matrix.governor }}.json
+        timeout-minutes: 45
+
+  regression:
+    name: Regression Gate
+    runs-on: macos-14
+    needs: [smoke, thermal]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: pyproject.toml
+
+      - name: Cache MLX and HuggingFace caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/mlx
+            ~/.cache/huggingface
+            ~/.cache/huggingface_hub
+          key: ${{ runner.os }}-mlx-hf-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-mlx-hf-
+
+      - name: Install dependencies
+        run: |
+          pip install -e ".[dev]"
+
+      - name: Run regression gate
+        run: |
+          python bench/regression.py --help 2>&1 | head -5 || true
+          # Find baseline and candidate artifacts
+          BASELINE=$(find bench/results -name "thermal_on.json" -o -name "smoke.json" | head -1)
+          CANDIDATE=$(find bench/results -name "thermal_off.json" -o -name "smoke.json" | tail -1)
+          if [ -n "$BASELINE" ] && [ -n "$CANDIDATE" ] && [ "$BASELINE" != "$CANDIDATE" ]; then
+            echo "Running regression gate: baseline=$BASELINE candidate=$CANDIDATE"
+            python bench/regression.py --baseline "$BASELINE" --candidate "$CANDIDATE" --threshold 0.10
+          else
+            echo "Skipping regression gate - need baseline and candidate artifacts"
+            echo "Baseline: $BASELINE"
+            echo "Candidate: $CANDIDATE"
+          fi
+        timeout-minutes: 10

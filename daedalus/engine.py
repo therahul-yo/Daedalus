@@ -36,6 +36,25 @@ from mlx_lm.sample_utils import make_sampler
 from daedalus.governor import ThermalGovernor
 from daedalus.sensors import ThermalLevel, ThermalMonitor
 
+# Structured logging
+try:
+    import structlog
+    HAS_STRUCTLOG = True
+except ImportError:
+    structlog = None
+    HAS_STRUCTLOG = False
+
+# OpenTelemetry
+try:
+    from opentelemetry import trace
+    HAS_OTEL = True
+except ImportError:
+    trace = None
+    HAS_OTEL = False
+
+logger = structlog.get_logger(__name__) if HAS_STRUCTLOG else __import__('logging').getLogger(__name__)
+tracer = trace.get_tracer("daedalus.engine") if HAS_OTEL and trace else None
+
 
 class PrefillAborted(Exception):
     """Raised when a prefill is abandoned via the abort hook."""
@@ -164,13 +183,24 @@ class Engine:
         if progress_cb:
             progress_cb(report.computed_tokens, total)
 
+        # Start span for the entire prefill
+        prefill_span = tracer.start_span("prefill") if tracer else None
+        if prefill_span:
+            prefill_span.set_attribute("total_tokens", total)
+            prefill_span.set_attribute("already_cached", already_cached)
+            prefill_span.set_attribute("job_tokens", job_tokens)
+
         thermal_chunk_tokens = self.governor.initial_chunk_tokens()
         chunk_tokens = min(
             self.config.prefill_chunk_tokens or thermal_chunk_tokens,
             thermal_chunk_tokens,
         )
+        
         while total - report.computed_tokens > 1:
             if should_abort and should_abort():
+                if prefill_span:
+                    prefill_span.set_attribute("aborted", True)
+                    prefill_span.end()
                 raise PrefillAborted(
                     f"aborted at {report.computed_tokens}/{total} tokens"
                 )
@@ -182,6 +212,13 @@ class Engine:
                     break
             piece = tokens[report.computed_tokens : report.computed_tokens + n]
 
+            # Start span for this chunk
+            chunk_span = tracer.start_span("prefill_chunk") if tracer else None
+            if chunk_span:
+                chunk_span.set_attribute("chunk_index", report.chunks)
+                chunk_span.set_attribute("chunk_tokens", n)
+                chunk_span.set_attribute("computed_tokens", report.computed_tokens)
+            
             start = self._clock()
             with mx.stream(generation_stream):
                 self.model(mx.array(piece)[None], cache=prompt_cache)
@@ -226,6 +263,33 @@ class Engine:
                 report.idle_seconds += self._idle(
                     decision.sleep_seconds, should_abort
                 )
+            
+            # Log structured info for this chunk
+            logger.info(
+                "prefill_chunk",
+                chunks=report.chunks,
+                computed_tokens=report.computed_tokens,
+                total_tokens=total,
+                chunk_tokens=n,
+                burn_seconds=burn,
+                thermal_level=decision.effective_level.name,
+                next_chunk_tokens=decision.next_chunk_tokens,
+                sleep_seconds=decision.sleep_seconds,
+            )
+            
+            if chunk_span:
+                chunk_span.set_attribute("thermal_level", decision.effective_level.name)
+                chunk_span.set_attribute("next_chunk_tokens", decision.next_chunk_tokens)
+                chunk_span.set_attribute("sleep_seconds", decision.sleep_seconds)
+                chunk_span.end()
+        
+        if prefill_span:
+            prefill_span.set_attribute("chunks", report.chunks)
+            prefill_span.set_attribute("burn_seconds", report.burn_seconds)
+            prefill_span.set_attribute("idle_seconds", report.idle_seconds)
+            prefill_span.set_attribute("max_thermal_level", report.max_level)
+            prefill_span.end()
+        
         return report
 
     def _idle(
@@ -273,17 +337,35 @@ class Engine:
                 should_abort=should_abort,
             )
 
+        # Decode phase span
+        decode_span = tracer.start_span("decode") if tracer else None
+        if decode_span:
+            decode_span.set_attribute("max_tokens", max_tokens)
+            decode_span.set_attribute("temperature", temperature)
+            decode_span.set_attribute("top_p", top_p)
+        
         sampler = make_sampler(temp=temperature, top_p=top_p)
-        yield from stream_generate(
-            self.model,
-            self.tokenizer,
-            prompt=tokens[-1:],
-            prompt_cache=prompt_cache,
-            max_tokens=max_tokens,
-            sampler=sampler,
-            kv_bits=self.config.kv_bits,
-            kv_group_size=self.config.kv_group_size,
-            quantized_kv_start=self.config.quantized_kv_start,
-            draft_model=self.draft_model,
-            num_draft_tokens=self.config.num_draft_tokens,
-        )
+        try:
+            for resp in stream_generate(
+                self.model,
+                self.tokenizer,
+                prompt=tokens[-1:],
+                prompt_cache=prompt_cache,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                kv_bits=self.config.kv_bits,
+                kv_group_size=self.config.kv_group_size,
+                quantized_kv_start=self.config.quantized_kv_start,
+                draft_model=self.draft_model,
+                num_draft_tokens=self.config.num_draft_tokens,
+            ):
+                if decode_span:
+                    decode_span.add_event("token_generated", {
+                        "token": resp.text[:50] if resp.text else "",
+                        "generation_tokens": resp.generation_tokens,
+                        "generation_tps": resp.generation_tps,
+                    })
+                yield resp
+        finally:
+            if decode_span:
+                decode_span.end()
