@@ -180,8 +180,11 @@ inspired by baseRT's public C API. The thermal governor exists in none of them.
 
 ## Status
 
-Working vertical slice, 56 tests. In progress: real-model validation on Qwen3.5-9B and
-Gemma 4 E4B, sustained thermal A/B on the M4 Air (`bench/thermal_validation.py`).
+v0.1: engine, persistent prefix cache, thermal governor, and OpenAI-compatible server are
+implemented and validated on real hardware (M4 Air 16GB, Qwen3.5-9B-4bit): 111 tests,
+thermal A/B benchmarked (`bench/thermal_validation.py`), tool calls and reasoning
+separation verified against pi. Multi-agent audited 2026-07-11; all P0/P1 findings fixed.
+See `CHANGELOG.md`. Next: MTP decode head (raw decode speed), Gemma 4 real-model run.
 
 ## License
 

@@ -231,3 +231,37 @@ def test_head_snapshot_persist_is_deferred():
     assert store.put_persist_flags and all(f is False for f in store.put_persist_flags)
     # ...and the deferred persists landed after generation.
     assert len(store.persist_calls) >= 1
+
+
+# ------------------------------------------------------------ findings 10/11
+
+
+def test_metrics_requires_auth_when_key_set():
+    engine, store = FakeEngine(), FakeStore()
+    app = create_app(engine, store, model_id="test-model", api_key="secret")
+    client = TestClient(app)
+    assert client.get("/metrics").status_code == 401
+    assert (
+        client.get("/metrics", headers={"Authorization": "Bearer secret"}).status_code
+        == 200
+    )
+    # Probes stay open.
+    assert client.get("/health").status_code == 200
+    assert client.get("/readyz").status_code == 200
+
+
+def test_rate_limit_window_expires(monkeypatch):
+    engine, store = FakeEngine(), FakeStore()
+    app = create_app(
+        engine, store, model_id="test-model", requests_per_minute=2
+    )
+    state = app.state.daedalus
+    assert state.allow_client("1.2.3.4")
+    assert state.allow_client("1.2.3.4")
+    assert not state.allow_client("1.2.3.4")  # limit hit
+    # Another client has its own bucket (IP-keyed, finding 11).
+    assert state.allow_client("5.6.7.8")
+    # After the 60s window passes, the original client is admitted again.
+    real_monotonic = time.monotonic
+    monkeypatch.setattr(time, "monotonic", lambda: real_monotonic() + 61)
+    assert state.allow_client("1.2.3.4")

@@ -366,7 +366,13 @@ def create_app(
                              "max_pending_requests": state.max_pending_requests}, status_code=status)
 
     @app.get("/metrics")
-    def metrics():
+    def metrics(authorization: Optional[str] = Header(default=None)):
+        # Usage/cache telemetry is operational data: when the server is
+        # key-protected (i.e. exposed beyond localhost), require the key.
+        # /health and /readyz stay open — they leak nothing and probes
+        # (launchd, uptime checks) can't attach headers.
+        if state.api_key is not None and not authorized(authorization):
+            return error("invalid API key", 401, "authentication_error")
         with state.admission_lock:
             active = state.admitted_requests
         return PlainTextResponse(state.metrics.render(active=active, limit=state.max_pending_requests,
@@ -407,7 +413,9 @@ def create_app(
     async def chat_completions(request: Request, authorization: Optional[str] = Header(default=None)):
         if not authorized(authorization):
             return error("invalid API key", 401, "authentication_error")
-        client_key = authorization or (request.client.host if request.client else "local")
+        # Bucket by client IP, not Authorization: with one shared bearer
+        # token every LAN client would otherwise share a single bucket.
+        client_key = request.client.host if request.client else "local"
         if not state.allow_client(client_key):
             state.metrics.inc_request("rate_limited")
             return error("request rate limit exceeded", 429, "rate_limit_error")
