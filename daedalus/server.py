@@ -15,114 +15,41 @@ Client-compatibility rules learned from OpenCode/pi/Hermes research:
   (before decode — hybrid caches can't be trimmed later) the KV state is
   snapshotted back into the store keyed by the prompt tokens.
 
-Multi-model server: per-model engine/store/router, shared thermal governor,
-request routing by model field in chat completions.
+Single-user engine: one request at a time; a queue lock serializes access.
 """
 
 from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import contextvars
 import hmac
 import json
 import logging
-import logging.handlers
-import os
-import sys
 import threading
 import time
 import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, AsyncGenerator, List, Optional
 
-from fastapi import FastAPI, Header, Request, WebSocket
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, Header, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from starlette.background import BackgroundTask
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request as StarletteRequest
-from starlette.responses import Response as StarletteResponse
-from starlette.websockets import WebSocket as StarletteWebSocket
 
 from daedalus.cache.store import PrefixCacheStore
 from daedalus.engine import Engine, PrefillAborted
-from daedalus.governor import ThermalGovernor
 from daedalus.metrics import ServerMetrics
 from daedalus.reasoning import ThinkStreamFilter
-from daedalus.scheduler import PriorityLock
-from daedalus.sensors import ThermalMonitor
+from daedalus.scheduler import FifoLock
 from daedalus.tools import make_stream_filter
 
 logger = logging.getLogger(__name__)
-
-# Request ID context variable for propagation through all log lines
-request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
-
-# Audit logger for structured security/audit logging
-audit_logger: Optional[logging.Logger] = None
 
 KEEPALIVE_INTERVAL_S = 1.0
 CHECKPOINT_EVERY_TOKENS = 4096
 CHECKPOINT_MIN_JOB_TOKENS = 8192
 CHECKPOINT_MIN_INTERVAL_S = 8.0
-SHORT_PROMPT_THRESHOLD = 2048  # tokens
-DEFAULT_SHUTDOWN_TIMEOUT = 30.0  # seconds
-
-
-class RequestIdMiddleware(BaseHTTPMiddleware):
-    """Middleware to extract and propagate X-Request-ID header through all log lines."""
-
-    async def dispatch(self, request: StarletteRequest, call_next):
-        # Extract or generate request ID
-        request_id = request.headers.get("x-request-id") or f"req-{uuid.uuid4().hex[:12]}"
-        
-        # Set in context variable for log propagation
-        token = request_id_var.set(request_id)
-        
-        try:
-            # Add request ID to response headers
-            response: StarletteResponse = await call_next(request)
-            response.headers["X-Request-ID"] = request_id
-            return response
-        finally:
-            request_id_var.reset(token)
-
-
-class GlobalRateLimiter:
-    """Global token bucket rate limiter for total RPS across all clients."""
-    
-    def __init__(self, max_rps: float, burst: int = 0):
-        self.max_rps = max_rps
-        self.burst = max(1, burst if burst > 0 else max(1, int(max_rps * 2)))
-        self._tokens = float(self.burst)
-        self._last_refill = time.monotonic()
-        self._lock = threading.Lock()
-    
-    def _refill(self) -> None:
-        now = time.monotonic()
-        elapsed = now - self._last_refill
-        self._tokens = min(self.burst, self._tokens + elapsed * self.max_rps)
-        self._last_refill = now
-    
-    def try_acquire(self) -> bool:
-        with self._lock:
-            self._refill()
-            if self._tokens >= 1.0:
-                self._tokens -= 1.0
-                return True
-            return False
-    
-    def acquire_wait(self, timeout: float = 30.0) -> bool:
-        """Wait for a token to become available."""
-        start = time.monotonic()
-        while time.monotonic() - start < timeout:
-            if self.try_acquire():
-                return True
-            time.sleep(0.01)
-        return False
 
 
 @dataclass
@@ -130,7 +57,7 @@ class ServerState:
     engine: Engine
     store: PrefixCacheStore
     model_id: str
-    lock: PriorityLock  # Priority queue for short prompts
+    lock: FifoLock
     max_pending_requests: int
     api_key: Optional[str]
     metrics: ServerMetrics
@@ -142,17 +69,9 @@ class ServerState:
     max_active_memory_bytes: Optional[int] = None
     max_prompt_tokens: int = 65536
     max_completion_tokens: int = 4096
-    requests_per_minute: int = 0  # Per-client rate limit
+    requests_per_minute: int = 0
     rate_windows: dict[str, tuple[float, int]] = None
     max_request_bytes: int = 2 * 1024 * 1024
-    global_rate_limiter: Optional[GlobalRateLimiter] = None
-    shutdown_timeout: float = DEFAULT_SHUTDOWN_TIMEOUT
-    cors_origins: List[str] = field(default_factory=list)
-    cors_allow_credentials: bool = False
-    audit_log_path: Optional[str] = None
-    in_flight_requests: int = 0
-    in_flight_lock: threading.Lock = field(default_factory=threading.Lock)
-    _multi_state: Optional["MultiModelServerState"] = field(default=None, repr=False)
 
     def try_admit(self) -> bool:
         with self.admission_lock:
@@ -177,7 +96,6 @@ class ServerState:
         return getattr(self.engine, "active_memory_bytes", lambda: 0)() < self.max_active_memory_bytes
 
     def allow_client(self, key: str) -> bool:
-        """Per-client rate limiting."""
         if self.requests_per_minute <= 0:
             return True
         now = time.monotonic()
@@ -195,98 +113,6 @@ class ServerState:
                 return False
             self.rate_windows[key] = (started, count + 1)
             return True
-
-    def allow_global_rate(self) -> bool:
-        """Global rate limiting check (fast path)."""
-        if self.global_rate_limiter is None:
-            return True
-        return self.global_rate_limiter.try_acquire()
-
-    def acquire_global_rate(self, timeout: float = 30.0) -> bool:
-        """Wait for global rate limiter token."""
-        if self.global_rate_limiter is None:
-            return True
-        return self.global_rate_limiter.acquire_wait(timeout)
-
-    def start_request(self) -> None:
-        """Track in-flight request for graceful shutdown."""
-        with self.in_flight_lock:
-            self.in_flight_requests += 1
-
-    def finish_request(self) -> None:
-        """Track completed request for graceful shutdown."""
-        with self.in_flight_lock:
-            self.in_flight_requests = max(0, self.in_flight_requests - 1)
-
-    def wait_for_drain(self, timeout: float) -> bool:
-        """Wait for in-flight requests to complete."""
-        start = time.monotonic()
-        while time.monotonic() - start < timeout:
-            with self.in_flight_lock:
-                if self.in_flight_requests == 0:
-                    return True
-            time.sleep(0.1)
-        return False
-
-
-@dataclass
-class MultiModelServerState:
-    """Holds state for multiple models with shared resources."""
-    models: Dict[str, ServerState]  # model_id -> ServerState
-    governor: Optional[ThermalGovernor]
-    monitor: Optional[ThermalMonitor]
-    max_active_memory_bytes: Optional[int] = None
-    global_rate_limiter: Optional[GlobalRateLimiter] = None
-    accepting: bool = True
-    in_flight_requests: int = 0
-    in_flight_lock: threading.Lock = field(default_factory=threading.Lock)
-
-    def get_model(self, model_id: str) -> Optional[ServerState]:
-        return self.models.get(model_id)
-
-    def list_models(self) -> List[dict]:
-        """Return model info for /v1/models endpoint."""
-        result = []
-        for model_id, state in self.models.items():
-            result.append({
-                "id": model_id,
-                "object": "model",
-                "owned_by": "daedalus",
-                "permission": [{"id": f"modelperm-{model_id}", "object": "model_permission", "created": int(time.time()), "allow_create_engine": False, "allow_sampling": True, "allow_logprobs": True, "allow_search_indices": False, "allow_view": True, "allow_fine_tuning": False, "organization": "*", "group": None, "is_blocking": False}],
-                "root": model_id,
-                "parent": None,
-            })
-        return result
-
-    def total_active_memory(self) -> int:
-        """Sum of active memory across all models."""
-        total = 0
-        for state in self.models.values():
-            total += getattr(state.engine, "active_memory_bytes", lambda: 0)()
-        return total
-
-    def memory_available(self) -> bool:
-        """Check if total active memory across all models is within limit."""
-        if self.max_active_memory_bytes is None:
-            return True
-        return self.total_active_memory() < self.max_active_memory_bytes
-
-    def start_request(self) -> None:
-        with self.in_flight_lock:
-            self.in_flight_requests += 1
-
-    def finish_request(self) -> None:
-        with self.in_flight_lock:
-            self.in_flight_requests = max(0, self.in_flight_requests - 1)
-
-    def wait_for_drain(self, timeout: float) -> bool:
-        start = time.monotonic()
-        while time.monotonic() - start < timeout:
-            with self.in_flight_lock:
-                if self.in_flight_requests == 0:
-                    return True
-            time.sleep(0.1)
-        return False
 
 
 class PromptTokenCache:
@@ -448,9 +274,9 @@ def _chunk(
 
 
 def create_app(
-    engines: Dict[str, Engine],
-    stores: Dict[str, PrefixCacheStore],
-    model_ids: List[str],
+    engine: Engine,
+    store: PrefixCacheStore,
+    model_id: str,
     *,
     max_pending_requests: int = 8,
     api_key: Optional[str] = None,
@@ -460,14 +286,6 @@ def create_app(
     max_completion_tokens: int = 4096,
     requests_per_minute: int = 0,
     max_request_bytes: int = 2 * 1024 * 1024,
-    global_rps: float = 0.0,
-    global_burst: int = 0,
-    shutdown_timeout: float = DEFAULT_SHUTDOWN_TIMEOUT,
-    cors_origins: Optional[List[str]] = None,
-    cors_allow_credentials: bool = False,
-    audit_log_path: Optional[str] = None,
-    governor: Optional[ThermalGovernor] = None,
-    monitor: Optional[ThermalMonitor] = None,
 ) -> FastAPI:
     if max_pending_requests < 1:
         raise ValueError("max_pending_requests must be at least 1")
@@ -479,464 +297,248 @@ def create_app(
         raise ValueError("requests_per_minute cannot be negative")
     if max_request_bytes < 1:
         raise ValueError("max_request_bytes must be positive")
-    if global_rps < 0:
-        raise ValueError("global_rps cannot be negative")
-    if shutdown_timeout <= 0:
-        raise ValueError("shutdown_timeout must be positive")
-
-    # Set up audit logger
-    global audit_logger
-    if audit_log_path:
-        audit_logger = logging.getLogger("daedalus.audit")
-        audit_logger.setLevel(logging.INFO)
-        audit_logger.propagate = False
-        if audit_log_path == "stderr":
-            handler = logging.StreamHandler(sys.stderr)
-        else:
-            handler = logging.handlers.RotatingFileHandler(
-                audit_log_path, maxBytes=10 * 1024 * 1024, backupCount=5
-            )
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        audit_logger.addHandler(handler)
-
-    # Create shared multi-model state first
-    multi_state = MultiModelServerState(
-        models={},
-        governor=governor,
-        monitor=monitor,
+    state = ServerState(
+        engine=engine, store=store, model_id=model_id, lock=FifoLock(),
+        max_pending_requests=max_pending_requests, api_key=api_key,
+        metrics=ServerMetrics(), admission_lock=threading.Lock(),
+        token_cache=PromptTokenCache(token_cache_entries),
+        head_cache=SharedHeadIndex(),
         max_active_memory_bytes=max_active_memory_bytes,
-        global_rate_limiter=GlobalRateLimiter(global_rps, global_burst) if global_rps > 0 else None,
+        max_prompt_tokens=max_prompt_tokens,
+        max_completion_tokens=max_completion_tokens,
+        requests_per_minute=requests_per_minute,
+        rate_windows={},
+        max_request_bytes=max_request_bytes,
     )
-
-    # Create per-model ServerState instances
-    model_states = {}
-    for model_id in model_ids:
-        engine = engines[model_id]
-        store = stores[model_id]
-        model_states[model_id] = ServerState(
-            engine=engine,
-            store=store,
-            model_id=model_id,
-            lock=PriorityLock(SHORT_PROMPT_THRESHOLD),
-            max_pending_requests=max_pending_requests,
-            api_key=api_key,
-            metrics=ServerMetrics(),
-            admission_lock=threading.Lock(),
-            token_cache=PromptTokenCache(token_cache_entries),
-            head_cache=SharedHeadIndex(),
-            max_active_memory_bytes=max_active_memory_bytes,
-            max_prompt_tokens=max_prompt_tokens,
-            max_completion_tokens=max_completion_tokens,
-            requests_per_minute=requests_per_minute,
-            rate_windows={},
-            max_request_bytes=max_request_bytes,
-            global_rate_limiter=GlobalRateLimiter(global_rps, global_burst) if global_rps > 0 else None,
-            shutdown_timeout=shutdown_timeout,
-            cors_origins=cors_origins or [],
-            cors_allow_credentials=cors_allow_credentials,
-            audit_log_path=audit_log_path,
-        )
-        model_states[model_id]._multi_state = multi_state  # Set back-reference for graceful shutdown
-
-    # Update multi_state with the models
-    multi_state.models = model_states
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        logger.info("daedalus multi-model server starting up")
         yield
-        logger.info("daedalus server shutting down: stopping acceptance of new requests")
-        with multi_state.in_flight_lock:
-            multi_state.accepting = False
-        for state in model_states.values():
-            with state.admission_lock:
-                state.accepting = False
-
-        # Wait for in-flight requests to complete with timeout
-        logger.info(f"waiting for in-flight requests to drain (timeout: {shutdown_timeout}s)")
-        if not multi_state.wait_for_drain(shutdown_timeout):
-            logger.warning(f"shutdown timeout ({shutdown_timeout}s) reached, forcing exit with {multi_state.in_flight_requests} requests still in flight")
-        else:
-            logger.info("all in-flight requests completed, shutdown complete")
-
-        for state in model_states.values():
-            close = getattr(state.store, "close", None)
-            if close:
-                close()
+        with state.admission_lock:
+            state.accepting = False
+        close = getattr(state.store, "close", None)
+        if close:
+            close()
 
     app = FastAPI(title="daedalus", lifespan=lifespan)
-    app.state.daedalus = multi_state
-
-    # Add CORS middleware if origins are configured
-    if cors_origins:
-        app.add_middleware(
-            CORSMiddleware,
-            allow_origins=cors_origins,
-            allow_credentials=cors_allow_credentials,
-            allow_methods=["*"],
-            allow_headers=["*"],
-        )
-
-    # Add Request ID middleware for header propagation
-    app.add_middleware(RequestIdMiddleware)
+    app.state.daedalus = state
 
     def error(message: str, status_code: int, kind: str = "invalid_request_error"):
+        state.metrics.inc_error(kind)
         return JSONResponse({"error": {"message": message, "type": kind}}, status_code=status_code)
 
-    def extract_api_key(request: Request, authorization: Optional[str] = None) -> Optional[str]:
-        """Extract API key from Authorization header, cookie, or websocket headers."""
-        # Check Authorization header first (Bearer token)
-        if authorization:
-            return authorization.removeprefix("Bearer ").strip()
-        
-        # Check cookie for daedalus_api_key
-        cookie_key = request.cookies.get("daedalus_api_key")
-        if cookie_key:
-            return cookie_key
-        
-        # Check X-API-Key header (for websocket handshake)
-        header_key = request.headers.get("x-api-key")
-        if header_key:
-            return header_key
-        
-        return None
-
-    def authorized(request: Request, authorization: Optional[str] = None) -> bool:
-        if api_key is None:
-            return True
-        api_key_extracted = extract_api_key(request, authorization)
-        return api_key_extracted is not None and hmac.compare_digest(api_key_extracted, api_key)
-
-    def audit_log(event: str, **fields):
-        """Structured audit logging for security events."""
-        if audit_logger is None:
-            return
-        log_entry = {
-            "timestamp": time.time(),
-            "event": event,
-            "request_id": request_id_var.get(),
-            **fields,
-        }
-        audit_logger.info(json.dumps(log_entry))
+    def authorized(authorization: Optional[str]) -> bool:
+        return state.api_key is None or hmac.compare_digest(
+            authorization or "", f"Bearer {state.api_key}"
+        )
 
     @app.get("/health")
     def health():
-        # Return health for all models
-        model_health = {}
-        for model_id, state in model_states.items():
-            model_health[model_id] = {
-                "thermal": state.engine.governor.effective_level.name,
-                "active_memory_bytes": getattr(state.engine, "active_memory_bytes", lambda: 0)(),
-                "accepting": state.accepting,
-                "in_flight": state.in_flight_requests,
-            }
         return {
             "status": "ok",
-            "models": model_health,
-            "thermal": governor.effective_level.name if governor else "unknown",
-            "accepting": multi_state.accepting,
-            "in_flight": multi_state.in_flight_requests,
+            "model": state.model_id,
+            "thermal": state.engine.governor.effective_level.name,
+            "active_memory_bytes": getattr(state.engine, "active_memory_bytes", lambda: 0)(),
         }
 
     @app.get("/readyz")
     def readyz():
-        ready = True
-        pending_total = 0
-        for state in model_states.values():
-            with state.admission_lock:
-                if not state.accepting or state.admitted_requests >= state.max_pending_requests:
-                    ready = False
-                pending_total += state.admitted_requests
+        with state.admission_lock:
+            ready = state.accepting and state.admitted_requests < state.max_pending_requests
+            pending = state.admitted_requests
         status = 200 if ready else 503
-        return JSONResponse({
-            "status": "ready" if ready else "busy",
-            "pending_requests": pending_total,
-            "models": {mid: {"pending": s.admitted_requests, "max_pending": s.max_pending_requests} for mid, s in model_states.items()},
-            "accepting": multi_state.accepting,
-            "in_flight": multi_state.in_flight_requests,
-        }, status_code=status)
+        return JSONResponse({"status": "ready" if ready else "busy", "pending_requests": pending,
+                             "queue_depth": state.lock.queued,
+                             "max_pending_requests": state.max_pending_requests}, status_code=status)
 
     @app.get("/metrics")
     def metrics():
-        active = sum(s.admitted_requests for s in model_states.values())
-        limit = max_pending_requests
-        cache_stats = {
-            "entries": sum(len(s.store.entries) for s in model_states.values()),
-            "hits": sum(s.store.hits for s in model_states.values()),
-            "misses": sum(s.store.misses for s in model_states.values()),
-            "copy_seconds": sum(getattr(s.store, 'copy_seconds', 0) for s in model_states.values()),
-            "lookup_seconds": sum(getattr(s.store, 'lookup_seconds', 0) for s in model_states.values()),
-            "load_seconds": sum(getattr(s.store, 'load_seconds', 0) for s in model_states.values()),
-            "tokenization": {
-                "hits": sum(s.token_cache.hits for s in model_states.values()),
-                "misses": sum(s.token_cache.misses for s in model_states.values()),
-            },
-            "shared_head": {
-                "hits": sum(s.head_cache.hits for s in model_states.values()),
-            },
-        }
-        thermal = governor.effective_level.name if governor else "unknown"
-        # Use the first model state for rendering
-        any_state = next(iter(model_states.values())) if model_states else None
-        if any_state:
-            return PlainTextResponse(any_state.metrics.render(
-                active=active,
-                limit=limit,
-                cache=cache_stats,
-                thermal=thermal,
-            ), media_type="text/plain; version=0.0.4")
-        return PlainTextResponse("", media_type="text/plain; version=0.0.4")
+        with state.admission_lock:
+            active = state.admitted_requests
+        return PlainTextResponse(state.metrics.render(active=active, limit=state.max_pending_requests,
+            cache={**state.store.stats(), "tokenization": state.token_cache.stats(), "shared_head": state.head_cache.stats()}, thermal=state.engine.governor.effective_level.name), media_type="text/plain; version=0.0.4")
 
     @app.get("/v1/models")
-    def models(request: Request, authorization: str = Header(default=None)):
-        if not authorized(request, authorization):
+    def models(authorization: Optional[str] = Header(default=None)):
+        if not authorized(authorization):
             return error("invalid API key", 401, "authentication_error")
         return {
             "object": "list",
-            "data": multi_state.list_models(),
+            "data": [
+                {
+                    "id": state.model_id,
+                    "object": "model",
+                    "owned_by": "daedalus",
+                }
+            ],
         }
 
     @app.get("/v1/cache/stats")
-    def cache_stats(request: Request, authorization: str = Header(default=None), model: Optional[str] = None):
-        if not authorized(request, authorization):
+    def cache_stats(authorization: Optional[str] = Header(default=None)):
+        if not authorized(authorization):
             return error("invalid API key", 401, "authentication_error")
-        if model:
-            state = multi_state.get_model(model)
-            if not state:
-                return error(f"model {model} not found", 404, "not_found_error")
-            return state.store.stats()
-        # Return stats for all models
-        return {mid: s.store.stats() for mid, s in model_states.items()}
+        return state.store.stats()
 
     @app.delete("/v1/cache")
-    def clear_cache(request: Request, authorization: str = Header(default=None), model: Optional[str] = None):
-        if not authorized(request, authorization):
+    def clear_cache(authorization: Optional[str] = Header(default=None)):
+        if not authorized(authorization):
             return error("invalid API key", 401, "authentication_error")
-        if model:
-            state = multi_state.get_model(model)
-            if not state:
-                return error(f"model {model} not found", 404, "not_found_error")
-            if state.admitted_requests:
-                return error("cache cannot be cleared while requests are active", 409, "conflict_error")
-            removed = state.store.clear()
-            state.metrics.inc_cache_admin("clear")
-            return {"removed_entries": removed}
-        # Clear all caches
-        total_removed = 0
-        for state in model_states.values():
-            if state.admitted_requests:
-                return error("cache cannot be cleared while requests are active", 409, "conflict_error")
-            removed = state.store.clear()
-            state.metrics.inc_cache_admin("clear")
-            total_removed += removed
-        return {"removed_entries": total_removed}
+        if state.admitted_requests:
+            return error("cache cannot be cleared while requests are active", 409, "conflict_error")
+        removed = state.store.clear()
+        state.metrics.inc_cache_admin("clear")
+        return {"removed_entries": removed}
 
     @app.post("/v1/chat/completions")
-    async def chat_completions(request: Request, authorization: str = Header(default=None)):
-        # Extract or generate request ID from X-Request-ID header
-        request_id = request.headers.get("X-Request-ID", f"chatcmpl-{uuid.uuid4().hex[:24]}")
-        token = request_id_var.set(request_id)
-        
-        # Log request start with request ID
-        logger.info(
-            "request_start request_id=%s",
-            request_id,
-        )
+    async def chat_completions(request: Request, authorization: Optional[str] = Header(default=None)):
+        if not authorized(authorization):
+            return error("invalid API key", 401, "authentication_error")
+        client_key = authorization or (request.client.host if request.client else "local")
+        if not state.allow_client(client_key):
+            state.metrics.inc_request("rate_limited")
+            return error("request rate limit exceeded", 429, "rate_limit_error")
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > state.max_request_bytes:
+                    return error("request body exceeds server limit", 413)
+            except ValueError:
+                return error("invalid Content-Length header", 400)
+        try:
+            body = await request.json()
+        except Exception:
+            return error("request body must be valid JSON", 400)
+        if not isinstance(body, dict):
+            return error("request body must be a JSON object", 400)
+        messages = body.get("messages", [])
+        if not isinstance(messages, list) or not messages:
+            return error("messages must be a non-empty array", 400)
+        stream = bool(body.get("stream", False))
+        try:
+            max_tokens = int(body.get("max_tokens") or body.get("max_completion_tokens") or 2048)
+            temperature = float(body.get("temperature", 0.7))
+            top_p = float(body.get("top_p", 1.0))
+        except (TypeError, ValueError):
+            return error("max_tokens, temperature, and top_p must be numeric", 400)
+        if max_tokens < 1 or temperature < 0 or not 0 < top_p <= 1:
+            return error("max_tokens must be positive, temperature non-negative, and top_p in (0, 1]", 400)
+        if max_tokens > state.max_completion_tokens:
+            return error(f"max_tokens exceeds server limit ({state.max_completion_tokens})", 400)
+        tools = body.get("tools") or None
+        if body.get("tool_choice") == "none":
+            tools = None
 
         try:
-            if not authorized(request, authorization):
-                logger.warning("auth_failed request_id=%s", request_id)
-                return error("invalid API key", 401, "authentication_error")
-            
-            client_key = authorization or (request.client.host if request.client else "local")
-            
-            # Check global rate limit first
-            if not multi_state.global_rate_limiter or multi_state.global_rate_limiter.try_acquire():
-                pass
-            else:
-                logger.warning("global_rate_limited request_id=%s", request_id)
-                return error("global request rate limit exceeded", 429, "rate_limit_error")
-            
-            content_length = request.headers.get("content-length")
-            if content_length:
-                try:
-                    if int(content_length) > max_request_bytes:
-                        return error("request body exceeds server limit", 413)
-                except ValueError:
-                    return error("invalid Content-Length header", 400)
-            
-            try:
-                body = await request.json()
-            except Exception:
-                return error("request body must be valid JSON", 400)
-            
-            if not isinstance(body, dict):
-                return error("request body must be a JSON object", 400)
-            
-            messages = body.get("messages", [])
-            if not isinstance(messages, list) or not messages:
-                return error("messages must be a non-empty array", 400)
-            
-            stream = bool(body.get("stream", False))
-            
-            try:
-                max_tokens = int(body.get("max_tokens") or body.get("max_completion_tokens") or 2048)
-                temperature = float(body.get("temperature", 0.7))
-                top_p = float(body.get("top_p", 1.0))
-            except (TypeError, ValueError):
-                return error("max_tokens, temperature, and top_p must be numeric", 400)
-            
-            if max_tokens < 1 or temperature < 0 or not 0 < top_p <= 1:
-                return error("max_tokens must be positive, temperature non-negative, and top_p in (0, 1]", 400)
-            
-            # Extract model from request - route to appropriate model
-            model_id = body.get("model")
-            if not model_id:
-                # Default to first model if not specified
-                model_id = model_ids[0] if model_ids else None
-            
-            state = multi_state.get_model(model_id)
-            if not state:
-                return error(f"model '{model_id}' not found. Available models: {', '.join(model_ids)}", 404, "not_found_error")
-            
-            # Check per-model limits
-            if max_tokens > state.max_completion_tokens:
-                return error(f"max_tokens exceeds server limit ({state.max_completion_tokens})", 400)
-            
-            tools = body.get("tools") or None
-            if body.get("tool_choice") == "none":
-                tools = None
+            tokens = build_prompt_tokens(state, messages, tools)
+        except Exception as exc:
+            # Surface template/format problems as a proper 400 instead of an
+            # opaque 500 the client silently retries.
+            logger.warning("prompt build failed: %s", exc)
+            return error("prompt could not be templated", 400)
+        if len(tokens) > state.max_prompt_tokens:
+            return error(f"prompt exceeds server limit ({state.max_prompt_tokens} tokens)", 413)
+        if not state.try_admit():
+            state.metrics.inc_request("rejected")
+            return error("server queue is full; retry shortly", 429, "rate_limit_error")
+        if not state.memory_available():
+            state.release()
+            state.metrics.inc_request("memory_rejected")
+            return error("insufficient free model memory; retry after active requests finish", 503, "server_overloaded_error")
+        request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        created = int(time.time())
 
-            try:
-                tokens = build_prompt_tokens(state, messages, tools)
-            except Exception as exc:
-                logger.warning("prompt_build_failed request_id=%s error=%s", request_id, str(exc))
-                return error("prompt could not be templated", 400)
-            
-            if len(tokens) > state.max_prompt_tokens:
-                return error(f"prompt exceeds server limit ({state.max_prompt_tokens} tokens)", 413)
-            
-            # Check per-client rate limit
-            if not state.allow_client(client_key):
-                state.metrics.inc_request("rate_limited")
-                logger.warning("rate_limited request_id=%s client=%s", request_id, client_key)
-                return error("request rate limit exceeded", 429, "rate_limit_error")
-            
-            # Check global rate limit (wait if needed)
-            if state.global_rate_limiter and not state.acquire_global_rate():
-                state.metrics.inc_request("global_rate_limited")
-                logger.warning("global_rate_limited request_id=%s", request_id)
-                return error("global request rate limit exceeded", 429, "rate_limit_error")
-            
-            # Try to admit request
-            if not state.try_admit():
-                state.metrics.inc_request("rejected")
-                return error("server queue is full; retry shortly", 429, "rate_limit_error")
-            
-            # Check memory availability across all models
-            if not multi_state.memory_available():
-                state.release()
-                state.metrics.inc_request("memory_rejected")
-                return error("insufficient free model memory; retry after active requests finish", 503, "server_overloaded_error")
+        # Qwen3.5-style templates end the generation prompt inside an opened
+        # <think> block; if so, the model's first output is reasoning.
+        try:
+            tail = state.engine.tokenizer.decode(tokens[-8:])
+        except Exception:
+            tail = ""
+        prompt_in_think = tail.rstrip().endswith("<think>")
 
-            created = int(time.time())
-
-            # Qwen3.5-style templates end the generation prompt inside an opened
-            # think block; if so, the model's first output is reasoning.
-            try:
-                tail = state.engine.tokenizer.decode(tokens[-8:])
-            except Exception:
-                tail = ""
-            prompt_in_think = tail.rstrip().endswith("think")
-
-            # Shared-head boundary: the token count of the prompt's stable head
-            # (system prompt + tool schemas), found by re-templating with a dummy
-            # conversation and taking the longest common prefix. Snapshotting the
-            # cache exactly there lets a NEW session/branch reuse the head even
-            # on non-trimmable hybrid models, where any divergence otherwise
-            # forces a full cold prefill.
-            head_key = state.head_cache.key(messages, tools)
-            head_boundary = state.head_cache.get(head_key)
-            try:
-                if head_boundary is None:
-                    head_msgs = [
-                        m for m in messages if m.get("role") in ("system", "developer")
-                    ] or messages[:1]
-                    probe = build_prompt_tokens(
-                        state, head_msgs + [{"role": "user", "content": "†"}], tools
-                    )
-                    lcp = 0
-                    for a, b in zip(tokens, probe):
-                        if a != b:
-                            break
-                        lcp += 1
-                    if 256 <= lcp < len(tokens) - 1:
-                        head_boundary = lcp
-                        state.head_cache.put(head_key, lcp)
-            except Exception:
-                pass
-
-            # Log with request ID propagation
-            rid = request_id[-6:]
-            logger.info(
-                "request_received",
-                request_id=rid,
-                model=model_id,
-                prompt_tokens=len(tokens),
-                tools=len(tools) if tools else 0,
-                head_boundary=head_boundary,
-                stream=stream,
-            )
-
-            gen = _Generation(
-                state=state,
-                tokens=tokens,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                tools=tools,
-                prompt_in_think=prompt_in_think,
-                head_boundary=head_boundary,
-                request_id=request_id,
-                created=created,
-            )
-
-            if stream:
-                return StreamingResponse(
-                    _stream_response(state, gen, request_id, created, request),
-                    media_type="text/event-stream",
-                    headers={
-                        "Cache-Control": "no-cache",
-                        "X-Accel-Buffering": "no",
-                        "X-Request-ID": request_id,
-                    },
-                    background=BackgroundTask(gen.release_slot),
+        # Shared-head boundary: the token count of the prompt's stable head
+        # (system prompt + tool schemas), found by re-templating with a dummy
+        # conversation and taking the longest common prefix. Snapshotting the
+        # cache exactly there lets a NEW session/branch reuse the head even
+        # on non-trimmable hybrid models, where any divergence otherwise
+        # forces a full cold prefill.
+        head_key = state.head_cache.key(messages, tools)
+        head_boundary = state.head_cache.get(head_key)
+        try:
+            if head_boundary is None:
+                head_msgs = [
+                    m for m in messages if m.get("role") in ("system", "developer")
+                ] or messages[:1]
+                probe = build_prompt_tokens(
+                    state, head_msgs + [{"role": "user", "content": "†"}], tools
                 )
+                lcp = 0
+                for a, b in zip(tokens, probe):
+                    if a != b:
+                        break
+                    lcp += 1
+                if 256 <= lcp < len(tokens) - 1:
+                    head_boundary = lcp
+                    state.head_cache.put(head_key, lcp)
+        except Exception:
+            pass
 
-            try:
-                result = await asyncio.to_thread(gen.run_to_completion)
-                state.metrics.inc_request("completed")
-            except Exception:
-                state.metrics.inc_request("failed")
-                raise
-            finally:
-                gen.release_slot()
-            
-            message: dict = {"role": "assistant", "content": result["text"] or None}
-            if result["reasoning"]:
-                message["reasoning_content"] = result["reasoning"]
-            if result["tool_calls"]:
-                # Response-format tool calls carry no "index" field.
-                message["tool_calls"] = [
-                    {k: v for k, v in c.items() if k != "index"}
-                    for c in result["tool_calls"]
-                ]
-            
-            return JSONResponse({
+        logger.info(
+            "→ %s · %d tok%s%s%s",
+            request_id[-6:],
+            len(tokens),
+            f" · {len(tools)} tools" if tools else "",
+            f" · head {head_boundary}" if head_boundary else "",
+            " · stream" if stream else "",
+        )
+
+        gen = _Generation(
+            state=state,
+            tokens=tokens,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            tools=tools,
+            prompt_in_think=prompt_in_think,
+            rid=request_id[-6:],
+            head_boundary=head_boundary,
+        )
+
+        if stream:
+            return StreamingResponse(
+                _stream_response(state, gen, request_id, created, request),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                },
+                # Runs after the response cycle ends on every path, including
+                # a disconnect before the generator is first iterated.
+                background=BackgroundTask(gen.release_slot),
+            )
+
+        try:
+            result = await asyncio.to_thread(gen.run_to_completion)
+            state.metrics.inc_request("completed")
+        except Exception:
+            state.metrics.inc_request("failed")
+            raise
+        finally:
+            gen.release_slot()
+        message: dict = {"role": "assistant", "content": result["text"] or None}
+        if result["reasoning"]:
+            message["reasoning_content"] = result["reasoning"]
+        if result["tool_calls"]:
+            # Response-format tool calls carry no "index" field.
+            message["tool_calls"] = [
+                {k: v for k, v in c.items() if k != "index"}
+                for c in result["tool_calls"]
+            ]
+        return JSONResponse(
+            {
                 "id": request_id,
                 "object": "chat.completion",
                 "created": created,
-                "model": model_id,
+                "model": state.model_id,
                 "choices": [
                     {
                         "index": 0,
@@ -945,10 +547,8 @@ def create_app(
                     }
                 ],
                 "usage": result["usage"],
-            })
-        finally:
-            request_id_var.reset(token)
-
+            }
+        )
 
     return app
 
@@ -964,15 +564,14 @@ class _Generation:
     def __init__(
         self,
         state: ServerState,
-        tokens: List[int],
-        max_tokens: int,
-        temperature: float,
-        top_p: float,
-        tools: Optional[List[dict]] = None,
-        prompt_in_think: bool = False,
-        head_boundary: Optional[int] = None,
-        request_id: str = "",
-        created: int = 0,
+        tokens,
+        max_tokens,
+        temperature,
+        top_p,
+        tools=None,
+        prompt_in_think=False,
+        rid="",
+        head_boundary=None,
     ):
         self.state = state
         self.tokens = tokens
@@ -981,264 +580,285 @@ class _Generation:
         self.top_p = top_p
         self.tools = tools
         self.prompt_in_think = prompt_in_think
+        self.rid = rid
         self.head_boundary = head_boundary
-        self.request_id = request_id
-        self.created = created
-        self.cached_tokens = 0
-        self.prefill_done = 0
+        self.events: "asyncio.Queue[dict]" = None  # set in stream()
         self.aborted = threading.Event()
-        self.slot_taken = False
-        self.rid = request_id[-6:]
-        self.keepalive_line = f": keepalive {self.rid}\n\n"
-
-    def take_slot(self) -> None:
-        self.slot_taken = True
+        self.prefill_done = 0
+        self.prefill_total = len(tokens)
+        self.prefill_started = time.monotonic()
+        self.cached_tokens = 0
+        self._release_lock = threading.Lock()
+        self._released = False
 
     def release_slot(self) -> None:
-        if self.slot_taken:
-            self.state.release()
-            self.slot_taken = False
+        """Idempotently release this request's admission slot.
 
-    def _run_engine(self):
-        state = self.state
-        already = 0
-        last_checkpoint = 0
-        last_checkpoint_time = time.monotonic()
-        deferred_persist_tokens = None
-        
-        # Take the admission slot for this generation
-        self.take_slot()
-        
-        # Track in-flight for graceful shutdown
-        state.start_request()
-        multi_state = getattr(state, '_multi_state', None)
-        if multi_state:
-            multi_state.start_request()
-        try:
-            with state.lock.acquire_with_priority(len(self.tokens)):
-                # A client can disconnect while its FIFO ticket is waiting. It
-                # still releases its turn, but never starts cache/model work.
-                if self.aborted.is_set():
-                    return
-                hit = state.store.fetch(self.tokens)
-                if hit is not None:
-                    prompt_cache = hit.cache
-                    already = hit.matched_tokens
-                    self.cached_tokens = already
-                    logger.info(
-                        "  %s · cache hit %d/%d tok (%s) — prefilling %d",
-                        self.rid,
-                        already,
-                        len(self.tokens),
-                        hit.source,
-                        len(self.tokens) - already,
-                    )
-                else:
-                    prompt_cache = state.engine.make_cache()
-                    already = 0
-                    logger.info(
-                        "  %s · cache miss — cold prefill %d tok",
-                        self.rid,
-                        len(self.tokens),
-                    )
+        Called from the engine worker's ``finally``, the non-streaming
+        handler, AND the StreamingResponse background task — the last one is
+        the guarantee: if a client disconnects before the response generator
+        is ever iterated, the worker never starts, and without this the slot
+        would leak until the server rejected everything.
+        """
+        with self._release_lock:
+            if self._released:
+                return
+            self._released = True
+        self.state.release()
 
-                last_checkpoint = already
-                last_checkpoint_time = time.monotonic()
-                deferred_persist_tokens: Optional[List[int]] = None
-                last_progress_log = [time.monotonic()]
+    def keepalive_line(self) -> str:
+        done, total = self.prefill_done, self.prefill_total
+        thermal = self.state.engine.governor.effective_level.name.lower()
+        elapsed = time.monotonic() - self.prefill_started
+        fresh = done - self.cached_tokens
+        if fresh > 0 and elapsed > 0 and done < total:
+            eta = (total - done) / (fresh / elapsed)
+            return f": prefill {done}/{total} thermal={thermal} eta={eta:.0f}s\n\n"
+        return f": prefill {done}/{total} thermal={thermal}\n\n"
 
-                def progress_cb(done: int, total: int) -> None:
-                    self.prefill_done = done
-                    now = time.monotonic()
-                    if now - last_progress_log[0] >= 5.0 and done < total:
-                        fresh = done - already
-                        elapsed = now - t_start
-                        rate = fresh / elapsed if elapsed > 0 else 0
-                        logger.info(
-                            "  %s · prefill %d/%d (%d%%) @ %.0f tok/s · thermal %s",
-                            self.rid,
-                            done,
-                            total,
-                            100 * done // max(total, 1),
-                            rate,
-                            state.engine.governor.effective_level.name,
-                        )
-                        last_progress_log[0] = now
-
-                def checkpoint_cb(done: int, cache: List[Any]) -> None:
-                    nonlocal last_checkpoint, last_checkpoint_time, deferred_persist_tokens
-                    if done >= len(self.tokens) - 1:
-                        # End-of-prefill snapshot keyed by the prompt: for
-                        # non-trimmable (hybrid) caches this is the only state
-                        # the next stateless-client turn can reuse.
-                        state.store.put(self.tokens[:done], cache, persist=False)
-                        deferred_persist_tokens = self.tokens[:done]
-                    elif done == self.head_boundary and done > already:
-                        # Shared-head snapshot: reused by NEW sessions/branches
-                        # whose conversation diverges after the system prompt.
-                        state.store.put(self.tokens[:done], cache)
-                        logger.info(
-                            "  %s · head snapshot at %d tok", self.rid, done
-                        )
-                    elif (
-                        len(self.tokens) - already >= CHECKPOINT_MIN_JOB_TOKENS
-                        and done - last_checkpoint >= CHECKPOINT_EVERY_TOKENS
-                        and time.monotonic() - last_checkpoint_time >= CHECKPOINT_MIN_INTERVAL_S
-                        and len(self.tokens) - done > CHECKPOINT_EVERY_TOKENS
-                    ):
-                        state.store.checkpoint(self.tokens, done, cache)
-                        last_checkpoint = done
-                        last_checkpoint_time = time.monotonic()
-
-                think_filter = ThinkStreamFilter(
-                    initially_thinking=self.prompt_in_think
-                )
-                tool_filter = make_stream_filter(state.engine.tokenizer, self.tools)
-                call_index = 0
-                emitted_calls = False
-                finish_reason = "stop"
-                n_generated = 0
-                decode_tps = 0.0
-                t_first_token = None
-
-                def route(text):
-                    """think-split, then tool-split the content half."""
-                    nonlocal call_index, emitted_calls
-                    reasoning, content = think_filter.feed(text)
-                    events = []
-                    if reasoning:
-                        events.append({"type": "reasoning", "text": reasoning})
-                    if content:
-                        plain, calls = tool_filter.feed(content)
-                        if plain:
-                            events.append({"type": "delta", "text": plain})
-                        if calls:
-                            emitted_calls = True
-                            events.append(
-                                {
-                                    "type": "tool_calls",
-                                    "calls": [
-                                        c.as_openai(call_index + i)
-                                        for i, c in enumerate(calls)
-                                    ],
-                                }
-                            )
-                            call_index += len(calls)
-                    return events
-
-                t_start = time.monotonic()
-                try:
-                    for resp in state.engine.generate(
-                        self.tokens,
-                        max_tokens=self.max_tokens,
-                        temperature=self.temperature,
-                        top_p=self.top_p,
-                        prompt_cache=prompt_cache,
-                        already_cached=already,
-                        snap_points=(
-                            [self.head_boundary] if self.head_boundary else None
-                        ),
-                        progress_cb=progress_cb,
-                        checkpoint_cb=checkpoint_cb,
-                        should_abort=self.aborted.is_set,
-                    ):
-                        if self.aborted.is_set():
-                            finish_reason = "abort"
-                            break
-                        if t_first_token is None:
-                            t_first_token = time.monotonic()
-                        if resp.text:
-                            output_events = route(resp.text)
-                            yield from output_events
-                        # Generator yields above before continuing here, so the
-                        # client can receive first content before disk I/O. MLX
-                        # cache serialization must remain on this engine thread.
-                        if deferred_persist_tokens is not None and resp.text and output_events:
-                            persist = getattr(state.store, "persist", None)
-                            if persist:
-                                persist(deferred_persist_tokens)
-                            deferred_persist_tokens = None
-                        n_generated = resp.generation_tokens
-                        decode_tps = resp.generation_tps
-                        if resp.finish_reason is not None:
-                            finish_reason = resp.finish_reason
-                except PrefillAborted:
-                    logger.info(
-                        "  %s · prefill aborted at %d tok (client gone)",
-                        self.rid,
-                        self.prefill_done,
-                    )
-                    return
-
-                reasoning, content = think_filter.finalize()
-                if deferred_persist_tokens is not None:
-                    persist = getattr(state.store, "persist", None)
-                    if persist:
-                        persist(deferred_persist_tokens)
-                if reasoning:
-                    yield {"type": "reasoning", "text": reasoning}
-                if content:
-                    plain, calls = tool_filter.feed(content)
-                    content_tail, tail_calls = tool_filter.finalize()
-                    if plain or content_tail:
-                        yield {"type": "delta", "text": plain + content_tail}
-                    calls = calls + tail_calls
-                else:
-                    content_tail, calls = tool_filter.finalize()
-                    if content_tail:
-                        yield {"type": "delta", "text": content_tail}
-                if calls:
-                    emitted_calls = True
-                    yield {
-                        "type": "tool_calls",
-                        "calls": [
-                            c.as_openai(call_index + i) for i, c in enumerate(calls)
-                        ],
-                    }
-
-                if emitted_calls:
-                    finish_reason = "tool_calls"
-
-                total_s = time.monotonic() - t_start
-                prefill_s = (t_first_token or time.monotonic()) - t_start
-                fresh = len(self.tokens) - already
-                logger.info(
-                    "← %s · %.1fs · prefill %d tok %.1fs (%d cached) · "
-                    "decode %d tok @ %.1f tok/s · thermal %s · finish=%s",
-                    self.rid,
-                    total_s,
-                    fresh,
-                    prefill_s,
-                    already,
-                    n_generated,
-                    decode_tps,
-                    state.engine.governor.effective_level.name,
-                    finish_reason,
-                )
-                yield {
-                    "type": "done",
-                    "finish_reason": finish_reason or "stop",
-                    "usage": {
-                        "prompt_tokens": len(self.tokens),
-                        "completion_tokens": n_generated,
-                        "total_tokens": len(self.tokens) + n_generated,
-                        "prompt_tokens_details": {
-                            "cached_tokens": self.cached_tokens
-                        },
-                    },
-                }
-        finally:
-            state.finish_request()
-            if multi_state:
-                multi_state.finish_request()
+    # ------------------------------------------------------------- sync path
 
     def run_to_completion(self) -> dict:
-        """Run generation to completion (non-streaming)."""
-        last_event = None
+        text_parts: List[str] = []
+        reasoning_parts: List[str] = []
+        tool_calls: List[dict] = []
+        finish_reason = "stop"
+        usage = {}
         for event in self._run_engine():
-            if event["type"] == "done":
-                last_event = event
-        return last_event
+            if event["type"] == "delta":
+                text_parts.append(event["text"])
+            elif event["type"] == "reasoning":
+                reasoning_parts.append(event["text"])
+            elif event["type"] == "tool_calls":
+                tool_calls.extend(event["calls"])
+            elif event["type"] == "done":
+                finish_reason = event["finish_reason"]
+                usage = event["usage"]
+        return {
+            "text": "".join(text_parts),
+            "reasoning": "".join(reasoning_parts),
+            "tool_calls": tool_calls,
+            "finish_reason": "tool_calls" if tool_calls else finish_reason,
+            "usage": usage,
+        }
+
+    # ----------------------------------------------------------- engine loop
+
+    def _run_engine(self):
+        """Sync generator of events: prefill progress, text deltas, done."""
+        state = self.state
+        t_start = time.monotonic()
+        with state.lock:
+            # A client can disconnect while its FIFO ticket is waiting. It
+            # still releases its turn, but never starts cache/model work.
+            if self.aborted.is_set():
+                return
+            hit = state.store.fetch(self.tokens)
+            if hit is not None:
+                prompt_cache = hit.cache
+                already = hit.matched_tokens
+                self.cached_tokens = already
+                logger.info(
+                    "  %s · cache hit %d/%d tok (%s) — prefilling %d",
+                    self.rid,
+                    already,
+                    len(self.tokens),
+                    hit.source,
+                    len(self.tokens) - already,
+                )
+            else:
+                prompt_cache = state.engine.make_cache()
+                already = 0
+                logger.info(
+                    "  %s · cache miss — cold prefill %d tok",
+                    self.rid,
+                    len(self.tokens),
+                )
+
+            last_checkpoint = already
+            last_checkpoint_time = time.monotonic()
+            deferred_persist_tokens: Optional[List[int]] = None
+            last_progress_log = [time.monotonic()]
+
+            def progress_cb(done: int, total: int) -> None:
+                self.prefill_done = done
+                now = time.monotonic()
+                if now - last_progress_log[0] >= 5.0 and done < total:
+                    fresh = done - already
+                    elapsed = now - t_start
+                    rate = fresh / elapsed if elapsed > 0 else 0
+                    logger.info(
+                        "  %s · prefill %d/%d (%d%%) @ %.0f tok/s · thermal %s",
+                        self.rid,
+                        done,
+                        total,
+                        100 * done // max(total, 1),
+                        rate,
+                        state.engine.governor.effective_level.name,
+                    )
+                    last_progress_log[0] = now
+
+            def checkpoint_cb(done: int, cache: List[Any]) -> None:
+                nonlocal last_checkpoint, last_checkpoint_time, deferred_persist_tokens
+                if done >= len(self.tokens) - 1:
+                    # End-of-prefill snapshot keyed by the prompt: for
+                    # non-trimmable (hybrid) caches this is the only state
+                    # the next stateless-client turn can reuse.
+                    state.store.put(self.tokens[:done], cache, persist=False)
+                    deferred_persist_tokens = self.tokens[:done]
+                elif done == self.head_boundary and done > already:
+                    # Shared-head snapshot: reused by NEW sessions/branches
+                    # whose conversation diverges after the system prompt.
+                    state.store.put(self.tokens[:done], cache)
+                    logger.info(
+                        "  %s · head snapshot at %d tok", self.rid, done
+                    )
+                elif (
+                    len(self.tokens) - already >= CHECKPOINT_MIN_JOB_TOKENS
+                    and done - last_checkpoint >= CHECKPOINT_EVERY_TOKENS
+                    and time.monotonic() - last_checkpoint_time >= CHECKPOINT_MIN_INTERVAL_S
+                    and len(self.tokens) - done > CHECKPOINT_EVERY_TOKENS
+                ):
+                    state.store.checkpoint(self.tokens, done, cache)
+                    last_checkpoint = done
+                    last_checkpoint_time = time.monotonic()
+
+            think_filter = ThinkStreamFilter(
+                initially_thinking=self.prompt_in_think
+            )
+            tool_filter = make_stream_filter(state.engine.tokenizer, self.tools)
+            call_index = 0
+            emitted_calls = False
+            finish_reason = "stop"
+            n_generated = 0
+            decode_tps = 0.0
+            t_first_token = None
+
+            def route(text):
+                """think-split, then tool-split the content half."""
+                nonlocal call_index, emitted_calls
+                reasoning, content = think_filter.feed(text)
+                events = []
+                if reasoning:
+                    events.append({"type": "reasoning", "text": reasoning})
+                if content:
+                    plain, calls = tool_filter.feed(content)
+                    if plain:
+                        events.append({"type": "delta", "text": plain})
+                    if calls:
+                        emitted_calls = True
+                        events.append(
+                            {
+                                "type": "tool_calls",
+                                "calls": [
+                                    c.as_openai(call_index + i)
+                                    for i, c in enumerate(calls)
+                                ],
+                            }
+                        )
+                        call_index += len(calls)
+                return events
+
+            try:
+                for resp in state.engine.generate(
+                    self.tokens,
+                    max_tokens=self.max_tokens,
+                    temperature=self.temperature,
+                    top_p=self.top_p,
+                    prompt_cache=prompt_cache,
+                    already_cached=already,
+                    snap_points=(
+                        [self.head_boundary] if self.head_boundary else None
+                    ),
+                    progress_cb=progress_cb,
+                    checkpoint_cb=checkpoint_cb,
+                    should_abort=self.aborted.is_set,
+                ):
+                    if self.aborted.is_set():
+                        finish_reason = "abort"
+                        break
+                    if t_first_token is None:
+                        t_first_token = time.monotonic()
+                    if resp.text:
+                        output_events = route(resp.text)
+                        yield from output_events
+                    # Generator yields above before continuing here, so the
+                    # client can receive first content before disk I/O. MLX
+                    # cache serialization must remain on this engine thread.
+                    if deferred_persist_tokens is not None and resp.text and output_events:
+                        persist = getattr(state.store, "persist", None)
+                        if persist:
+                            persist(deferred_persist_tokens)
+                        deferred_persist_tokens = None
+                    n_generated = resp.generation_tokens
+                    decode_tps = resp.generation_tps
+                    if resp.finish_reason is not None:
+                        finish_reason = resp.finish_reason
+            except PrefillAborted:
+                logger.info(
+                    "  %s · prefill aborted at %d tok (client gone)",
+                    self.rid,
+                    self.prefill_done,
+                )
+                return
+
+            reasoning, content = think_filter.finalize()
+            if deferred_persist_tokens is not None:
+                persist = getattr(state.store, "persist", None)
+                if persist:
+                    persist(deferred_persist_tokens)
+            if reasoning:
+                yield {"type": "reasoning", "text": reasoning}
+            if content:
+                plain, calls = tool_filter.feed(content)
+                content_tail, tail_calls = tool_filter.finalize()
+                if plain or content_tail:
+                    yield {"type": "delta", "text": plain + content_tail}
+                calls = calls + tail_calls
+            else:
+                content_tail, calls = tool_filter.finalize()
+                if content_tail:
+                    yield {"type": "delta", "text": content_tail}
+            if calls:
+                emitted_calls = True
+                yield {
+                    "type": "tool_calls",
+                    "calls": [
+                        c.as_openai(call_index + i) for i, c in enumerate(calls)
+                    ],
+                }
+
+            if emitted_calls:
+                finish_reason = "tool_calls"
+
+            total_s = time.monotonic() - t_start
+            prefill_s = (t_first_token or time.monotonic()) - t_start
+            fresh = len(self.tokens) - already
+            logger.info(
+                "← %s · %.1fs · prefill %d tok %.1fs (%d cached) · "
+                "decode %d tok @ %.1f tok/s · thermal %s · finish=%s",
+                self.rid,
+                total_s,
+                fresh,
+                prefill_s,
+                already,
+                n_generated,
+                decode_tps,
+                state.engine.governor.effective_level.name,
+                finish_reason,
+            )
+            yield {
+                "type": "done",
+                "finish_reason": finish_reason or "stop",
+                "usage": {
+                    "prompt_tokens": len(self.tokens),
+                    "completion_tokens": n_generated,
+                    "total_tokens": len(self.tokens) + n_generated,
+                    "prompt_tokens_details": {
+                        "cached_tokens": self.cached_tokens
+                    },
+                },
+            }
 
 
 async def _stream_response(

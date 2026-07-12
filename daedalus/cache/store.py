@@ -20,8 +20,6 @@ Rapid-MLX runtime/cache.py, baseRT prefix-cache C API):
   (tmp + rename); unreadable entries are skipped, not fatal.
 - Mid-prefill checkpoints reuse the same store: a checkpoint is just a normal
   entry for ``tokens[:done]``, so resume-after-timeout is a plain fetch.
-- Cache format version migration: v1 → v2 adds token count metadata, model key
-  validation, and TTL-based disk eviction support.
 """
 
 from __future__ import annotations
@@ -46,29 +44,9 @@ from mlx_lm.models.cache import (
     trim_prompt_cache,
 )
 
-# Structured logging
-try:
-    import structlog
-    HAS_STRUCTLOG = True
-except ImportError:
-    structlog = None
-    HAS_STRUCTLOG = False
+logger = logging.getLogger(__name__)
 
-# OpenTelemetry
-try:
-    from opentelemetry import trace
-    HAS_OTEL = True
-except ImportError:
-    trace = None
-    HAS_OTEL = False
-
-logger = structlog.get_logger(__name__) if HAS_STRUCTLOG else logging.getLogger(__name__)
-tracer = trace.get_tracer("daedalus.cache") if HAS_OTEL and trace else None
-
-# Cache format version. Increment when changing the on-disk format.
-# v1: Original format with basic metadata
-# v2: Added token count in metadata, model key validation, TTL support
-FORMAT_VERSION = 2
+FORMAT_VERSION = 1
 
 
 def _default_cache_dir() -> Path:
@@ -137,7 +115,6 @@ class PrefixCacheStore:
         max_disk_bytes: int = 10 * 1024**3,
         min_persist_tokens: int = 1024,
         exclusive: bool = False,
-        cache_ttl_days: Optional[int] = None,
     ) -> None:
         self.model_key = model_key
         self.dir = (cache_dir or _default_cache_dir()) / _sanitize_model_key(model_key)
@@ -167,7 +144,6 @@ class PrefixCacheStore:
         self.max_ram_bytes = max_ram_bytes
         self.max_disk_bytes = max_disk_bytes
         self.min_persist_tokens = min_persist_tokens
-        self.cache_ttl_days = cache_ttl_days
         self._entries: dict[str, _Entry] = {}
         self._trie = _TrieNode()
         self._lock = threading.Lock()
@@ -177,7 +153,6 @@ class PrefixCacheStore:
         self.lookup_seconds = 0.0
         self.load_seconds = 0.0
         self._load_disk_index()
-        self._prune_disk_by_ttl()
 
     def _index(self, key: str, tokens: List[int]) -> None:
         node = self._trie
@@ -224,12 +199,6 @@ class PrefixCacheStore:
         one token remains for the engine to process (decode needs a final
         input token). Superset/overlong entries are trimmed when possible.
         """
-        # Start span for cache fetch
-        span = tracer.start_span("cache.fetch") if tracer else None
-        if span:
-            span.set_attribute("token_count", len(tokens))
-            span.set_attribute("model_key", self.model_key)
-        
         lookup_start = time.perf_counter()
         with self._lock:
             best_key, best_usable = None, 0
@@ -251,10 +220,6 @@ class PrefixCacheStore:
                     best_key, best_usable = key, usable
             if best_key is None:
                 self.misses += 1
-                if span:
-                    span.set_attribute("hit", False)
-                    span.end()
-                logger.info("cache_fetch_miss", token_count=len(tokens), model_key=self.model_key)
                 return None
             entry = self._entries[best_key]
         with self._lock:
@@ -266,10 +231,6 @@ class PrefixCacheStore:
             self.load_seconds += time.perf_counter() - load_start
         if cache_obj is None:
             self.misses += 1
-            if span:
-                span.set_attribute("hit", False)
-                span.end()
-            logger.info("cache_fetch_materialize_failed", token_count=len(tokens), model_key=self.model_key)
             return None
 
         overhang = len(entry.tokens) - best_usable
@@ -277,30 +238,12 @@ class PrefixCacheStore:
             if not can_trim_prompt_cache(cache_obj):
                 # Non-trimmable (hybrid/rotating) cache: only a pure-prefix
                 # entry is usable. Fall back to a strict-prefix search.
-                if span:
-                    span.end()
                 return self._fetch_strict_prefix(tokens, exclude=best_key)
             trim_prompt_cache(cache_obj, overhang)
 
         with self._lock:
             entry.last_used = time.monotonic()
             self.hits += 1
-        
-        if span:
-            span.set_attribute("hit", True)
-            span.set_attribute("matched_tokens", best_usable)
-            span.set_attribute("source", source)
-            span.set_attribute("overhang_tokens", overhang)
-            span.end()
-        
-        logger.info(
-            "cache_fetch_hit",
-            token_count=len(tokens),
-            matched_tokens=best_usable,
-            source=source,
-            overhang_tokens=overhang,
-            model_key=self.model_key,
-        )
         return CacheHit(cache=cache_obj, matched_tokens=best_usable, source=source)
 
     def _fetch_strict_prefix(
@@ -367,14 +310,6 @@ class PrefixCacheStore:
         """Store (a deep copy of) ``prompt_cache`` for ``tokens``."""
         if len(tokens) == 0:
             return
-        
-        # Start span for cache put
-        span = tracer.start_span("cache.put") if tracer else None
-        if span:
-            span.set_attribute("token_count", len(tokens))
-            span.set_attribute("model_key", self.model_key)
-            span.set_attribute("persist", persist)
-        
         key = _tokens_digest(tokens)
         stored = self._copy_cache(prompt_cache)
         entry = _Entry(
@@ -389,19 +324,6 @@ class PrefixCacheStore:
                 entry.path = old.path
             self._entries[key] = entry
             self._index(key, entry.tokens)
-        
-        logger.info(
-            "cache_put",
-            token_count=len(tokens),
-            size_bytes=entry.nbytes,
-            model_key=self.model_key,
-            persist=persist,
-        )
-        
-        if span:
-            span.set_attribute("size_bytes", entry.nbytes)
-            span.end()
-        
         if persist and len(tokens) >= self.min_persist_tokens:
             # MLX cache serialization is GPU-stream-bound, so it cannot run
             # on a generic writer thread. ``async_persist`` is retained for
@@ -415,21 +337,11 @@ class PrefixCacheStore:
     def persist(self, tokens: List[int]) -> None:
         """Synchronously persist an already-stored immutable snapshot."""
         key = _tokens_digest(tokens)
-        
-        span = tracer.start_span("cache.persist") if tracer else None
-        if span:
-            span.set_attribute("token_count", len(tokens))
-            span.set_attribute("model_key", self.model_key)
-        
         with self._lock:
             entry = self._entries.get(key)
         if entry is not None and entry.cache is not None and len(tokens) >= self.min_persist_tokens:
             self._persist(key, entry)
             self._evict_disk()
-            logger.info("cache_persist", token_count=len(tokens), model_key=self.model_key)
-        
-        if span:
-            span.end()
 
     def close(self, timeout: float = 10.0) -> None:
         """Release the optional single-process cache ownership lock."""
@@ -445,13 +357,6 @@ class PrefixCacheStore:
         RAM — written straight to disk so a retry can resume)."""
         if done < self.min_persist_tokens:
             return
-        
-        span = tracer.start_span("cache.checkpoint") if tracer else None
-        if span:
-            span.set_attribute("token_count", done)
-            span.set_attribute("total_tokens", len(tokens))
-            span.set_attribute("model_key", self.model_key)
-        
         prefix = list(tokens[:done])
         key = _tokens_digest(prefix)
         entry = _Entry(
@@ -462,9 +367,6 @@ class PrefixCacheStore:
         )
         path = self._write_entry_files(key, prefix, prompt_cache)
         if path is None:
-            if span:
-                span.set_attribute("failed", True)
-                span.end()
             return
         entry.path = path
         with self._lock:
@@ -473,27 +375,13 @@ class PrefixCacheStore:
                 self._entries[key] = entry
                 self._index(key, prefix)
         self._evict_disk()
-        
-        logger.info("cache_checkpoint", token_count=done, total_tokens=len(tokens), model_key=self.model_key)
-        
-        if span:
-            span.end()
 
     # ---------------------------------------------------------- persistence
 
     def _persist(self, key: str, entry: _Entry) -> None:
-        span = tracer.start_span("cache._persist") if tracer else None
-        if span:
-            span.set_attribute("key", key)
-            span.set_attribute("model_key", self.model_key)
-        
         path = self._write_entry_files(key, entry.tokens, entry.cache)
         if path is not None:
             entry.path = path
-        
-        if span:
-            span.set_attribute("success", path is not None)
-            span.end()
 
     def _write_entry_files(
         self, key: str, tokens: List[int], prompt_cache: List[Any]
@@ -525,9 +413,6 @@ class PrefixCacheStore:
             )
             tmp.rename(final)
             sidecar_tmp.rename(Path(str(final) + ".json"))
-            
-            logger.debug("cache_write_entry", key=key, token_count=len(tokens), model_key=self.model_key)
-            
             return final
         except Exception as exc:
             logger.warning("failed to persist cache entry %s: %s", key, exc)
@@ -539,10 +424,6 @@ class PrefixCacheStore:
         for sidecar in self.dir.glob("*.safetensors.json"):
             try:
                 meta = json.loads(sidecar.read_text())
-                # Handle migration from v1 to v2
-                if meta.get("version", 1) < FORMAT_VERSION:
-                    self._migrate_entry(meta, sidecar)
-                    continue
                 if meta.get("version") != FORMAT_VERSION:
                     continue
                 if meta.get("model_key") != self.model_key:
@@ -562,69 +443,6 @@ class PrefixCacheStore:
                 self._index(key, tokens)
             except Exception as exc:
                 logger.warning("skipping bad cache sidecar %s: %s", sidecar, exc)
-
-    def _migrate_entry(self, meta: dict, sidecar: Path) -> None:
-        """Migrate a v1 entry to v2 format."""
-        try:
-            old_version = meta.get("version", 1)
-            logger.info("Migrating cache entry from v%s to v%s: %s", old_version, FORMAT_VERSION, sidecar)
-            
-            # Load the cache to get token count
-            data_path = Path(str(sidecar)[: -len(".json")])
-            if not data_path.exists():
-                logger.warning("Cache data file missing for %s, skipping migration", sidecar)
-                return
-            
-            # v1 didn't have n_tokens in metadata, so we load the cache to count tokens
-            try:
-                prompt_cache = load_prompt_cache(str(data_path))
-                n_tokens = sum(layer.state[0].shape[1] for layer in prompt_cache if hasattr(layer, 'state') and layer.state)
-                # Fallback: use token list length from meta
-                if n_tokens == 0 and "tokens" in meta:
-                    n_tokens = len(meta["tokens"])
-            except Exception:
-                n_tokens = len(meta.get("tokens", []))
-            
-            # Update metadata with v2 fields
-            meta["version"] = FORMAT_VERSION
-            meta["model_key"] = meta.get("model_key", self.model_key)
-            meta["n_tokens"] = n_tokens
-            meta["created"] = meta.get("created", sidecar.stat().st_mtime)
-            meta["ttl_days"] = self.cache_ttl_days
-            
-            # Write updated sidecar
-            sidecar.write_text(json.dumps(meta))
-            logger.info("Successfully migrated cache entry %s to v%d", sidecar, FORMAT_VERSION)
-        except Exception as exc:
-            logger.warning("Failed to migrate cache entry %s: %s", sidecar, exc)
-            # Remove corrupted entry
-            sidecar.unlink(missing_ok=True)
-            Path(str(sidecar)[:-5]).unlink(missing_ok=True)
-
-    def _prune_disk_by_ttl(self) -> None:
-        """Remove disk entries older than cache_ttl_days."""
-        if self.cache_ttl_days is None:
-            return
-        cutoff = time.time() - (self.cache_ttl_days * 86400)
-        for sidecar in self.dir.glob("*.safetensors.json"):
-            try:
-                meta = json.loads(sidecar.read_text())
-                created = meta.get("created", sidecar.stat().st_mtime)
-                if created < cutoff:
-                    data_path = Path(str(sidecar)[: -len(".json")])
-                    logger.info("TTL eviction: removing cache entry older than %d days: %s", 
-                               self.cache_ttl_days, sidecar)
-                    data_path.unlink(missing_ok=True)
-                    sidecar.unlink(missing_ok=True)
-                    # Remove from index if present
-                    tokens = meta.get("tokens", [])
-                    key = _tokens_digest(tokens)
-                    with self._lock:
-                        self._entries.pop(key, None)
-            except Exception as exc:
-                logger.warning("Error during TTL pruning of %s: %s", sidecar, exc)
-        with self._lock:
-            self._rebuild_index()
 
     # ------------------------------------------------------------- eviction
 
@@ -713,169 +531,3 @@ class PrefixCacheStore:
                     self._entries.pop(_tokens_digest(entry.tokens), None)
             self._rebuild_index()
             return before - total
-
-    # ----------------------------------------------------------- CLI helpers
-
-    def list_entries(self, model_filter: Optional[str] = None) -> List[dict]:
-        """List all cache entries with metadata for CLI display."""
-        entries = []
-        with self._lock:
-            for key, entry in self._entries.items():
-                if model_filter and self.model_key != model_filter:
-                    continue
-                entry_info = {
-                    "key": key,
-                    "model_key": self.model_key,
-                    "token_count": len(entry.tokens),
-                    "size_bytes": entry.nbytes if entry.cache is not None else (
-                        entry.path.stat().st_size if entry.path and entry.path.exists() else 0
-                    ),
-                    "in_ram": entry.cache is not None,
-                    "on_disk": entry.path is not None and entry.path.exists(),
-                    "last_used": entry.last_used,
-                    "age_seconds": time.time() - entry.last_used,
-                    "hits": getattr(entry, 'hits', 0),
-                }
-                entries.append(entry_info)
-        # Sort by last used (most recent first)
-        entries.sort(key=lambda e: e["last_used"], reverse=True)
-        return entries
-
-    def inspect_entry(self, key: str) -> Optional[dict]:
-        """Get detailed info about a specific cache entry."""
-        with self._lock:
-            entry = self._entries.get(key)
-            if entry is None:
-                return None
-            
-            info = {
-                "key": key,
-                "model_key": self.model_key,
-                "tokens": entry.tokens,
-                "token_count": len(entry.tokens),
-                "size_bytes": entry.nbytes if entry.cache is not None else (
-                    entry.path.stat().st_size if entry.path and entry.path.exists() else 0
-                ),
-                "in_ram": entry.cache is not None,
-                "on_disk": entry.path is not None and entry.path.exists(),
-                "path": str(entry.path) if entry.path else None,
-                "last_used": entry.last_used,
-                "created": None,
-                "hits": getattr(entry, 'hits', 0),
-            }
-            
-            # Try to get creation time from sidecar
-            if entry.path and entry.path.exists():
-                sidecar = Path(str(entry.path) + ".json")
-                if sidecar.exists():
-                    try:
-                        meta = json.loads(sidecar.read_text())
-                        info["created"] = meta.get("created")
-                        info["version"] = meta.get("version")
-                    except Exception:
-                        pass
-            
-            return info
-
-    def prune_by_ttl(self, ttl_days: Optional[int] = None, model_filter: Optional[str] = None) -> int:
-        """Prune disk entries older than TTL days. Returns count of removed entries."""
-        ttl = ttl_days if ttl_days is not None else self.cache_ttl_days
-        if ttl is None:
-            return 0
-        
-        cutoff = time.time() - (ttl * 86400)
-        removed = 0
-        
-        for sidecar in self.dir.glob("*.safetensors.json"):
-            try:
-                meta = json.loads(sidecar.read_text())
-                if model_filter and meta.get("model_key") != model_filter:
-                    continue
-                created = meta.get("created", sidecar.stat().st_mtime)
-                if created < cutoff:
-                    data_path = Path(str(sidecar)[:-5])  # remove .json
-                    data_path.unlink(missing_ok=True)
-                    sidecar.unlink(missing_ok=True)
-                    removed += 1
-                    # Remove from index
-                    tokens = meta.get("tokens", [])
-                    key = _tokens_digest(tokens)
-                    with self._lock:
-                        self._entries.pop(key, None)
-            except Exception as exc:
-                logger.warning("Error pruning cache entry %s: %s", sidecar, exc)
-        
-        with self._lock:
-            self._rebuild_index()
-        
-        return removed
-
-    def warm_from_history(
-        self,
-        source: str,
-        model: str,
-        engine,
-        limit: Optional[int] = None,
-    ) -> int:
-        """Warm cache from chat history exports."""
-        import json
-        from pathlib import Path
-        
-        if source == "openwebui":
-            # OpenWebUI exports: {"chats": [{"messages": [...]}, ...]}
-            history_path = Path.home() / ".local" / "share" / "open-webui" / "chats.json"
-            if not history_path.exists():
-                history_path = Path.home() / "Library" / "Application Support" / "OpenWebUI" / "chats.json"
-            if not history_path.exists():
-                raise FileNotFoundError(f"OpenWebUI chat history not found at {history_path}")
-            data = json.loads(history_path.read_text())
-            conversations = data.get("chats", [])
-            prompts = []
-            for chat in conversations:
-                messages = chat.get("messages", [])
-                if messages:
-                    prompts.append({"messages": messages})
-                    
-        elif source == "opencode":
-            # OpenCode exports: [{"messages": [...]}]
-            history_path = Path.home() / ".config" / "opencode" / "history.json"
-            if not history_path.exists():
-                raise FileNotFoundError(f"OpenCode history not found at {history_path}")
-            data = json.loads(history_path.read_text())
-            prompts = data if isinstance(data, list) else data.get("conversations", [])
-            
-        elif source == "hermes":
-            # Hermes exports: ~/.hermes/conversations/*.json
-            history_dir = Path.home() / ".hermes" / "conversations"
-            if not history_dir.exists():
-                raise FileNotFoundError(f"Hermes conversations not found at {history_dir}")
-            prompts = []
-            for conv_file in sorted(history_dir.glob("*.json")):
-                data = json.loads(conv_file.read_text())
-                if "messages" in data:
-                    prompts.append({"messages": data["messages"]})
-                    
-        else:
-            raise ValueError(f"Unknown history source: {source}. Use openwebui, opencode, or hermes")
-        
-        if limit:
-            prompts = prompts[:limit]
-        
-        warmed = 0
-        for i, item in enumerate(prompts):
-            messages = item.get("messages", [])
-            if not messages:
-                continue
-            tokens = engine.tokenizer.apply_chat_template(
-                messages, add_generation_prompt=True
-            )
-            if self.fetch(tokens) is not None:
-                print(f"[{i}] already cached ({len(tokens)} tokens)")
-                continue
-            cache = engine.make_cache()
-            report = engine.paced_prefill(tokens, cache)
-            self.put(tokens[:report.computed_tokens], cache)
-            print(f"[{i}] cached {report.computed_tokens} tokens")
-            warmed += 1
-            
-        return warmed

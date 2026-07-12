@@ -88,11 +88,6 @@ class FakeStore:
     def __init__(self):
         self.entries = {}
         self.put_calls = []
-        self.hits = 0
-        self.misses = 0
-        self.copy_seconds = 0.0
-        self.lookup_seconds = 0.0
-        self.load_seconds = 0.0
 
     def fetch(self, tokens):
         key = tuple(tokens[:-1])
@@ -112,22 +107,13 @@ class FakeStore:
         pass
 
     def stats(self):
-        return {"entries": len(self.entries), "hits": self.hits, "misses": self.misses,
-                "copy_seconds": self.copy_seconds, "lookup_seconds": self.lookup_seconds,
-                "load_seconds": self.load_seconds,
-                "tokenization": {"hits": self.hits, "misses": self.misses},
-                "shared_head": {"hits": self.hits}}
+        return {"entries": len(self.entries)}
 
 
 @pytest.fixture
 def client_and_fakes():
     engine, store = FakeEngine(), FakeStore()
-    app = create_app(
-        engines={"test-model": engine},
-        stores={"test-model": store},
-        model_ids=["test-model"],
-        governor=None,  # No global governor; engine has its own
-    )
+    app = create_app(engine, store, model_id="test-model")
     return TestClient(app), engine, store
 
 
@@ -135,8 +121,8 @@ def test_health(client_and_fakes):
     client, _, _ = client_and_fakes
     r = client.get("/health")
     assert r.status_code == 200
-    assert "test-model" in r.json()["models"]
-    assert r.json()["models"]["test-model"]["thermal"] == "NOMINAL"
+    assert r.json()["model"] == "test-model"
+    assert r.json()["thermal"] == "NOMINAL"
 
 
 def test_models(client_and_fakes):
@@ -217,7 +203,7 @@ def test_missing_messages_400(client_and_fakes):
 
 def test_cache_stats_endpoint(client_and_fakes):
     client, _, _ = client_and_fakes
-    assert "entries" in client.get("/v1/cache/stats").json()["test-model"]
+    assert "entries" in client.get("/v1/cache/stats").json()
 
 
 def test_readiness_and_metrics(client_and_fakes):
@@ -242,12 +228,7 @@ def test_request_validation(client_and_fakes):
 
 def test_api_key_protects_v1_endpoints():
     engine, store = FakeEngine(), FakeStore()
-    client = TestClient(create_app(
-        engines={"test-model": engine},
-        stores={"test-model": store},
-        model_ids=["test-model"],
-        api_key="secret"
-    ))
+    client = TestClient(create_app(engine, store, model_id="test-model", api_key="secret"))
     assert client.get("/v1/models").status_code == 401
     assert client.post(
         "/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}
@@ -263,12 +244,7 @@ def test_clear_cache_requires_idle_and_authorization():
             return count
 
     engine, store = FakeEngine(), ClearableStore()
-    client = TestClient(create_app(
-        engines={"test-model": engine},
-        stores={"test-model": store},
-        model_ids=["test-model"],
-        api_key="secret"
-    ))
+    client = TestClient(create_app(engine, store, model_id="test-model", api_key="secret"))
     store.entries[(1, 2)] = ["cached"]
     response = client.delete("/v1/cache", headers={"Authorization": "Bearer secret"})
     assert response.status_code == 200
@@ -277,13 +253,8 @@ def test_clear_cache_requires_idle_and_authorization():
 
 def test_bounded_admission_rejects_overloaded_server():
     engine, store = FakeEngine(), FakeStore()
-    app = create_app(
-        engines={"test-model": engine},
-        stores={"test-model": store},
-        model_ids=["test-model"],
-        max_pending_requests=1
-    )
-    app.state.daedalus.models["test-model"].admitted_requests = 1
+    app = create_app(engine, store, model_id="test-model", max_pending_requests=1)
+    app.state.daedalus.admitted_requests = 1
     client = TestClient(app)
     assert client.get("/readyz").status_code == 503
     response = client.post(
@@ -299,18 +270,12 @@ def test_release_slot_is_idempotent():
     from daedalus.server import _Generation
 
     engine, store = FakeEngine(), FakeStore()
-    app = create_app(
-        engines={"test-model": engine},
-        stores={"test-model": store},
-        model_ids=["test-model"],
-        max_pending_requests=4
-    )
-    state = app.state.daedalus.models["test-model"]
+    app = create_app(engine, store, model_id="test-model", max_pending_requests=4)
+    state = app.state.daedalus
     assert state.try_admit() and state.try_admit()  # two admitted
     gen = _Generation(
         state=state, tokens=[1, 2, 3], max_tokens=8, temperature=0.0, top_p=1.0
     )
-    gen.take_slot()  # take the slot first
     gen.release_slot()
     gen.release_slot()  # double-fire must not release the second request's slot
     assert state.admitted_requests == 1
@@ -347,12 +312,7 @@ def test_memory_guard_evicts_cache_then_rejects_when_still_over_limit():
             return 0
 
     engine, store = MemoryEngine(), MemoryStore()
-    client = TestClient(create_app(
-        engines={"test-model": engine},
-        stores={"test-model": store},
-        model_ids=["test-model"],
-        max_active_memory_bytes=50
-    ))
+    client = TestClient(create_app(engine, store, model_id="test-model", max_active_memory_bytes=50))
     response = client.post(
         "/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}
     )
@@ -363,10 +323,7 @@ def test_memory_guard_evicts_cache_then_rejects_when_still_over_limit():
 def test_server_enforces_prompt_and_completion_limits():
     engine, store = FakeEngine(), FakeStore()
     client = TestClient(create_app(
-        engines={"test-model": engine},
-        stores={"test-model": store},
-        model_ids=["test-model"],
-        max_prompt_tokens=10, max_completion_tokens=2
+        engine, store, model_id="test-model", max_prompt_tokens=10, max_completion_tokens=2
     ))
     assert client.post(
         "/v1/chat/completions", json={"messages": [{"role": "user", "content": "long prompt"}], "max_tokens": 1}
@@ -378,24 +335,14 @@ def test_server_enforces_prompt_and_completion_limits():
 
 def test_server_rate_limit():
     engine, store = FakeEngine(), FakeStore()
-    client = TestClient(create_app(
-        engines={"test-model": engine},
-        stores={"test-model": store},
-        model_ids=["test-model"],
-        requests_per_minute=1
-    ))
+    client = TestClient(create_app(engine, store, model_id="test-model", requests_per_minute=1))
     payload = {"messages": [{"role": "user", "content": "hi"}]}
     assert client.post("/v1/chat/completions", json=payload).status_code == 200
     assert client.post("/v1/chat/completions", json=payload).status_code == 429
 
 
 def test_server_rejects_oversized_content_length():
-    client = TestClient(create_app(
-        engines={"test-model": FakeEngine()},
-        stores={"test-model": FakeStore()},
-        model_ids=["test-model"],
-        max_request_bytes=10
-    ))
+    client = TestClient(create_app(FakeEngine(), FakeStore(), "test-model", max_request_bytes=10))
     response = client.post(
         "/v1/chat/completions", content="{}", headers={"Content-Length": "11"}
     )
@@ -418,11 +365,7 @@ TOOL_SCRIPT = [
 
 def make_tool_client(script):
     engine, store = FakeEngine(script=script), FakeStore()
-    app = create_app(
-        engines={"test-model": engine},
-        stores={"test-model": store},
-        model_ids=["test-model"],
-    )
+    app = create_app(engine, store, model_id="test-model")
     return TestClient(app), engine, store
 
 
@@ -496,14 +439,10 @@ def test_no_tools_means_no_filter_interference():
 
 
 def make_thinking_client(script):
-    """Engine whose template opened a  block (Qwen3.5 behavior)."""
+    """Engine whose template opened a <think> block (Qwen3.5 behavior)."""
     engine, store = FakeEngine(script=script), FakeStore()
-    engine.tokenizer.prompt_tail = "assistant\nthink"
-    app = create_app(
-        engines={"test-model": engine},
-        stores={"test-model": store},
-        model_ids=["test-model"],
-    )
+    engine.tokenizer.prompt_tail = "<|im_start|>assistant\n<think>"
+    app = create_app(engine, store, model_id="test-model")
     return TestClient(app), engine, store
 
 

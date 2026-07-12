@@ -23,25 +23,6 @@ from typing import Callable, Mapping, Optional
 
 from daedalus.sensors import ThermalLevel, ThermalMonitor
 
-# Structured logging
-try:
-    import structlog
-    HAS_STRUCTLOG = True
-except ImportError:
-    structlog = None
-    HAS_STRUCTLOG = False
-
-# OpenTelemetry
-try:
-    from opentelemetry import trace
-    HAS_OTEL = True
-except ImportError:
-    trace = None
-    HAS_OTEL = False
-
-logger = structlog.get_logger(__name__) if HAS_STRUCTLOG else __import__('logging').getLogger(__name__)
-tracer = trace.get_tracer("daedalus.governor") if HAS_OTEL and trace else None
-
 
 @dataclass(frozen=True)
 class LevelPolicy:
@@ -150,15 +131,7 @@ class ThermalGovernor:
         4-second burn saves no meaningful heat but triples the latency of
         an interactive turn.
         """
-        # Start span for pace decision
-        span = tracer.start_span("governor.pace") if tracer else None
-        if span:
-            span.set_attribute("chunk_seconds", chunk_seconds)
-            span.set_attribute("job_tokens", job_tokens or 0)
-            span.set_attribute("current_level", self._monitor.level.name)
-        
         now = self._clock()
-        previous_effective = self._effective
         self._update_effective(self._monitor.level, now)
         policy = self._config.policies[self._effective]
         duty = min(policy.duty, self._config.max_duty)
@@ -173,71 +146,13 @@ class ThermalGovernor:
             sleep = min(
                 self._config.max_sleep_seconds, chunk_seconds * (1.0 - duty) / duty
             )
-        
-        decision = PaceDecision(
+        return PaceDecision(
             next_chunk_tokens=policy.chunk_tokens,
             sleep_seconds=sleep,
             effective_level=self._effective,
         )
-        
-        # Log thermal transition if level changed
-        if self._effective != previous_effective:
-            logger.info(
-                "thermal_transition",
-                from_level=previous_effective.name,
-                to_level=self._effective.name,
-                observed_level=self._monitor.level.name,
-                duty=duty,
-                chunk_seconds=chunk_seconds,
-                sleep_seconds=sleep,
-            )
-            if span:
-                span.add_event("thermal_transition", {
-                    "from_level": previous_effective.name,
-                    "to_level": self._effective.name,
-                    "observed_level": self._monitor.level.name,
-                })
-        
-        logger.debug(
-            "governor_pace",
-            effective_level=self._effective.name,
-            observed_level=self._monitor.level.name,
-            duty=duty,
-            chunk_seconds=chunk_seconds,
-            next_chunk_tokens=decision.next_chunk_tokens,
-            sleep_seconds=sleep,
-            small_job=small_job,
-        )
-        
-        if span:
-            span.set_attribute("effective_level", self._effective.name)
-            span.set_attribute("duty", duty)
-            span.set_attribute("next_chunk_tokens", decision.next_chunk_tokens)
-            span.set_attribute("sleep_seconds", sleep)
-            span.set_attribute("small_job", small_job)
-            span.end()
-        
-        return decision
 
     def initial_chunk_tokens(self) -> int:
         """Chunk size for the first chunk of a prefill (no burn measured yet)."""
-        span = tracer.start_span("governor.initial_chunk_tokens") if tracer else None
-        if span:
-            span.set_attribute("current_level", self._monitor.level.name)
-        
         self._update_effective(self._monitor.level, self._clock())
-        result = self._config.policies[self._effective].chunk_tokens
-        
-        logger.debug(
-            "governor_initial_chunk",
-            effective_level=self._effective.name,
-            observed_level=self._monitor.level.name,
-            chunk_tokens=result,
-        )
-        
-        if span:
-            span.set_attribute("effective_level", self._effective.name)
-            span.set_attribute("chunk_tokens", result)
-            span.end()
-        
-        return result
+        return self._config.policies[self._effective].chunk_tokens

@@ -2,135 +2,29 @@ name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    tags: ["v*"]
 
 permissions:
   contents: write
-  packages: write
 
 jobs:
-  build-macos:
-    name: Build macOS ARM64 Binary
-    runs-on: macos-latest
-    timeout-minutes: 60
+  package:
+    runs-on: macos-14
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --extra dev --locked
+      - run: uv run --extra dev pytest -q
+      - run: uv build
+      - uses: actions/upload-artifact@v4
         with:
-          fetch-depth: 0
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+          name: daedalus-dist
+          path: dist/*
+      - uses: softprops/action-gh-release@v2
         with:
-          python-version: '3.12'
-          cache: 'pip'
-
-      - name: Install system dependencies
-        run: |
-          brew install pyinstaller upx
-
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip setuptools wheel
-          pip install -e ".[dev,observability]"
-          pip install pyinstaller
-
-      - name: Build binary with PyInstaller
-        run: |
-          pyinstaller packaging/pyinstaller/daedalus.spec --clean --noconfirm
-
-      - name: Verify binary
-        run: |
-          ./dist/daedalus doctor
-
-      - name: Create release archive
-        run: |
-          VERSION=${GITHUB_REF_NAME#v}
-          mkdir -p dist/release
-          tar -czf dist/release/daedalus-${VERSION}-macos-arm64.tar.gz -C dist daedalus
-          sha256sum dist/release/daedalus-${VERSION}-macos-arm64.tar.gz > dist/release/daedalus-${VERSION}-macos-arm64.tar.gz.sha256
-          cat dist/release/daedalus-${VERSION}-macos-arm64.tar.gz.sha256
-
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: daedalus-macos-arm64
-          path: |
-            dist/release/daedalus-*-macos-arm64.tar.gz
-            dist/release/daedalus-*-macos-arm64.tar.gz.sha256
-          retention-days: 30
-
-  release:
-    name: Create GitHub Release
-    runs-on: ubuntu-latest
-    needs: build-macos
-    timeout-minutes: 10
-    steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: daedalus-macos-arm64
-          path: dist/release
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: Daedalus ${{ github.ref_name }}
-          draft: false
-          prerelease: ${{ contains(github.ref_name, 'rc') || contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') }}
-          files: |
-            dist/release/daedalus-*-macos-arm64.tar.gz
-            dist/release/daedalus-*-macos-arm64.tar.gz.sha256
           generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          files: dist/*
 
-  update-homebrew:
-    name: Update Homebrew Tap
-    runs-on: ubuntu-latest
-    needs: release
-    timeout-minutes: 10
-    if: github.repository == 'nousresearch/daedalus'
-    steps:
-      - name: Checkout homebrew tap
-        uses: actions/checkout@v4
-        with:
-          repository: nousresearch/homebrew-daedalus
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          path: homebrew-daedalus
-
-      - name: Download release artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: daedalus-macos-arm64
-          path: dist/release
-
-      - name: Extract version and SHA256
-        id: vars
-        run: |
-          VERSION=${GITHUB_REF_NAME#v}
-          TARBALL=$(ls dist/release/daedalus-${VERSION}-macos-arm64.tar.gz)
-          SHA256=$(cat dist/release/daedalus-${VERSION}-macos-arm64.tar.gz.sha256 | cut -d' ' -f1)
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "sha256=${SHA256}" >> $GITHUB_OUTPUT
-          echo "tarball=${TARBALL}" >> $GITHUB_OUTPUT
-
-      - name: Update Homebrew formula
-        run: |
-          cd homebrew-daedalus
-          sed -i "s|url \".*\"|url \"https://github.com/nousresearch/daedalus/releases/download/${GITHUB_REF_NAME}/daedalus-${{ steps.vars.outputs.version }}-macos-arm64.tar.gz\"|" Formula/daedalus.rb
-          sed -i "s|sha256 \".*\"|sha256 \"${{ steps.vars.outputs.sha256 }}\"|" Formula/daedalus.rb
-          sed -i "s|version \".*\"|version \"${{ steps.vars.outputs.version }}\"|" Formula/daedalus.rb
-
-      - name: Commit and push
-        run: |
-          cd homebrew-daedalus
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/daedalus.rb
-          git commit -m "Update daedalus to ${{ steps.vars.outputs.version }}" || echo "No changes to commit"
-          git push
-        env:
-          GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      # Add APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_ID,
+      # APPLE_TEAM_ID, and APPLE_APP_PASSWORD before extending this job with
+      # codesign/notarytool for a signed app bundle or installer.
