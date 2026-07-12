@@ -10,11 +10,12 @@
     <string>daedalus</string>
     <string>serve</string>
     <string>--model</string><string>mlx-community/Qwen3.5-9B-MLX-4bit</string>
-    <string>--api-key-env</string><string>DAEDALUS_API_KEY</string>
+    <!-- Keep the secret OUT of this plist (launchd plists are world-readable
+         and end up in backups). Store it in a chmod-600 file instead:
+           echo "your-secret" > ~/.config/daedalus/api-key && chmod 600 ~/.config/daedalus/api-key -->
+    <string>--api-key-file</string><string>/Users/YOU/.config/daedalus/api-key</string>
     <string>--max-active-memory-gb</string><string>12</string>
   </array>
-  <key>EnvironmentVariables</key>
-  <dict><key>DAEDALUS_API_KEY</key><string>replace-with-secret</string></dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>/tmp/daedalus.log</string>

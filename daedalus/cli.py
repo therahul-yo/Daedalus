@@ -53,17 +53,27 @@ def cmd_serve(args) -> int:
 
     log.info("loading %s ...", args.model)
     t0 = time.monotonic()
-    engine = Engine.from_pretrained(
-        args.model,
-        governor=governor,
-        config=EngineConfig(
-            kv_bits=args.kv_bits or None,
-            prefill_chunk_tokens=args.prefill_chunk_tokens,
-            clear_metal_cache_between_chunks=args.clear_metal_cache_between_chunks,
-            num_draft_tokens=args.num_draft_tokens,
-        ),
-        draft_model_path=args.draft_model,
-    )
+    try:
+        engine = Engine.from_pretrained(
+            args.model,
+            governor=governor,
+            config=EngineConfig(
+                kv_bits=args.kv_bits or None,
+                prefill_chunk_tokens=args.prefill_chunk_tokens,
+                clear_metal_cache_between_chunks=args.clear_metal_cache_between_chunks,
+                num_draft_tokens=args.num_draft_tokens,
+            ),
+            draft_model_path=args.draft_model,
+        )
+    except Exception as exc:
+        monitor.stop()
+        print(f"error: could not load model {args.model!r}: {exc}", flush=True)
+        print(
+            "hint: check the model id for typos (huggingface.co/mlx-community), "
+            "network access for a first download, and free disk space.",
+            flush=True,
+        )
+        return 1
     load_s = time.monotonic() - t0
 
     import mlx.core as mx
@@ -167,6 +177,18 @@ def cmd_warm(args) -> int:
     from daedalus.governor import ThermalGovernor
     from daedalus.sensors import ThermalMonitor
 
+    # Validate the prompts file BEFORE the multi-minute model load.
+    try:
+        raw = Path(args.prompts).read_text()
+        prompts = _json.loads(raw)  # [{"messages": [...]}, ...]
+        if not isinstance(prompts, list) or not all(
+            isinstance(p, dict) and isinstance(p.get("messages"), list) for p in prompts
+        ):
+            raise ValueError('expected a JSON array of {"messages": [...]} objects')
+    except Exception as exc:
+        print(f"error: invalid prompts file {args.prompts!r}: {exc}", flush=True)
+        return 1
+
     monitor = ThermalMonitor().start()
     engine = Engine.from_pretrained(
         args.model, monitor=monitor, config=EngineConfig(kv_bits=args.kv_bits or None)
@@ -176,9 +198,6 @@ def cmd_warm(args) -> int:
         tokenizer_id=getattr(engine.tokenizer, "name_or_path", args.model),
         model_revision=args.model_revision,
     ), exclusive=True)
-
-    raw = Path(args.prompts).read_text()
-    prompts = _json.loads(raw)  # [{"messages": [...]}, ...]
     for i, item in enumerate(prompts):
         tokens = engine.tokenizer.apply_chat_template(
             item["messages"], add_generation_prompt=True
@@ -373,6 +392,10 @@ def main() -> int:
             ap.error("--num-draft-tokens cannot be negative")
         if args.num_draft_tokens and not args.draft_model:
             ap.error("--num-draft-tokens requires --draft-model")
+        if args.draft_model and not args.num_draft_tokens:
+            # A draft model with zero draft tokens silently loads a second
+            # multi-GB model that never speculates.
+            ap.error("--draft-model requires --num-draft-tokens (e.g. 3)")
     if args.cmd == "tune" and (args.prompt_tokens < 512 or args.repeats < 1):
         ap.error("--prompt-tokens must be at least 512 and --repeats at least 1")
     return args.fn(args)
