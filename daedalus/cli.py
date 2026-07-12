@@ -115,6 +115,8 @@ def cmd_serve(args) -> int:
         requests_per_minute=args.requests_per_minute,
         max_request_bytes=args.max_request_bytes,
         audit_log_path=args.audit_log,
+        cors_origins=args.cors_origins,
+        global_rps=args.global_rps,
     )
 
     bar = "─" * 62
@@ -362,6 +364,14 @@ def main() -> int:
         default="info",
         help="request/thermal log verbosity (default: info)",
     )
+    serve.add_argument(
+        "--cors-origin", action="append", dest="cors_origins", default=None,
+        help="permitted CORS origin; repeat for multiple origins",
+    )
+    serve.add_argument(
+        "--global-rps", type=float, default=0.0,
+        help="global rate limit across all clients in requests per second (0 = disabled)",
+    )
     serve.set_defaults(fn=cmd_serve)
 
     doctor = sub.add_parser("doctor", help="check thermal sensor + mlx setup")
@@ -383,6 +393,9 @@ def main() -> int:
     tune.add_argument("--clear-metal-cache-between-chunks", action="store_true")
     tune.add_argument("--out", help="write JSON result to this path")
     tune.set_defaults(fn=cmd_tune)
+
+    from daedalus.cache.cli import add_cache_parser
+    add_cache_parser(sub)
 
     args = ap.parse_args()
     if args.cmd == "serve":

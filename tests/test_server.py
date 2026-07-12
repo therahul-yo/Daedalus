@@ -512,3 +512,97 @@ def test_no_think_model_untouched():
     msg = r.json()["choices"][0]["message"]
     assert msg["content"] == "Direct answer, no thinking."
     assert "reasoning_content" not in msg
+
+
+def test_request_id_echoes_back_and_generates_when_absent(client_and_fakes):
+    """(a) Response echoes X-Request-ID and generates one when absent."""
+    client, _, _ = client_and_fakes
+    # Without a request-ID header — server generates one.
+    r = client.get("/health")
+    assert "X-Request-ID" in r.headers
+    generated_id = r.headers["X-Request-ID"]
+    assert generated_id.startswith("req-")
+    assert len(generated_id) > 8
+
+    # With a custom request-ID header — server echoes it.
+    r = client.get("/health", headers={"X-Request-ID": "my-trace-id-42"})
+    assert r.headers["X-Request-ID"] == "my-trace-id-42"
+
+    # Also on chat completions endpoint.
+    r = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+        headers={"X-Request-ID": "chat-trace-99"},
+    )
+    assert r.headers["X-Request-ID"] == "chat-trace-99"
+
+
+def test_global_rate_limit_rejects_with_429_while_per_ip_untouched():
+    """(b) Requests beyond --global-rps get 429; different client-IP
+    confirms the per-IP limiter is not the rejecting side."""
+    engine, store = FakeEngine(), FakeStore()
+    client = TestClient(create_app(
+        engine, store, model_id="test-model",
+        global_rps=1.0, global_burst=1,
+        requests_per_minute=100,  # per-IP is generous — won't trigger
+    ))
+    # First request passes.
+    r1 = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r1.status_code == 200
+
+    # Second immediate request hits the global rate limit.
+    r2 = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r2.status_code == 429
+    assert "global request rate limit exceeded" in r2.json()["error"]["message"]
+
+    # A different client-IP sees the same global limit error
+    # (the per-IP limiter was NOT the cause).
+    r3 = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+        headers={"X-Forwarded-For": "10.0.0.2"},
+    )
+    assert r3.status_code == 429
+    assert "global request rate limit exceeded" in r3.json()["error"]["message"]
+
+
+def test_start_finish_request_tracks_in_flight_via_drain():
+    """(c) Lifespan drain waits for an in-flight request tracked via
+    start_request/finish_request."""
+    engine, store = FakeEngine(), FakeStore()
+    app = create_app(engine, store, model_id="test-model")
+    state = app.state.daedalus
+
+    # Non-streaming: after response, in_flight returns to 0.
+    client = TestClient(app)
+    client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert state.in_flight_requests == 0
+
+    # Streaming: after consuming the stream, in_flight returns to 0.
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], "stream": True},
+    ) as r:
+        "".join(r.iter_text())
+    assert state.in_flight_requests == 0
+
+    # Manually verify the drain waits: call with a made-up in-flight count.
+    state.start_request()
+    assert state.in_flight_requests == 1
+    # Simulate the lifespan drain check.
+    assert not state.wait_for_drain(timeout=0.05)
+    # On an actual lifespan the wait would eventually time out
+    # or the request would finish.  Here we call finish_request.
+    state.finish_request()
+    assert state.in_flight_requests == 0
+    assert state.wait_for_drain(timeout=0.05)
