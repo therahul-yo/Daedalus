@@ -71,6 +71,7 @@ class FakeEngine:
         checkpoint_cb=None,
         should_abort=None,
         progress_cb=None,
+        **kwargs,
     ):
         self.generate_calls.append(
             {"tokens": len(tokens), "already_cached": already_cached}
@@ -165,14 +166,15 @@ def test_streaming_completion_format(client_and_fakes):
     assert chunks[0]["choices"][0]["delta"] == {"role": "assistant"}
     # Reassembled content.
     content = "".join(
-        c["choices"][0]["delta"].get("content", "") for c in chunks
+        c["choices"][0]["delta"].get("content", "") for c in chunks if c.get("choices")
     )
     assert content == "Hello world!"
     # Final chunk has finish_reason and usage.
-    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+    assert chunks[-2]["choices"][0]["finish_reason"] == "stop"
     assert chunks[-1]["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
     # OpenCode compat: no chunk may carry an empty tool_calls array.
     for c in chunks:
+        if not c.get("choices"): continue
         assert c["choices"][0]["delta"].get("tool_calls") != []
 
 
@@ -403,7 +405,7 @@ def test_streaming_tool_call_deltas():
     chunks = [json.loads(l[6:]) for l in lines[:-1]]
 
     tool_chunks = [
-        c for c in chunks if "tool_calls" in c["choices"][0]["delta"]
+        c for c in chunks if c.get("choices") and "tool_calls" in c["choices"][0]["delta"]
     ]
     assert len(tool_chunks) == 1
     tc = tool_chunks[0]["choices"][0]["delta"]["tool_calls"][0]
@@ -411,8 +413,9 @@ def test_streaming_tool_call_deltas():
     assert tc["function"]["name"] == "read_file"
     # OpenCode compat: no chunk anywhere may carry empty tool_calls.
     for c in chunks:
+        if not c.get("choices"): continue
         assert c["choices"][0]["delta"].get("tool_calls") != []
-    assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
+    assert chunks[-2]["choices"][0]["finish_reason"] == "tool_calls"
 
 
 def test_tool_choice_none_disables_tools():
@@ -478,9 +481,9 @@ def test_reasoning_separated_streaming():
     ]
     chunks = [json.loads(l[6:]) for l in lines]
     reasoning = "".join(
-        c["choices"][0]["delta"].get("reasoning_content", "") for c in chunks
+        c["choices"][0]["delta"].get("reasoning_content", "") for c in chunks if c.get("choices")
     )
-    content = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks)
+    content = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks if c.get("choices"))
     assert reasoning == "The user greets me. I should reply."
     assert content == "Yo! How can I help?"
     assert "</think>" not in content

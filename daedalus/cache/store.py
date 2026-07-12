@@ -476,12 +476,13 @@ class PrefixCacheStore:
             path.unlink(missing_ok=True)
             Path(str(path) + ".json").unlink(missing_ok=True)
             total -= size
-            for key, entry in list(self._entries.items()):
-                if entry.path == path:
-                    if entry.cache is None:
-                        self._entries.pop(key, None)
-                    else:
-                        entry.path = None
+            with self._lock:
+                for key, entry in list(self._entries.items()):
+                    if entry.path == path:
+                        if entry.cache is None:
+                            self._entries.pop(key, None)
+                        else:
+                            entry.path = None
         with self._lock:
             self._rebuild_index()
 

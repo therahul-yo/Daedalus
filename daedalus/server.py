@@ -72,6 +72,7 @@ class ServerState:
     requests_per_minute: int = 0
     rate_windows: dict[str, tuple[float, int]] = None
     max_request_bytes: int = 2 * 1024 * 1024
+    io_pool: concurrent.futures.ThreadPoolExecutor = None
 
     def try_admit(self) -> bool:
         with self.admission_lock:
@@ -87,6 +88,17 @@ class ServerState:
     def memory_available(self) -> bool:
         if self.max_active_memory_bytes is None:
             return True
+        try:
+            import psutil
+            if psutil.virtual_memory().available < 1024 * 1024 * 512:
+                trim = getattr(self.store, "trim_ram", None)
+                if trim:
+                    trim(0)
+                if psutil.virtual_memory().available < 1024 * 1024 * 512:
+                    return False
+        except ImportError:
+            pass
+
         active = getattr(self.engine, "active_memory_bytes", lambda: 0)()
         if active < self.max_active_memory_bytes:
             return True
@@ -309,6 +321,7 @@ def create_app(
         requests_per_minute=requests_per_minute,
         rate_windows={},
         max_request_bytes=max_request_bytes,
+        io_pool=concurrent.futures.ThreadPoolExecutor(max_workers=1),
     )
 
     @asynccontextmanager
@@ -316,6 +329,8 @@ def create_app(
         yield
         with state.admission_lock:
             state.accepting = False
+        if state.io_pool:
+            state.io_pool.shutdown(wait=False)
         close = getattr(state.store, "close", None)
         if close:
             close()
@@ -418,15 +433,23 @@ def create_app(
             max_tokens = int(body.get("max_tokens") or body.get("max_completion_tokens") or 2048)
             temperature = float(body.get("temperature", 0.7))
             top_p = float(body.get("top_p", 1.0))
+            freq_p = float(body.get("frequency_penalty", 0.0))
+            pres_p = float(body.get("presence_penalty", 0.0))
         except (TypeError, ValueError):
-            return error("max_tokens, temperature, and top_p must be numeric", 400)
-        if max_tokens < 1 or temperature < 0 or not 0 < top_p <= 1:
+            return error("max_tokens, temperature, top_p, frequency_penalty, presence_penalty must be numeric", 400)
+        if max_tokens < 1 or temperature < 0 or not 0 < top_p <= 1 or not -2.0 <= freq_p <= 2.0 or not -2.0 <= pres_p <= 2.0:
             return error("max_tokens must be positive, temperature non-negative, and top_p in (0, 1]", 400)
         if max_tokens > state.max_completion_tokens:
             return error(f"max_tokens exceeds server limit ({state.max_completion_tokens})", 400)
         tools = body.get("tools") or None
         if body.get("tool_choice") == "none":
             tools = None
+            
+        stop = body.get("stop")
+        if isinstance(stop, str):
+            stop = [stop]
+        elif not isinstance(stop, list):
+            stop = []
 
         try:
             tokens = build_prompt_tokens(state, messages, tools)
@@ -501,6 +524,9 @@ def create_app(
             prompt_in_think=prompt_in_think,
             rid=request_id[-6:],
             head_boundary=head_boundary,
+            stop=stop,
+            frequency_penalty=freq_p,
+            presence_penalty=pres_p,
         )
 
         if stream:
@@ -572,6 +598,9 @@ class _Generation:
         prompt_in_think=False,
         rid="",
         head_boundary=None,
+        stop=None,
+        frequency_penalty=0.0,
+        presence_penalty=0.0,
     ):
         self.state = state
         self.tokens = tokens
@@ -582,6 +611,9 @@ class _Generation:
         self.prompt_in_think = prompt_in_think
         self.rid = rid
         self.head_boundary = head_boundary
+        self.stop = stop or []
+        self.frequency_penalty = frequency_penalty
+        self.presence_penalty = presence_penalty
         self.events: "asyncio.Queue[dict]" = None  # set in stream()
         self.aborted = threading.Event()
         self.prefill_done = 0
@@ -648,11 +680,9 @@ class _Generation:
         """Sync generator of events: prefill progress, text deltas, done."""
         state = self.state
         t_start = time.monotonic()
-        with state.lock:
-            # A client can disconnect while its FIFO ticket is waiting. It
-            # still releases its turn, but never starts cache/model work.
-            if self.aborted.is_set():
-                return
+        if not state.lock.acquire(self.aborted):
+            return
+        try:
             hit = state.store.fetch(self.tokens)
             if hit is not None:
                 prompt_cache = hit.cache
@@ -759,9 +789,17 @@ class _Generation:
                         call_index += len(calls)
                 return events
 
+            buffer = ""
             try:
+                try:
+                    from mlx_lm.sample_utils import make_logits_processors
+                    logits_processors = make_logits_processors(frequency_penalty=self.frequency_penalty, presence_penalty=self.presence_penalty)
+                except ImportError:
+                    logits_processors = None
+
                 for resp in state.engine.generate(
                     self.tokens,
+                    logits_processors=logits_processors,
                     max_tokens=self.max_tokens,
                     temperature=self.temperature,
                     top_p=self.top_p,
@@ -780,6 +818,22 @@ class _Generation:
                     if t_first_token is None:
                         t_first_token = time.monotonic()
                     if resp.text:
+                        buffer += resp.text
+                        matched = False
+                        for s in self.stop:
+                            if s in buffer:
+                                matched = True
+                                prev_len = len(buffer) - len(resp.text)
+                                valid_chunk_len = max(0, buffer.find(s) - prev_len)
+                                text_to_emit = resp.text[:valid_chunk_len]
+                                if text_to_emit:
+                                    yield from route(text_to_emit)
+                                break
+                        
+                        if matched:
+                            finish_reason = "stop"
+                            break
+                        
                         output_events = route(resp.text)
                         yield from output_events
                     # Generator yields above before continuing here, so the
@@ -788,7 +842,7 @@ class _Generation:
                     if deferred_persist_tokens is not None and resp.text and output_events:
                         persist = getattr(state.store, "persist", None)
                         if persist:
-                            persist(deferred_persist_tokens)
+                            state.io_pool.submit(persist, deferred_persist_tokens)
                         deferred_persist_tokens = None
                     n_generated = resp.generation_tokens
                     decode_tps = resp.generation_tps
@@ -801,64 +855,66 @@ class _Generation:
                     self.prefill_done,
                 )
                 return
+        finally:
+            state.lock.release()
 
-            reasoning, content = think_filter.finalize()
-            if deferred_persist_tokens is not None:
-                persist = getattr(state.store, "persist", None)
-                if persist:
-                    persist(deferred_persist_tokens)
-            if reasoning:
-                yield {"type": "reasoning", "text": reasoning}
-            if content:
-                plain, calls = tool_filter.feed(content)
-                content_tail, tail_calls = tool_filter.finalize()
-                if plain or content_tail:
-                    yield {"type": "delta", "text": plain + content_tail}
-                calls = calls + tail_calls
-            else:
-                content_tail, calls = tool_filter.finalize()
-                if content_tail:
-                    yield {"type": "delta", "text": content_tail}
-            if calls:
-                emitted_calls = True
-                yield {
+        reasoning, content = think_filter.finalize()
+        if deferred_persist_tokens is not None:
+            persist = getattr(state.store, "persist", None)
+            if persist:
+                persist(deferred_persist_tokens)
+        if reasoning:
+            yield {"type": "reasoning", "text": reasoning}
+        if content:
+            plain, calls = tool_filter.feed(content)
+            content_tail, tail_calls = tool_filter.finalize()
+            if plain or content_tail:
+                yield {"type": "delta", "text": plain + content_tail}
+            calls = calls + tail_calls
+        else:
+            content_tail, calls = tool_filter.finalize()
+            if content_tail:
+                yield {"type": "delta", "text": content_tail}
+        if calls:
+            emitted_calls = True
+            yield {
                     "type": "tool_calls",
                     "calls": [
                         c.as_openai(call_index + i) for i, c in enumerate(calls)
                     ],
                 }
 
-            if emitted_calls:
-                finish_reason = "tool_calls"
+        if emitted_calls:
+            finish_reason = "tool_calls"
 
-            total_s = time.monotonic() - t_start
-            prefill_s = (t_first_token or time.monotonic()) - t_start
-            fresh = len(self.tokens) - already
-            logger.info(
-                "← %s · %.1fs · prefill %d tok %.1fs (%d cached) · "
-                "decode %d tok @ %.1f tok/s · thermal %s · finish=%s",
-                self.rid,
-                total_s,
-                fresh,
-                prefill_s,
-                already,
-                n_generated,
-                decode_tps,
-                state.engine.governor.effective_level.name,
-                finish_reason,
-            )
-            yield {
-                "type": "done",
-                "finish_reason": finish_reason or "stop",
-                "usage": {
-                    "prompt_tokens": len(self.tokens),
-                    "completion_tokens": n_generated,
-                    "total_tokens": len(self.tokens) + n_generated,
-                    "prompt_tokens_details": {
-                        "cached_tokens": self.cached_tokens
-                    },
+        total_s = time.monotonic() - t_start
+        prefill_s = (t_first_token or time.monotonic()) - t_start
+        fresh = len(self.tokens) - already
+        logger.info(
+            "← %s · %.1fs · prefill %d tok %.1fs (%d cached) · "
+            "decode %d tok @ %.1f tok/s · thermal %s · finish=%s",
+            self.rid,
+            total_s,
+            fresh,
+            prefill_s,
+            already,
+            n_generated,
+            decode_tps,
+            state.engine.governor.effective_level.name,
+            finish_reason,
+        )
+        yield {
+            "type": "done",
+            "finish_reason": finish_reason or "stop",
+            "usage": {
+                "prompt_tokens": len(self.tokens),
+                "completion_tokens": n_generated,
+                "total_tokens": len(self.tokens) + n_generated,
+                "prompt_tokens_details": {
+                    "cached_tokens": self.cached_tokens
                 },
-            }
+            },
+        }
 
 
 async def _stream_response(
@@ -954,9 +1010,19 @@ async def _stream_response(
                         created,
                         {},
                         finish_reason=event["finish_reason"],
-                        usage=event["usage"],
                     )
                 )
+                if event.get("usage"):
+                    yield _sse(
+                        {
+                            "id": request_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [],
+                            "usage": event["usage"],
+                        }
+                    )
             elif event["type"] == "error":
                 yield _sse(
                     {
