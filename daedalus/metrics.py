@@ -78,7 +78,7 @@ class ServerMetrics:
             f"daedalus_shared_head_cache_hits_total {cache.get('shared_head', {}).get('hits', 0)}",
             "# HELP daedalus_thermal_level Current thermal level (0=nominal through 4=sleeping).",
             "# TYPE daedalus_thermal_level gauge",
-            f"daedalus_thermal_level{{level=\"{thermal.lower()}\"}} {['NOMINAL', 'MODERATE', 'HEAVY', 'TRAPPING', 'SLEEPING'].index(thermal)}",
+            f"daedalus_thermal_level{{level=\\\"{thermal.lower()}\\\"}} {['NOMINAL', 'MODERATE', 'HEAVY', 'TRAPPING', 'SLEEPING', 'UNKNOWN'].index(thermal.upper()) if thermal.upper() in ['NOMINAL', 'MODERATE', 'HEAVY', 'TRAPPING', 'SLEEPING', 'UNKNOWN'] else -1}",
         ]
         lines += [f'daedalus_cache_admin_total{{action="{k}"}} {v}' for k, v in sorted(cache_admin.items())]
         return "\n".join(lines) + "\n"
