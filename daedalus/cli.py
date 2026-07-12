@@ -104,6 +104,7 @@ def cmd_serve(args) -> int:
         max_completion_tokens=args.max_completion_tokens,
         requests_per_minute=args.requests_per_minute,
         max_request_bytes=args.max_request_bytes,
+        audit_log_path=args.audit_log,
     )
 
     bar = "─" * 62
@@ -315,6 +316,10 @@ def main() -> int:
     serve.add_argument("--requests-per-minute", type=int, default=0,
                        help="per-client LAN limit; 0 disables rate limiting")
     serve.add_argument("--max-request-bytes", type=int, default=2 * 1024 * 1024)
+    serve.add_argument(
+        "--audit-log",
+        help="path to a structured (NDJSON) audit log for auth failures, rate-limit events, and cache-admin operations",
+    )
     serve.add_argument("--kv-bits", type=int, default=8)
     serve.add_argument(
         "--prefill-chunk-tokens", type=int,
