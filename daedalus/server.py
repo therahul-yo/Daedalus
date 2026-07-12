@@ -331,7 +331,7 @@ class PromptTokenCache:
 class SharedHeadIndex:
     """Memoize stable system/tool prefix boundaries across agent sessions."""
 
-    def __init__(self, max_entries: int = 128) -> None:
+    def __init__(self, max_entries: int = 512) -> None:
         self._entries: OrderedDict[str, int] = OrderedDict()
         self._lock = threading.Lock()
         self.max_entries = max_entries
@@ -454,7 +454,7 @@ def create_app(
     *,
     max_pending_requests: int = 8,
     api_key: Optional[str] = None,
-    token_cache_entries: int = 256,
+    token_cache_entries: int = 1024,
     max_active_memory_bytes: Optional[int] = None,
     max_prompt_tokens: int = 65536,
     max_completion_tokens: int = 4096,
