@@ -286,6 +286,7 @@ def create_app(
     max_completion_tokens: int = 4096,
     requests_per_minute: int = 0,
     max_request_bytes: int = 2 * 1024 * 1024,
+    shutdown_drain_seconds: float = 10.0,
 ) -> FastAPI:
     if max_pending_requests < 1:
         raise ValueError("max_pending_requests must be at least 1")
@@ -316,6 +317,19 @@ def create_app(
         yield
         with state.admission_lock:
             state.accepting = False
+        # Drain in-flight generations before releasing the cache flock:
+        # engine worker threads may still be writing snapshots to disk.
+        deadline = time.monotonic() + shutdown_drain_seconds
+        while time.monotonic() < deadline:
+            with state.admission_lock:
+                if state.admitted_requests == 0:
+                    break
+            await asyncio.sleep(0.1)
+        else:
+            logger.warning(
+                "shutdown: %d request(s) still active after drain deadline",
+                state.admitted_requests,
+            )
         close = getattr(state.store, "close", None)
         if close:
             close()
@@ -517,7 +531,25 @@ def create_app(
             )
 
         try:
-            result = await asyncio.to_thread(gen.run_to_completion)
+            # Run the engine in a thread, but keep watching the connection:
+            # a non-streaming client that gives up (OpenCode's 300s retry)
+            # must abort the burn instead of wasting a full prefill+decode.
+            engine_task = asyncio.create_task(
+                asyncio.to_thread(gen.run_to_completion)
+            )
+            while True:
+                done_set, _ = await asyncio.wait({engine_task}, timeout=1.0)
+                if done_set:
+                    break
+                if await request.is_disconnected():
+                    gen.aborted.set()
+                    await engine_task  # engine exits at the next chunk/abort poll
+                    state.metrics.inc_request("cancelled")
+                    return JSONResponse(
+                        {"error": {"message": "client disconnected", "type": "cancelled"}},
+                        status_code=499,
+                    )
+            result = engine_task.result()
             state.metrics.inc_request("completed")
         except Exception:
             state.metrics.inc_request("failed")
@@ -678,6 +710,7 @@ class _Generation:
             last_checkpoint = already
             last_checkpoint_time = time.monotonic()
             deferred_persist_tokens: Optional[List[int]] = None
+            deferred_head_tokens: Optional[List[int]] = None
             last_progress_log = [time.monotonic()]
 
             def progress_cb(done: int, total: int) -> None:
@@ -699,7 +732,8 @@ class _Generation:
                     last_progress_log[0] = now
 
             def checkpoint_cb(done: int, cache: List[Any]) -> None:
-                nonlocal last_checkpoint, last_checkpoint_time, deferred_persist_tokens
+                nonlocal last_checkpoint, last_checkpoint_time
+                nonlocal deferred_persist_tokens, deferred_head_tokens
                 if done >= len(self.tokens) - 1:
                     # End-of-prefill snapshot keyed by the prompt: for
                     # non-trimmable (hybrid) caches this is the only state
@@ -709,7 +743,10 @@ class _Generation:
                 elif done == self.head_boundary and done > already:
                     # Shared-head snapshot: reused by NEW sessions/branches
                     # whose conversation diverges after the system prompt.
-                    state.store.put(self.tokens[:done], cache)
+                    # RAM-only here (pinned); disk write is deferred past the
+                    # response so it never sits inside TTFT.
+                    state.store.put(self.tokens[:done], cache, persist=False)
+                    deferred_head_tokens = self.tokens[:done]
                     logger.info(
                         "  %s · head snapshot at %d tok", self.rid, done
                     )
@@ -780,16 +817,7 @@ class _Generation:
                     if t_first_token is None:
                         t_first_token = time.monotonic()
                     if resp.text:
-                        output_events = route(resp.text)
-                        yield from output_events
-                    # Generator yields above before continuing here, so the
-                    # client can receive first content before disk I/O. MLX
-                    # cache serialization must remain on this engine thread.
-                    if deferred_persist_tokens is not None and resp.text and output_events:
-                        persist = getattr(state.store, "persist", None)
-                        if persist:
-                            persist(deferred_persist_tokens)
-                        deferred_persist_tokens = None
+                        yield from route(resp.text)
                     n_generated = resp.generation_tokens
                     decode_tps = resp.generation_tps
                     if resp.finish_reason is not None:
@@ -800,65 +828,80 @@ class _Generation:
                     self.rid,
                     self.prefill_done,
                 )
+                # A head snapshot taken before the abort is still valuable —
+                # persist it (rare path; lock hold acceptable) so its pin
+                # is released and the work isn't lost.
+                if deferred_head_tokens is not None:
+                    persist = getattr(state.store, "persist", None)
+                    if persist:
+                        persist(deferred_head_tokens)
                 return
 
-            reasoning, content = think_filter.finalize()
-            if deferred_persist_tokens is not None:
-                persist = getattr(state.store, "persist", None)
-                if persist:
-                    persist(deferred_persist_tokens)
-            if reasoning:
-                yield {"type": "reasoning", "text": reasoning}
-            if content:
-                plain, calls = tool_filter.feed(content)
-                content_tail, tail_calls = tool_filter.finalize()
-                if plain or content_tail:
-                    yield {"type": "delta", "text": plain + content_tail}
-                calls = calls + tail_calls
-            else:
-                content_tail, calls = tool_filter.finalize()
-                if content_tail:
-                    yield {"type": "delta", "text": content_tail}
-            if calls:
-                emitted_calls = True
-                yield {
-                    "type": "tool_calls",
-                    "calls": [
-                        c.as_openai(call_index + i) for i, c in enumerate(calls)
-                    ],
-                }
-
-            if emitted_calls:
-                finish_reason = "tool_calls"
-
-            total_s = time.monotonic() - t_start
-            prefill_s = (t_first_token or time.monotonic()) - t_start
-            fresh = len(self.tokens) - already
-            logger.info(
-                "← %s · %.1fs · prefill %d tok %.1fs (%d cached) · "
-                "decode %d tok @ %.1f tok/s · thermal %s · finish=%s",
-                self.rid,
-                total_s,
-                fresh,
-                prefill_s,
-                already,
-                n_generated,
-                decode_tps,
-                state.engine.governor.effective_level.name,
-                finish_reason,
-            )
+        # ---- FifoLock released: engine/GPU work is done. Filter finalize,
+        # the done event, and deferred disk writes must not make the next
+        # queued request wait behind this one's tail work.
+        reasoning, content = think_filter.finalize()
+        if reasoning:
+            yield {"type": "reasoning", "text": reasoning}
+        if content:
+            plain, calls = tool_filter.feed(content)
+            content_tail, tail_calls = tool_filter.finalize()
+            if plain or content_tail:
+                yield {"type": "delta", "text": plain + content_tail}
+            calls = calls + tail_calls
+        else:
+            content_tail, calls = tool_filter.finalize()
+            if content_tail:
+                yield {"type": "delta", "text": content_tail}
+        if calls:
+            emitted_calls = True
             yield {
-                "type": "done",
-                "finish_reason": finish_reason or "stop",
-                "usage": {
-                    "prompt_tokens": len(self.tokens),
-                    "completion_tokens": n_generated,
-                    "total_tokens": len(self.tokens) + n_generated,
-                    "prompt_tokens_details": {
-                        "cached_tokens": self.cached_tokens
-                    },
-                },
+                "type": "tool_calls",
+                "calls": [
+                    c.as_openai(call_index + i) for i, c in enumerate(calls)
+                ],
             }
+
+        if emitted_calls:
+            finish_reason = "tool_calls"
+
+        total_s = time.monotonic() - t_start
+        prefill_s = (t_first_token or time.monotonic()) - t_start
+        fresh = len(self.tokens) - already
+        logger.info(
+            "← %s · %.1fs · prefill %d tok %.1fs (%d cached) · "
+            "decode %d tok @ %.1f tok/s · thermal %s · finish=%s",
+            self.rid,
+            total_s,
+            fresh,
+            prefill_s,
+            already,
+            n_generated,
+            decode_tps,
+            state.engine.governor.effective_level.name,
+            finish_reason,
+        )
+        yield {
+            "type": "done",
+            "finish_reason": finish_reason or "stop",
+            "usage": {
+                "prompt_tokens": len(self.tokens),
+                "completion_tokens": n_generated,
+                "total_tokens": len(self.tokens) + n_generated,
+                "prompt_tokens_details": {
+                    "cached_tokens": self.cached_tokens
+                },
+            },
+        }
+
+        # Deferred snapshot persists land after the client already has its
+        # final chunk: outside the FifoLock, off the TTFT path, still on
+        # this engine worker thread (MLX serialization is stream-bound).
+        persist = getattr(state.store, "persist", None)
+        if persist:
+            for toks in (deferred_head_tokens, deferred_persist_tokens):
+                if toks is not None:
+                    persist(toks)
 
 
 async def _stream_response(

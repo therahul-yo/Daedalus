@@ -94,6 +94,9 @@ class _Entry:
     nbytes: int
     last_used: float
     path: Optional[Path] = None  # set when persisted
+    # A deferred snapshot awaiting persist() — must survive RAM eviction,
+    # otherwise the most valuable cache write of a request silently vanishes.
+    pinned: bool = False
 
 
 @dataclass
@@ -147,6 +150,9 @@ class PrefixCacheStore:
         self._entries: dict[str, _Entry] = {}
         self._trie = _TrieNode()
         self._lock = threading.Lock()
+        # Incremental disk accounting: path -> (bytes, mtime). Avoids
+        # re-globbing and stat-ing the whole cache dir on every put().
+        self._disk_usage: dict[Path, tuple[int, float]] = {}
         self.hits = 0
         self.misses = 0
         self.copy_seconds = 0.0
@@ -277,6 +283,7 @@ class PrefixCacheStore:
         """Deep copy of the entry's cache, loading from disk if needed."""
         if entry.cache is not None:
             return self._copy_cache(entry.cache), "ram"
+        load_start = time.perf_counter()
         try:
             loaded = load_prompt_cache(str(entry.path))
         except Exception as exc:  # corrupt/stale file: drop the entry
@@ -284,12 +291,17 @@ class PrefixCacheStore:
             with self._lock:
                 self._entries.pop(_tokens_digest(entry.tokens), None)
                 self._rebuild_index()
+                self._disk_usage.pop(entry.path, None)
             if entry.path:
                 entry.path.unlink(missing_ok=True)
                 Path(str(entry.path) + ".json").unlink(missing_ok=True)
             return None, "disk"
-        entry.cache = loaded
-        entry.nbytes = cache_nbytes(loaded)
+        # Shared-entry mutation must happen under the lock: sync FastAPI
+        # routes (/metrics, /v1/cache/stats) read entries from other threads.
+        with self._lock:
+            entry.cache = loaded
+            entry.nbytes = cache_nbytes(loaded)
+            self.load_seconds += time.perf_counter() - load_start
         self._evict_ram()
         return self._copy_cache(loaded), "disk"
 
@@ -312,16 +324,21 @@ class PrefixCacheStore:
             return
         key = _tokens_digest(tokens)
         stored = self._copy_cache(prompt_cache)
+        deferred = not persist and len(tokens) >= self.min_persist_tokens
         entry = _Entry(
             tokens=list(tokens),
             cache=stored,
             nbytes=cache_nbytes(stored),
             last_used=time.monotonic(),
+            # Deferred snapshots are pinned until persist() lands them on
+            # disk — RAM eviction must not silently discard them.
+            pinned=deferred,
         )
         with self._lock:
             old = self._entries.get(key)
             if old is not None and old.path is not None:
                 entry.path = old.path
+                entry.pinned = False  # already on disk from a previous turn
             self._entries[key] = entry
             self._index(key, entry.tokens)
         if persist and len(tokens) >= self.min_persist_tokens:
@@ -342,6 +359,9 @@ class PrefixCacheStore:
         if entry is not None and entry.cache is not None and len(tokens) >= self.min_persist_tokens:
             self._persist(key, entry)
             self._evict_disk()
+        elif entry is not None:
+            with self._lock:
+                entry.pinned = False
 
     def close(self, timeout: float = 10.0) -> None:
         """Release the optional single-process cache ownership lock."""
@@ -380,8 +400,12 @@ class PrefixCacheStore:
 
     def _persist(self, key: str, entry: _Entry) -> None:
         path = self._write_entry_files(key, entry.tokens, entry.cache)
-        if path is not None:
-            entry.path = path
+        with self._lock:
+            if path is not None:
+                entry.path = path
+            # Persisted (or persist failed and was logged): either way the
+            # pin has done its job — release it so eviction works normally.
+            entry.pinned = False
 
     def _write_entry_files(
         self, key: str, tokens: List[int], prompt_cache: List[Any]
@@ -411,8 +435,14 @@ class PrefixCacheStore:
                     }
                 )
             )
-            tmp.rename(final)
+            # Sidecar first: a crash between the two renames then leaves a
+            # dangling sidecar (harmless, cleaned by _load_disk_index) rather
+            # than an orphaned multi-GB data file invisible to the index.
             sidecar_tmp.rename(Path(str(final) + ".json"))
+            tmp.rename(final)
+            size = final.stat().st_size
+            with self._lock:
+                self._disk_usage[final] = (size, time.time())
             return final
         except Exception as exc:
             logger.warning("failed to persist cache entry %s: %s", key, exc)
@@ -431,16 +461,20 @@ class PrefixCacheStore:
                 tokens = meta["tokens"]
                 data_path = Path(str(sidecar)[: -len(".json")])
                 if not data_path.exists():
+                    # Dangling sidecar from a crash between renames.
+                    sidecar.unlink(missing_ok=True)
                     continue
                 key = _tokens_digest(tokens)
+                stat = data_path.stat()
                 self._entries[key] = _Entry(
                     tokens=tokens,
                     cache=None,
                     nbytes=0,
-                    last_used=data_path.stat().st_mtime,
+                    last_used=stat.st_mtime,
                     path=data_path,
                 )
                 self._index(key, tokens)
+                self._disk_usage[data_path] = (stat.st_size, stat.st_mtime)
             except Exception as exc:
                 logger.warning("skipping bad cache sidecar %s: %s", sidecar, exc)
 
@@ -453,37 +487,64 @@ class PrefixCacheStore:
             if total <= self.max_ram_bytes:
                 return
             resident.sort(key=lambda e: e.last_used)
+            popped = False
             for entry in resident:
                 if total <= self.max_ram_bytes:
                     break
+                if entry.pinned:
+                    # A deferred snapshot awaiting persist(): dropping it
+                    # here would silently lose the request's cache write.
+                    continue
                 # Drop from RAM; keep the entry if it lives on disk.
                 total -= entry.nbytes
                 entry.cache = None
                 entry.nbytes = 0
                 if entry.path is None:
                     self._entries.pop(_tokens_digest(entry.tokens), None)
-            self._rebuild_index()
+                    popped = True
+            if total > self.max_ram_bytes:
+                logger.warning(
+                    "cache RAM over budget (%d > %d) — pinned deferred "
+                    "snapshots held; will shrink after persist",
+                    total,
+                    self.max_ram_bytes,
+                )
+            if popped:
+                self._rebuild_index()
 
     def _evict_disk(self) -> None:
-        files = sorted(
-            self.dir.glob("*.safetensors"), key=lambda p: p.stat().st_mtime
-        )
-        total = sum(p.stat().st_size for p in files)
-        for path in files:
+        with self._lock:
+            total = sum(size for size, _ in self._disk_usage.values())
             if total <= self.max_disk_bytes:
-                break
-            size = path.stat().st_size
+                return
+            # Oldest-first victims, chosen under the lock…
+            victims = []
+            for path, (size, mtime) in sorted(
+                self._disk_usage.items(), key=lambda kv: kv[1][1]
+            ):
+                if total <= self.max_disk_bytes:
+                    break
+                victims.append(path)
+                total -= size
+        # …file I/O outside the lock…
+        for path in victims:
             path.unlink(missing_ok=True)
             Path(str(path) + ".json").unlink(missing_ok=True)
-            total -= size
-            for key, entry in list(self._entries.items()):
-                if entry.path == path:
-                    if entry.cache is None:
-                        self._entries.pop(key, None)
-                    else:
-                        entry.path = None
+        # …then entry-table mutation back under the lock (fixes a race with
+        # the sync /metrics and /v1/cache routes on threadpool threads).
         with self._lock:
-            self._rebuild_index()
+            popped = False
+            for path in victims:
+                self._disk_usage.pop(path, None)
+                for key, entry in list(self._entries.items()):
+                    if entry.path == path:
+                        if entry.cache is None:
+                            self._entries.pop(key, None)
+                            popped = True
+                        else:
+                            entry.path = None
+            if popped:
+                self._rebuild_index()
 
     # ---------------------------------------------------------------- stats
 
@@ -507,6 +568,7 @@ class PrefixCacheStore:
             count = len(self._entries)
             self._entries.clear()
             self._rebuild_index()
+            self._disk_usage.clear()
             self.hits = 0
             self.misses = 0
         for path in self.dir.glob("*.safetensors"):
@@ -517,7 +579,11 @@ class PrefixCacheStore:
     def trim_ram(self, target_bytes: int = 0) -> int:
         """Drop least-recently-used RAM copies until at or below target."""
         with self._lock:
-            resident = [e for e in self._entries.values() if e.cache is not None]
+            resident = [
+                e
+                for e in self._entries.values()
+                if e.cache is not None and not e.pinned
+            ]
             before = sum(e.nbytes for e in resident)
             resident.sort(key=lambda e: e.last_used)
             total = before
