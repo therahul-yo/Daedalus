@@ -87,6 +87,17 @@ class ServerState:
     def memory_available(self) -> bool:
         if self.max_active_memory_bytes is None:
             return True
+        try:
+            import psutil
+            if psutil.virtual_memory().available < 1024 * 1024 * 512:
+                trim = getattr(self.store, "trim_ram", None)
+                if trim:
+                    trim(0)
+                if psutil.virtual_memory().available < 1024 * 1024 * 512:
+                    return False
+        except ImportError:
+            pass
+
         active = getattr(self.engine, "active_memory_bytes", lambda: 0)()
         if active < self.max_active_memory_bytes:
             return True
@@ -440,15 +451,23 @@ def create_app(
             max_tokens = int(body.get("max_tokens") or body.get("max_completion_tokens") or 2048)
             temperature = float(body.get("temperature", 0.7))
             top_p = float(body.get("top_p", 1.0))
+            freq_p = float(body.get("frequency_penalty", 0.0))
+            pres_p = float(body.get("presence_penalty", 0.0))
         except (TypeError, ValueError):
-            return error("max_tokens, temperature, and top_p must be numeric", 400)
-        if max_tokens < 1 or temperature < 0 or not 0 < top_p <= 1:
+            return error("max_tokens, temperature, top_p, frequency_penalty, presence_penalty must be numeric", 400)
+        if max_tokens < 1 or temperature < 0 or not 0 < top_p <= 1 or not -2.0 <= freq_p <= 2.0 or not -2.0 <= pres_p <= 2.0:
             return error("max_tokens must be positive, temperature non-negative, and top_p in (0, 1]", 400)
         if max_tokens > state.max_completion_tokens:
             return error(f"max_tokens exceeds server limit ({state.max_completion_tokens})", 400)
         tools = body.get("tools") or None
         if body.get("tool_choice") == "none":
             tools = None
+            
+        stop = body.get("stop")
+        if isinstance(stop, str):
+            stop = [stop]
+        elif not isinstance(stop, list):
+            stop = []
 
         try:
             tokens = build_prompt_tokens(state, messages, tools)
@@ -523,11 +542,20 @@ def create_app(
             prompt_in_think=prompt_in_think,
             rid=request_id[-6:],
             head_boundary=head_boundary,
+            stop=stop,
+            frequency_penalty=freq_p,
+            presence_penalty=pres_p,
         )
 
         if stream:
+            stream_options = body.get("stream_options")
+            include_usage = isinstance(stream_options, dict) and bool(
+                stream_options.get("include_usage")
+            )
             return StreamingResponse(
-                _stream_response(state, gen, request_id, created, request),
+                _stream_response(
+                    state, gen, request_id, created, request, include_usage
+                ),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -612,6 +640,9 @@ class _Generation:
         prompt_in_think=False,
         rid="",
         head_boundary=None,
+        stop=None,
+        frequency_penalty=0.0,
+        presence_penalty=0.0,
     ):
         self.state = state
         self.tokens = tokens
@@ -622,6 +653,9 @@ class _Generation:
         self.prompt_in_think = prompt_in_think
         self.rid = rid
         self.head_boundary = head_boundary
+        self.stop = stop or []
+        self.frequency_penalty = frequency_penalty
+        self.presence_penalty = presence_penalty
         self.events: "asyncio.Queue[dict]" = None  # set in stream()
         self.aborted = threading.Event()
         self.prefill_done = 0
@@ -688,11 +722,9 @@ class _Generation:
         """Sync generator of events: prefill progress, text deltas, done."""
         state = self.state
         t_start = time.monotonic()
-        with state.lock:
-            # A client can disconnect while its FIFO ticket is waiting. It
-            # still releases its turn, but never starts cache/model work.
-            if self.aborted.is_set():
-                return
+        if not state.lock.acquire(self.aborted):
+            return
+        try:
             hit = state.store.fetch(self.tokens)
             if hit is not None:
                 prompt_cache = hit.cache
@@ -804,9 +836,22 @@ class _Generation:
                         call_index += len(calls)
                 return events
 
+            buffer = ""
             try:
+                # Only engage penalty processors when a client asks for them:
+                # the default path stays byte-identical to plain sampling.
+                penalty_kwargs = {}
+                if self.frequency_penalty or self.presence_penalty:
+                    from mlx_lm.sample_utils import make_logits_processors
+
+                    penalty_kwargs["logits_processors"] = make_logits_processors(
+                        frequency_penalty=self.frequency_penalty,
+                        presence_penalty=self.presence_penalty,
+                    )
+
                 for resp in state.engine.generate(
                     self.tokens,
+                    **penalty_kwargs,
                     max_tokens=self.max_tokens,
                     temperature=self.temperature,
                     top_p=self.top_p,
@@ -825,6 +870,21 @@ class _Generation:
                     if t_first_token is None:
                         t_first_token = time.monotonic()
                     if resp.text:
+                        if self.stop:
+                            buffer += resp.text
+                            matched = False
+                            for s in self.stop:
+                                if s in buffer:
+                                    matched = True
+                                    prev_len = len(buffer) - len(resp.text)
+                                    valid_chunk_len = max(0, buffer.find(s) - prev_len)
+                                    text_to_emit = resp.text[:valid_chunk_len]
+                                    if text_to_emit:
+                                        yield from route(text_to_emit)
+                                    break
+                            if matched:
+                                finish_reason = "stop"
+                                break
                         yield from route(resp.text)
                     n_generated = resp.generation_tokens
                     decode_tps = resp.generation_tps
@@ -844,6 +904,8 @@ class _Generation:
                     if persist:
                         persist(deferred_head_tokens)
                 return
+        finally:
+            state.lock.release()
 
         # ---- FifoLock released: engine/GPU work is done. Filter finalize,
         # the done event, and deferred disk writes must not make the next
@@ -918,6 +980,7 @@ async def _stream_response(
     request_id: str,
     created: int,
     request: Request,
+    include_usage: bool = False,
 ) -> AsyncGenerator[str, None]:
     model = state.model_id
     queue: asyncio.Queue = asyncio.Queue(maxsize=64)
@@ -998,6 +1061,11 @@ async def _stream_response(
                     )
                 )
             elif event["type"] == "done":
+                # OpenAI spec: with stream_options.include_usage the usage
+                # rides a trailing chunk whose choices array is empty. That
+                # empty array breaks clients that index choices[0] unguarded
+                # (OpenCode among them), so the legacy default keeps usage on
+                # the finish_reason chunk and never emits empty choices.
                 yield _sse(
                     _chunk(
                         request_id,
@@ -1005,9 +1073,20 @@ async def _stream_response(
                         created,
                         {},
                         finish_reason=event["finish_reason"],
-                        usage=event["usage"],
+                        usage=None if include_usage else event["usage"],
                     )
                 )
+                if include_usage:
+                    yield _sse(
+                        {
+                            "id": request_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [],
+                            "usage": event["usage"],
+                        }
+                    )
             elif event["type"] == "error":
                 yield _sse(
                     {
