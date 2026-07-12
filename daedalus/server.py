@@ -668,7 +668,9 @@ def create_app(
         }, status_code=status)
 
     @app.get("/metrics")
-    def metrics():
+    def metrics(request: Request, authorization: str | None = Header(default=None)):
+        if not authorized(request, authorization):
+            return error("invalid API key", 401, "authentication_error")
         active = sum(s.admitted_requests for s in model_states.values())
         limit = max_pending_requests
         cache_stats = {
