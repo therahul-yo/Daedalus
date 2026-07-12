@@ -26,8 +26,15 @@ def wait_for_server(timeout=300):
     raise TimeoutError("server did not come up")
 
 
+RUN_NONCE = str(time.time_ns())
+
+
 def timed_request(label):
-    filler = "The quick brown fox jumps over the lazy dog. " * (PROMPT_TOKENS // 10)
+    # Unique per run: the disk cache survives across bench invocations (by
+    # design), so a static prompt would make the "cold" request a warm hit.
+    filler = f"Run {RUN_NONCE}. " + "The quick brown fox jumps over the lazy dog. " * (
+        PROMPT_TOKENS // 10
+    )
     body = json.dumps(
         {
             "messages": [
@@ -35,7 +42,7 @@ def timed_request(label):
                 {"role": "user", "content": "Reply with exactly: E2E OK"},
             ],
             "stream": True,
-            "max_tokens": 30,
+            "max_tokens": 200,
             "temperature": 0,
         }
     ).encode()
@@ -61,10 +68,12 @@ def timed_request(label):
             if "error" in chunk:
                 raise RuntimeError(chunk["error"])
             delta = chunk["choices"][0]["delta"]
-            if delta.get("content"):
+            # Reasoning models emit reasoning_content before content —
+            # either one is the first generated token for TTFT purposes.
+            if delta.get("content") or delta.get("reasoning_content"):
                 if first_content is None:
                     first_content = time.time() - start
-                text += delta["content"]
+                text += delta.get("content") or ""
             if chunk.get("usage"):
                 usage = chunk["usage"]
     cached = usage["prompt_tokens_details"]["cached_tokens"] if usage else 0
