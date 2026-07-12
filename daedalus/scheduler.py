@@ -53,8 +53,10 @@ class PriorityLock:
             return len(self._heap)
 
     def __enter__(self) -> "PriorityLock":
-        # Default entry without priority - should use acquire_with_priority instead
-        return self.acquire_with_priority(0)
+        # NOTE: acquire_with_priority() is called explicitly before entering the
+        # with block (e.g. `with lock.acquire_with_priority(n):`).  That call
+        # already acquires the lock, so __enter__ must NOT acquire a second time.
+        return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
         with self._condition:

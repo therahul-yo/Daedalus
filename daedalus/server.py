@@ -584,16 +584,11 @@ def create_app(
     def error(message: str, status_code: int, kind: str = "invalid_request_error"):
         return JSONResponse({"error": {"message": message, "type": kind}}, status_code=status_code)
 
-    def extract_api_key(request: Request, authorization: Optional[str] = None) -> Optional[str]:
-        """Extract API key from Authorization header, cookie, or websocket headers."""
+    def extract_api_key(request: Request, authorization: str | None = None) -> Optional[str]:
+        """Extract API key from Authorization header or websocket headers only."""
         # Check Authorization header first (Bearer token)
         if authorization:
             return authorization.removeprefix("Bearer ").strip()
-        
-        # Check cookie for daedalus_api_key
-        cookie_key = request.cookies.get("daedalus_api_key")
-        if cookie_key:
-            return cookie_key
         
         # Check X-API-Key header (for websocket handshake)
         header_key = request.headers.get("x-api-key")
@@ -1245,12 +1240,28 @@ class _Generation:
                 multi_state.finish_request()
 
     def run_to_completion(self) -> dict:
-        """Run generation to completion (non-streaming)."""
-        last_event = None
+        """Run generation to completion (non-streaming) and return accumulated result."""
+        text_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        all_tool_calls: list[dict] = []
+        done_info: dict = {}
         for event in self._run_engine():
-            if event["type"] == "done":
-                last_event = event
-        return last_event
+            t = event.get("type")
+            if t == "delta":
+                text_parts.append(event.get("text", ""))
+            elif t == "reasoning":
+                reasoning_parts.append(event.get("text", ""))
+            elif t == "tool_calls":
+                all_tool_calls.extend(event.get("calls", []))
+            elif t == "done":
+                done_info = event
+        return {
+            "text": "".join(text_parts),
+            "reasoning": "".join(reasoning_parts),
+            "tool_calls": all_tool_calls,
+            "finish_reason": done_info.get("finish_reason", "stop"),
+            "usage": done_info.get("usage", {}),
+        }
 
 
 async def _stream_response(

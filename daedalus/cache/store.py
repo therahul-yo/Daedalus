@@ -542,7 +542,8 @@ class PrefixCacheStore:
                 # Handle migration from v1 to v2
                 if meta.get("version", 1) < FORMAT_VERSION:
                     self._migrate_entry(meta, sidecar)
-                    continue
+                    # Re-read migrated v2 metadata so the entry is indexed now
+                    meta = json.loads(sidecar.read_text())
                 if meta.get("version") != FORMAT_VERSION:
                     continue
                 if meta.get("model_key") != self.model_key:
