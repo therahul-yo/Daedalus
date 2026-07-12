@@ -46,7 +46,7 @@ from mlx_lm.models.cache import (
 
 logger = logging.getLogger(__name__)
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
 
 def _default_cache_dir() -> Path:
@@ -97,6 +97,7 @@ class _Entry:
     # A deferred snapshot awaiting persist() — must survive RAM eviction,
     # otherwise the most valuable cache write of a request silently vanishes.
     pinned: bool = False
+    created: float = 0.0  # wall-clock timestamp of file creation (for TTL eviction)
 
 
 @dataclass
@@ -118,6 +119,7 @@ class PrefixCacheStore:
         max_disk_bytes: int = 10 * 1024**3,
         min_persist_tokens: int = 1024,
         exclusive: bool = False,
+        cache_ttl_days: Optional[int] = None,
     ) -> None:
         self.model_key = model_key
         self.dir = (cache_dir or _default_cache_dir()) / _sanitize_model_key(model_key)
@@ -147,6 +149,7 @@ class PrefixCacheStore:
         self.max_ram_bytes = max_ram_bytes
         self.max_disk_bytes = max_disk_bytes
         self.min_persist_tokens = min_persist_tokens
+        self.cache_ttl_days = cache_ttl_days
         self._entries: dict[str, _Entry] = {}
         self._trie = _TrieNode()
         self._lock = threading.Lock()
@@ -159,6 +162,7 @@ class PrefixCacheStore:
         self.lookup_seconds = 0.0
         self.load_seconds = 0.0
         self._load_disk_index()
+        self._prune_disk_by_ttl()
 
     def _index(self, key: str, tokens: List[int]) -> None:
         node = self._trie
@@ -333,12 +337,14 @@ class PrefixCacheStore:
             # Deferred snapshots are pinned until persist() lands them on
             # disk — RAM eviction must not silently discard them.
             pinned=deferred,
+            created=time.time(),
         )
         with self._lock:
             old = self._entries.get(key)
             if old is not None and old.path is not None:
                 entry.path = old.path
                 entry.pinned = False  # already on disk from a previous turn
+                entry.created = old.created  # preserve original creation time
             self._entries[key] = entry
             self._index(key, entry.tokens)
         if persist and len(tokens) >= self.min_persist_tokens:
@@ -454,12 +460,21 @@ class PrefixCacheStore:
         for sidecar in self.dir.glob("*.safetensors.json"):
             try:
                 meta = json.loads(sidecar.read_text())
+                data_path = Path(str(sidecar)[: -len(".json")])
+                # Handle migration from v1 to v2
+                if meta.get("version", 1) < FORMAT_VERSION:
+                    if not data_path.exists():
+                        # Dangling sidecar — clean up now before migration.
+                        sidecar.unlink(missing_ok=True)
+                        continue
+                    self._migrate_entry(meta, sidecar)
+                    # Re-read migrated v2 metadata so the entry is indexed now
+                    meta = json.loads(sidecar.read_text())
                 if meta.get("version") != FORMAT_VERSION:
                     continue
                 if meta.get("model_key") != self.model_key:
                     continue
                 tokens = meta["tokens"]
-                data_path = Path(str(sidecar)[: -len(".json")])
                 if not data_path.exists():
                     # Dangling sidecar from a crash between renames.
                     sidecar.unlink(missing_ok=True)
@@ -472,6 +487,7 @@ class PrefixCacheStore:
                     nbytes=0,
                     last_used=stat.st_mtime,
                     path=data_path,
+                    created=meta.get("created", stat.st_mtime),
                 )
                 self._index(key, tokens)
                 self._disk_usage[data_path] = (stat.st_size, stat.st_mtime)
@@ -597,3 +613,145 @@ class PrefixCacheStore:
                     self._entries.pop(_tokens_digest(entry.tokens), None)
             self._rebuild_index()
             return before - total
+
+    # ----------------------------------------------------------- migration
+
+    def _migrate_entry(self, meta: dict, sidecar: Path) -> None:
+        """Migrate a v1 entry to v2 format (adds created, model_key, n_tokens)."""
+        try:
+            old_version = meta.get("version", 1)
+            logger.info("Migrating cache entry from v%s to v%s: %s", old_version, FORMAT_VERSION, sidecar)
+
+            data_path = Path(str(sidecar)[: -len(".json")])
+            if not data_path.exists():
+                logger.warning("Cache data file missing for %s, skipping migration", sidecar)
+                return
+
+            # v1 didn't have n_tokens — derive from the token list
+            n_tokens = len(meta.get("tokens", []))
+
+            meta["version"] = FORMAT_VERSION
+            meta["model_key"] = meta.get("model_key", self.model_key)
+            meta["n_tokens"] = n_tokens
+            meta["created"] = meta.get("created", data_path.stat().st_mtime)
+
+            sidecar.write_text(json.dumps(meta))
+            logger.info("Successfully migrated cache entry %s to v%d", sidecar, FORMAT_VERSION)
+        except Exception as exc:
+            logger.warning("Failed to migrate cache entry %s: %s", sidecar, exc)
+            sidecar.unlink(missing_ok=True)
+            Path(str(sidecar)[:-5]).unlink(missing_ok=True)
+
+    # ----------------------------------------------------------- TTL eviction
+
+    def _prune_disk_by_ttl(self) -> int:
+        """Remove disk entries older than ``cache_ttl_days``.
+
+        Three-phase structure mirroring ``_evict_disk``:
+        1. Under lock: identify victims based on entry.created + pinned guard.
+        2. Outside lock: unlink files.
+        3. Under lock: remove from _entries, _disk_usage, rebuild index.
+        Returns count of removed entries.
+        """
+        if self.cache_ttl_days is None:
+            return 0
+        cutoff = time.time() - (self.cache_ttl_days * 86400)
+
+        # Phase 1: identify victims (under lock)
+        victims = []
+        with self._lock:
+            for key, entry in list(self._entries.items()):
+                if entry.path is None:
+                    continue  # RAM-only — not on disk
+                if entry.pinned:
+                    continue
+                created = entry.created if entry.created > 0 else entry.last_used
+                if created < cutoff:
+                    victims.append((key, entry.path))
+
+        if not victims:
+            return 0
+
+        # Phase 2: unlink files (outside lock)
+        for _, path in victims:
+            path.unlink(missing_ok=True)
+            Path(str(path) + ".json").unlink(missing_ok=True)
+
+        # Phase 3: update data structures (under lock)
+        with self._lock:
+            for key, path in victims:
+                self._disk_usage.pop(path, None)
+                entry = self._entries.get(key)
+                if entry is not None and entry.path == path:
+                    if entry.cache is None:
+                        self._entries.pop(key, None)
+                    else:
+                        entry.path = None
+            self._rebuild_index()
+
+        return len(victims)
+
+    def prune_by_ttl(self, ttl_days: Optional[int] = None,
+                     model_filter: Optional[str] = None) -> int:
+        """Public entry point for CLI.  Prunes entries older than ``ttl_days``.
+        When ``model_filter`` is set, only prune that model's directory
+        (no-op if this store is for a different model — the caller filters)."""
+        if ttl_days is not None:
+            old_ttl, self.cache_ttl_days = self.cache_ttl_days, ttl_days
+            removed = self._prune_disk_by_ttl()
+            self.cache_ttl_days = old_ttl
+            return removed
+        return self._prune_disk_by_ttl()
+
+    # ----------------------------------------------------------- CLI helpers
+
+    def list_entries(self, model_filter: Optional[str] = None) -> List[dict]:
+        """List all cache entries with metadata for CLI display."""
+        entries = []
+        with self._lock:
+            for key, entry in self._entries.items():
+                if model_filter is not None and self.model_key != model_filter:
+                    continue
+                entry_info = {
+                    "key": key,
+                    "model_key": self.model_key,
+                    "token_count": len(entry.tokens),
+                    "size_bytes": (
+                        entry.nbytes if entry.cache is not None
+                        else (entry.path.stat().st_size if entry.path and entry.path.exists() else 0)
+                    ),
+                    "in_ram": entry.cache is not None,
+                    "on_disk": entry.path is not None and entry.path.exists(),
+                    "last_used": entry.last_used,
+                    "age_seconds": time.time() - entry.last_used,
+                    "path": str(entry.path) if entry.path else None,
+                    "created": entry.created,
+                    "hits": 0,
+                }
+                entries.append(entry_info)
+        entries.sort(key=lambda e: e["last_used"], reverse=True)
+        return entries
+
+    def inspect_entry(self, key_prefix: str) -> Optional[dict]:
+        """Return detailed info for a single entry matched by key prefix."""
+        with self._lock:
+            for key, entry in self._entries.items():
+                if key.startswith(key_prefix):
+                    return {
+                        "key": key,
+                        "model_key": self.model_key,
+                        "token_count": len(entry.tokens),
+                        "tokens": list(entry.tokens),
+                        "size_bytes": (
+                            entry.nbytes if entry.cache is not None
+                            else (entry.path.stat().st_size if entry.path and entry.path.exists() else 0)
+                        ),
+                        "in_ram": entry.cache is not None,
+                        "on_disk": entry.path is not None and entry.path.exists(),
+                        "path": str(entry.path) if entry.path else None,
+                        "last_used": entry.last_used,
+                        "created": entry.created,
+                        "version": FORMAT_VERSION,
+                        "hits": 0,
+                    }
+        return None
