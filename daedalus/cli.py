@@ -106,7 +106,6 @@ def cmd_serve(args) -> int:
         max_request_bytes=args.max_request_bytes,
         cors_origins=args.cors_origins,
         global_rps=args.global_rps,
-        audit_log_path=args.audit_log_path,
     )
 
     bar = "─" * 62
@@ -353,10 +352,6 @@ def main() -> int:
     serve.add_argument(
         "--global-rps", type=float, default=0.0,
         help="global rate limit across all clients in requests per second (0 = disabled)",
-    )
-    serve.add_argument(
-        "--audit-log-path",
-        help="path to JSON audit log (\"stderr\" for stderr); default: disabled",
     )
     serve.set_defaults(fn=cmd_serve)
 

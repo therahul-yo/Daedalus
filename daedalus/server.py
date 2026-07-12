@@ -26,9 +26,6 @@ import contextvars
 import hmac
 import json
 import logging
-import logging.handlers
-import os
-import sys
 import threading
 import time
 import uuid
@@ -57,7 +54,7 @@ logger = logging.getLogger(__name__)
 # Request ID context variable for propagation through all log lines
 request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
 
-# Audit logger for structured security/audit logging
+# Audit logger — reserved for bucket 3 (observability)
 audit_logger: Optional[logging.Logger] = None
 
 KEEPALIVE_INTERVAL_S = 1.0
@@ -104,14 +101,6 @@ class GlobalRateLimiter:
                 return True
             return False
 
-    def acquire_wait(self, timeout: float = 30.0) -> bool:
-        start = time.monotonic()
-        while time.monotonic() - start < timeout:
-            if self.try_acquire():
-                return True
-            time.sleep(0.01)
-        return False
-
 
 @dataclass
 class ServerState:
@@ -137,7 +126,6 @@ class ServerState:
     shutdown_timeout: float = 30.0
     cors_origins: List[str] = field(default_factory=list)
     cors_allow_credentials: bool = False
-    audit_log_path: Optional[str] = None
     in_flight_requests: int = 0
     in_flight_lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -198,11 +186,6 @@ class ServerState:
             return True
         return self.global_rate_limiter.try_acquire()
 
-    def acquire_global_rate(self, timeout: float = 30.0) -> bool:
-        if self.global_rate_limiter is None:
-            return True
-        return self.global_rate_limiter.acquire_wait(timeout)
-
     def start_request(self) -> None:
         with self.in_flight_lock:
             self.in_flight_requests += 1
@@ -210,6 +193,16 @@ class ServerState:
     def finish_request(self) -> None:
         with self.in_flight_lock:
             self.in_flight_requests = max(0, self.in_flight_requests - 1)
+
+    def wait_for_drain(self, timeout: float) -> bool:
+        """Wait for in-flight requests to complete during shutdown."""
+        start = time.monotonic()
+        while time.monotonic() - start < timeout:
+            with self.in_flight_lock:
+                if self.in_flight_requests == 0:
+                    return True
+            time.sleep(0.1)
+        return False
 
 
 class PromptTokenCache:
@@ -389,7 +382,6 @@ def create_app(
     shutdown_timeout: float = 30.0,
     cors_origins: Optional[List[str]] = None,
     cors_allow_credentials: bool = False,
-    audit_log_path: Optional[str] = None,
 ) -> FastAPI:
     if max_pending_requests < 1:
         raise ValueError("max_pending_requests must be at least 1")
@@ -405,20 +397,6 @@ def create_app(
         raise ValueError("global_rps cannot be negative")
     if shutdown_timeout <= 0:
         raise ValueError("shutdown_timeout must be positive")
-
-    # Set up audit logger
-    if audit_log_path:
-        audit_logger = logging.getLogger("daedalus.audit")
-        audit_logger.setLevel(logging.INFO)
-        audit_logger.propagate = False
-        if audit_log_path == "stderr":
-            handler = logging.StreamHandler(sys.stderr)
-        else:
-            handler = logging.handlers.RotatingFileHandler(
-                audit_log_path, maxBytes=10 * 1024 * 1024, backupCount=5
-            )
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        audit_logger.addHandler(handler)
 
     state = ServerState(
         engine=engine, store=store, model_id=model_id, lock=FifoLock(),
@@ -436,7 +414,6 @@ def create_app(
         shutdown_timeout=shutdown_timeout,
         cors_origins=cors_origins or [],
         cors_allow_credentials=cors_allow_credentials,
-        audit_log_path=audit_log_path,
     )
 
     @asynccontextmanager
