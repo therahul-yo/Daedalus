@@ -89,7 +89,7 @@ class EngineConfig:
     # otherwise accumulate buffer-cache into swap on a 16GB Air. When MLX's
     # cache exceeds this high-water mark, it is cleared at the next chunk
     # boundary regardless of the flag above.
-    metal_cache_high_water_bytes: int = 1_536_000_000
+    metal_cache_high_water_bytes: int = 1_610_612_736  # 1.5GB optimal
     # Poll the abort hook at this interval while idling between chunks.
     idle_poll_seconds: float = 0.1
     # Optional MLX-LM speculative decoding; only enable after a RAM/throughput
