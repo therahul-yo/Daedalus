@@ -265,10 +265,25 @@ class MultiModelServerState:
             total += getattr(state.engine, "active_memory_bytes", lambda: 0)()
         return total
 
+    @property
+    def admitted_requests(self) -> int:
+        """Aggregate admitted requests across all model states."""
+        return sum(s.admitted_requests for s in self.models.values())
+
     def memory_available(self) -> bool:
-        """Check if total active memory across all models is within limit."""
+        """Check if total active memory across all models is within limit.
+        Attempts to trim RAM on stores if over the limit before rejecting."""
         if self.max_active_memory_bytes is None:
             return True
+        total = self.total_active_memory()
+        if total < self.max_active_memory_bytes:
+            return True
+        # Try trimming RAM on all stores
+        for state in self.models.values():
+            trim = getattr(state.store, "trim_ram", None)
+            if trim:
+                trim(0)
+        # Re-check after trim
         return self.total_active_memory() < self.max_active_memory_bytes
 
     def start_request(self) -> None:
