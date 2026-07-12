@@ -126,3 +126,34 @@ def test_audit_handler_rotates(tmp_path: Path):
     # The backup files are named log.{n} by RotatingFileHandler.
     backups = [f for f in files if f.suffix == ".ndjson" or f.name.endswith(".1")]
     assert backups or True  # rotation may not always fire in unit test
+
+
+def test_endpoint_auth_failure_audits_real_client_ip(tmp_path: Path):
+    """Auth failures on ops endpoints must record the actual client address,
+    not a placeholder (review finding: four endpoints logged "0.0.0.0")."""
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    from fastapi.testclient import TestClient
+
+    from daedalus.server import create_app
+    from test_server import FakeEngine, FakeStore
+
+    log_path = tmp_path / "audit.ndjson"
+    app = create_app(
+        FakeEngine(), FakeStore(), model_id="test-model",
+        api_key="secret", audit_log_path=str(log_path),
+    )
+    with TestClient(app) as client:
+        assert client.get("/v1/models").status_code == 401
+        assert client.get("/v1/cache/stats").status_code == 401
+        assert client.get("/metrics").status_code == 401
+        assert client.delete("/v1/cache").status_code == 401
+
+    lines = [json.loads(l) for l in log_path.read_text().strip().split("\n")]
+    assert len(lines) == 4
+    for rec in lines:
+        assert rec["event"] == "auth_failure"
+        # Starlette's TestClient connects as "testclient" — the point is
+        # that the real peer address lands in the log, never "0.0.0.0".
+        assert rec["client_ip"] == "testclient"

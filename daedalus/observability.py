@@ -13,9 +13,14 @@ without any OTel dependency.
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import os
 import sys
 from typing import Any, Optional
+
+# App logs rotate at 100 MiB; on a 16GB Air the log volume must never
+# compete with model weights for the SSD.
+_LOG_ROTATE_BYTES = 100 * 1024**2
 
 
 def setup_logging(
@@ -53,7 +58,7 @@ def setup_logging(
     handler: logging.Handler
     if log_file:
         handler = logging.handlers.RotatingFileHandler(
-            log_file, maxBytes=100 * 1024**3, backupCount=3
+            log_file, maxBytes=_LOG_ROTATE_BYTES, backupCount=3
         )
     else:
         handler = logging.StreamHandler(sys.stderr)
@@ -91,7 +96,7 @@ def _setup_structlog(numeric_level: int, log_file: Optional[str] = None) -> None
 
     if log_file:
         handler: logging.Handler = logging.handlers.RotatingFileHandler(
-            log_file, maxBytes=100 * 1024**3, backupCount=3
+            log_file, maxBytes=_LOG_ROTATE_BYTES, backupCount=3
         )
     else:
         handler = logging.StreamHandler(sys.stderr)

@@ -23,7 +23,7 @@ _AUDIT_LOGGER_NAME = "daedalus.audit"
 _handler: Optional[logging.handlers.RotatingFileHandler] = None
 
 
-def setup_audit_log(path: Path, *, max_bytes: int = 100 * 1024**3, backup_count: int = 5) -> logging.Logger:
+def setup_audit_log(path: Path, *, max_bytes: int = 10 * 1024**2, backup_count: int = 5) -> logging.Logger:
     """Configure the ``daedalus.audit`` logger with a rotating file handler.
 
     Each event is written as a single JSON line (newline-delimited JSON / NDJSON)
