@@ -64,7 +64,11 @@ def test_monitor_survives_reader_failure():
 
     monitor = ThermalMonitor(reader=flaky_reader, poll_interval=0.01)
     monitor.start()
-    time.sleep(0.05)
+    # Wait on the observable condition, not a fixed sleep: a loaded CI
+    # runner can schedule the poll thread as few as 2 times in 50ms.
+    deadline = time.time() + 5.0
+    while calls["n"] <= 2 and time.time() < deadline:
+        time.sleep(0.01)
     monitor.stop()
     # Last known level is retained despite read failures.
     assert monitor.level == ThermalLevel.MODERATE
