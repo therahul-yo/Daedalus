@@ -7,12 +7,17 @@ import logging
 import sys
 
 
-def _setup_logging(level: str) -> None:
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s │ %(levelname)-5s │ %(message)s",
-        datefmt="%H:%M:%S",
-    )
+def _setup_logging(level: str, json_output: bool = False) -> None:
+    if json_output:
+        from daedalus.observability import setup_logging
+
+        setup_logging(level=level, json_output=True)
+    else:
+        logging.basicConfig(
+            level=getattr(logging, level.upper(), logging.INFO),
+            format="%(asctime)s │ %(levelname)-5s │ %(message)s",
+            datefmt="%H:%M:%S",
+        )
     for noisy in ("httpx", "urllib3", "filelock", "huggingface_hub", "transformers"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
@@ -32,8 +37,13 @@ def cmd_serve(args) -> int:
     from daedalus.server import create_app
     from daedalus.runtime import cache_identity
 
-    _setup_logging(args.log_level)
+    _setup_logging(args.log_level, json_output=getattr(args, "log_json", False))
     log = logging.getLogger("daedalus")
+
+    from daedalus.observability import maybe_init_otel
+
+    if maybe_init_otel():
+        log.info("OpenTelemetry tracing enabled (OTLP export)")
 
     monitor = ThermalMonitor().start()
     monitor.on_change(
@@ -104,6 +114,7 @@ def cmd_serve(args) -> int:
         max_completion_tokens=args.max_completion_tokens,
         requests_per_minute=args.requests_per_minute,
         max_request_bytes=args.max_request_bytes,
+        audit_log_path=args.audit_log,
         cors_origins=args.cors_origins,
         global_rps=args.global_rps,
     )
@@ -317,6 +328,14 @@ def main() -> int:
     serve.add_argument("--requests-per-minute", type=int, default=0,
                        help="per-client LAN limit; 0 disables rate limiting")
     serve.add_argument("--max-request-bytes", type=int, default=2 * 1024 * 1024)
+    serve.add_argument(
+        "--audit-log",
+        help="path to a structured (NDJSON) audit log for auth failures, rate-limit events, and cache-admin operations",
+    )
+    serve.add_argument(
+        "--log-json", action="store_true",
+        help="emit structured JSON logs (uses structlog when installed)",
+    )
     serve.add_argument("--kv-bits", type=int, default=8)
     serve.add_argument(
         "--prefill-chunk-tokens", type=int,

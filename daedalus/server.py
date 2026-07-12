@@ -32,6 +32,7 @@ import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, AsyncGenerator, List, Optional
 
 from fastapi import FastAPI, Header, Request
@@ -49,13 +50,12 @@ from daedalus.reasoning import ThinkStreamFilter
 from daedalus.scheduler import FifoLock
 from daedalus.tools import make_stream_filter
 
+from daedalus import audit as audit_logger
+
 logger = logging.getLogger(__name__)
 
 # Request ID context variable for propagation through all log lines
 request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
-
-# Audit logger — reserved for bucket 3 (observability)
-audit_logger: Optional[logging.Logger] = None
 
 KEEPALIVE_INTERVAL_S = 1.0
 CHECKPOINT_EVERY_TOKENS = 4096
@@ -377,6 +377,7 @@ def create_app(
     requests_per_minute: int = 0,
     max_request_bytes: int = 2 * 1024 * 1024,
     shutdown_drain_seconds: float = 10.0,
+    audit_log_path: Optional[str] = None,
     global_rps: float = 0.0,
     global_burst: int = 0,
     shutdown_timeout: float = 30.0,
@@ -397,6 +398,11 @@ def create_app(
         raise ValueError("global_rps cannot be negative")
     if shutdown_timeout <= 0:
         raise ValueError("shutdown_timeout must be positive")
+
+    # Audit log ########################################################
+    if audit_log_path:
+        audit_logger.setup_audit_log(Path(audit_log_path))
+        logger.info("audit log enabled at %s", audit_log_path)
 
     state = ServerState(
         engine=engine, store=store, model_id=model_id, lock=FifoLock(),
@@ -440,6 +446,7 @@ def create_app(
         close = getattr(state.store, "close", None)
         if close:
             close()
+        audit_logger.close()
 
     app = FastAPI(title="daedalus", lifespan=lifespan)
     app.state.daedalus = state
@@ -485,13 +492,17 @@ def create_app(
                              "queue_depth": state.lock.queued,
                              "max_pending_requests": state.max_pending_requests}, status_code=status)
 
+    def client_ip(request: Request) -> str:
+        return request.client.host if request.client else "local"
+
     @app.get("/metrics")
-    def metrics(authorization: Optional[str] = Header(default=None)):
+    def metrics(request: Request, authorization: Optional[str] = Header(default=None)):
         # Usage/cache telemetry is operational data: when the server is
         # key-protected (i.e. exposed beyond localhost), require the key.
         # /health and /readyz stay open — they leak nothing and probes
         # (launchd, uptime checks) can't attach headers.
         if state.api_key is not None and not authorized(authorization):
+            audit_logger.auth_failure(client_ip(request), reason="missing_api_key")
             return error("invalid API key", 401, "authentication_error")
         with state.admission_lock:
             active = state.admitted_requests
@@ -499,8 +510,9 @@ def create_app(
             cache={**state.store.stats(), "tokenization": state.token_cache.stats(), "shared_head": state.head_cache.stats()}, thermal=state.engine.governor.effective_level.name), media_type="text/plain; version=0.0.4")
 
     @app.get("/v1/models")
-    def models(authorization: Optional[str] = Header(default=None)):
+    def models(request: Request, authorization: Optional[str] = Header(default=None)):
         if not authorized(authorization):
+            audit_logger.auth_failure(client_ip(request), reason="missing_api_key")
             return error("invalid API key", 401, "authentication_error")
         return {
             "object": "list",
@@ -514,24 +526,29 @@ def create_app(
         }
 
     @app.get("/v1/cache/stats")
-    def cache_stats(authorization: Optional[str] = Header(default=None)):
+    def cache_stats(request: Request, authorization: Optional[str] = Header(default=None)):
         if not authorized(authorization):
+            audit_logger.auth_failure(client_ip(request), reason="missing_api_key")
             return error("invalid API key", 401, "authentication_error")
         return state.store.stats()
 
     @app.delete("/v1/cache")
-    def clear_cache(authorization: Optional[str] = Header(default=None)):
+    def clear_cache(request: Request, authorization: Optional[str] = Header(default=None)):
         if not authorized(authorization):
+            audit_logger.auth_failure(client_ip(request), reason="missing_api_key")
             return error("invalid API key", 401, "authentication_error")
         if state.admitted_requests:
             return error("cache cannot be cleared while requests are active", 409, "conflict_error")
         removed = state.store.clear()
         state.metrics.inc_cache_admin("clear")
+        audit_logger.cache_admin("clear", client_ip=client_ip(request))
         return {"removed_entries": removed}
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request, authorization: str | None = Header(default=None)):
         if not authorized(authorization):
+            client_ip = request.client.host if request.client else "local"
+            audit_logger.auth_failure(client_ip)
             return error("invalid API key", 401, "authentication_error")
         # Check global rate limit first
         if not state.allow_global_rate():
@@ -542,6 +559,10 @@ def create_app(
         client_key = request.client.host if request.client else "local"
         if not state.allow_client(client_key):
             state.metrics.inc_request("rate_limited")
+            audit_logger.rate_limit_hit(
+                client_key, policy="requests_per_minute",
+                limit=state.requests_per_minute,
+            )
             return error("request rate limit exceeded", 429, "rate_limit_error")
         content_length = request.headers.get("content-length")
         if content_length:
@@ -593,10 +614,13 @@ def create_app(
             return error(f"prompt exceeds server limit ({state.max_prompt_tokens} tokens)", 413)
         if not state.try_admit():
             state.metrics.inc_request("rejected")
+            audit_logger.request_rejected(client_key, reason="queue_full",
+                                          limit=state.max_pending_requests)
             return error("server queue is full; retry shortly", 429, "rate_limit_error")
         if not state.memory_available():
             state.release()
             state.metrics.inc_request("memory_rejected")
+            audit_logger.request_rejected(client_key, reason="memory_pressure")
             return error("insufficient free model memory; retry after active requests finish", 503, "server_overloaded_error")
         state.start_request()
         request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
