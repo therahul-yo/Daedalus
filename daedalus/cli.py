@@ -365,6 +365,9 @@ def main() -> int:
     tune.add_argument("--out", help="write JSON result to this path")
     tune.set_defaults(fn=cmd_tune)
 
+    from daedalus.cache.cli import add_cache_parser
+    add_cache_parser(sub)
+
     args = ap.parse_args()
     if args.cmd == "serve":
         if args.max_pending_requests < 1:
