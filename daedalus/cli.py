@@ -104,6 +104,9 @@ def cmd_serve(args) -> int:
         max_completion_tokens=args.max_completion_tokens,
         requests_per_minute=args.requests_per_minute,
         max_request_bytes=args.max_request_bytes,
+        cors_origins=args.cors_origins,
+        global_rps=args.global_rps,
+        audit_log_path=args.audit_log_path,
     )
 
     bar = "─" * 62
@@ -342,6 +345,18 @@ def main() -> int:
         choices=["debug", "info", "warning", "error"],
         default="info",
         help="request/thermal log verbosity (default: info)",
+    )
+    serve.add_argument(
+        "--cors-origin", action="append", dest="cors_origins", default=None,
+        help="permitted CORS origin; repeat for multiple origins",
+    )
+    serve.add_argument(
+        "--global-rps", type=float, default=0.0,
+        help="global rate limit across all clients in requests per second (0 = disabled)",
+    )
+    serve.add_argument(
+        "--audit-log-path",
+        help="path to JSON audit log (\"stderr\" for stderr); default: disabled",
     )
     serve.set_defaults(fn=cmd_serve)
 

@@ -22,20 +22,28 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextvars
 import hmac
 import json
 import logging
+import logging.handlers
+import os
+import sys
 import threading
 import time
 import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, List, Optional
 
 from fastapi import FastAPI, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from starlette.background import BackgroundTask
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
+from starlette.responses import Response as StarletteResponse
 
 from daedalus.cache.store import PrefixCacheStore
 from daedalus.engine import Engine, PrefillAborted
@@ -46,10 +54,63 @@ from daedalus.tools import make_stream_filter
 
 logger = logging.getLogger(__name__)
 
+# Request ID context variable for propagation through all log lines
+request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
+
+# Audit logger for structured security/audit logging
+audit_logger: Optional[logging.Logger] = None
+
 KEEPALIVE_INTERVAL_S = 1.0
 CHECKPOINT_EVERY_TOKENS = 4096
 CHECKPOINT_MIN_JOB_TOKENS = 8192
 CHECKPOINT_MIN_INTERVAL_S = 8.0
+
+
+class RequestIdMiddleware(BaseHTTPMiddleware):
+    """Middleware to extract and propagate X-Request-ID header through all log lines."""
+
+    async def dispatch(self, request: StarletteRequest, call_next):
+        request_id = request.headers.get("x-request-id") or f"req-{uuid.uuid4().hex[:12]}"
+        token = request_id_var.set(request_id)
+        try:
+            response: StarletteResponse = await call_next(request)
+            response.headers["X-Request-ID"] = request_id
+            return response
+        finally:
+            request_id_var.reset(token)
+
+
+class GlobalRateLimiter:
+    """Global token bucket rate limiter for total RPS across all clients."""
+
+    def __init__(self, max_rps: float, burst: int = 0):
+        self.max_rps = max_rps
+        self.burst = max(1, burst if burst > 0 else max(1, int(max_rps * 2)))
+        self._tokens = float(self.burst)
+        self._last_refill = time.monotonic()
+        self._lock = threading.Lock()
+
+    def _refill(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self._last_refill
+        self._tokens = min(self.burst, self._tokens + elapsed * self.max_rps)
+        self._last_refill = now
+
+    def try_acquire(self) -> bool:
+        with self._lock:
+            self._refill()
+            if self._tokens >= 1.0:
+                self._tokens -= 1.0
+                return True
+            return False
+
+    def acquire_wait(self, timeout: float = 30.0) -> bool:
+        start = time.monotonic()
+        while time.monotonic() - start < timeout:
+            if self.try_acquire():
+                return True
+            time.sleep(0.01)
+        return False
 
 
 @dataclass
@@ -72,6 +133,13 @@ class ServerState:
     requests_per_minute: int = 0
     rate_windows: dict[str, tuple[float, int]] = None
     max_request_bytes: int = 2 * 1024 * 1024
+    global_rate_limiter: Optional[GlobalRateLimiter] = None
+    shutdown_timeout: float = 30.0
+    cors_origins: List[str] = field(default_factory=list)
+    cors_allow_credentials: bool = False
+    audit_log_path: Optional[str] = None
+    in_flight_requests: int = 0
+    in_flight_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def try_admit(self) -> bool:
         with self.admission_lock:
@@ -124,6 +192,24 @@ class ServerState:
                 return False
             self.rate_windows[key] = (started, count + 1)
             return True
+
+    def allow_global_rate(self) -> bool:
+        if self.global_rate_limiter is None:
+            return True
+        return self.global_rate_limiter.try_acquire()
+
+    def acquire_global_rate(self, timeout: float = 30.0) -> bool:
+        if self.global_rate_limiter is None:
+            return True
+        return self.global_rate_limiter.acquire_wait(timeout)
+
+    def start_request(self) -> None:
+        with self.in_flight_lock:
+            self.in_flight_requests += 1
+
+    def finish_request(self) -> None:
+        with self.in_flight_lock:
+            self.in_flight_requests = max(0, self.in_flight_requests - 1)
 
 
 class PromptTokenCache:
@@ -298,6 +384,12 @@ def create_app(
     requests_per_minute: int = 0,
     max_request_bytes: int = 2 * 1024 * 1024,
     shutdown_drain_seconds: float = 10.0,
+    global_rps: float = 0.0,
+    global_burst: int = 0,
+    shutdown_timeout: float = 30.0,
+    cors_origins: Optional[List[str]] = None,
+    cors_allow_credentials: bool = False,
+    audit_log_path: Optional[str] = None,
 ) -> FastAPI:
     if max_pending_requests < 1:
         raise ValueError("max_pending_requests must be at least 1")
@@ -309,6 +401,25 @@ def create_app(
         raise ValueError("requests_per_minute cannot be negative")
     if max_request_bytes < 1:
         raise ValueError("max_request_bytes must be positive")
+    if global_rps < 0:
+        raise ValueError("global_rps cannot be negative")
+    if shutdown_timeout <= 0:
+        raise ValueError("shutdown_timeout must be positive")
+
+    # Set up audit logger
+    if audit_log_path:
+        audit_logger = logging.getLogger("daedalus.audit")
+        audit_logger.setLevel(logging.INFO)
+        audit_logger.propagate = False
+        if audit_log_path == "stderr":
+            handler = logging.StreamHandler(sys.stderr)
+        else:
+            handler = logging.handlers.RotatingFileHandler(
+                audit_log_path, maxBytes=10 * 1024 * 1024, backupCount=5
+            )
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        audit_logger.addHandler(handler)
+
     state = ServerState(
         engine=engine, store=store, model_id=model_id, lock=FifoLock(),
         max_pending_requests=max_pending_requests, api_key=api_key,
@@ -321,6 +432,11 @@ def create_app(
         requests_per_minute=requests_per_minute,
         rate_windows={},
         max_request_bytes=max_request_bytes,
+        global_rate_limiter=GlobalRateLimiter(global_rps, global_burst) if global_rps > 0 else None,
+        shutdown_timeout=shutdown_timeout,
+        cors_origins=cors_origins or [],
+        cors_allow_credentials=cors_allow_credentials,
+        audit_log_path=audit_log_path,
     )
 
     @asynccontextmanager
@@ -332,9 +448,12 @@ def create_app(
         # engine worker threads may still be writing snapshots to disk.
         deadline = time.monotonic() + shutdown_drain_seconds
         while time.monotonic() < deadline:
+            # Use in_flight_requests in addition to admitted_requests
+            in_flight = state.in_flight_requests
             with state.admission_lock:
-                if state.admitted_requests == 0:
-                    break
+                admitted = state.admitted_requests
+            if admitted == 0 and in_flight == 0:
+                break
             await asyncio.sleep(0.1)
         else:
             logger.warning(
@@ -347,6 +466,19 @@ def create_app(
 
     app = FastAPI(title="daedalus", lifespan=lifespan)
     app.state.daedalus = state
+
+    # Add CORS middleware if origins are configured
+    if cors_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=cors_origins,
+            allow_credentials=cors_allow_credentials,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+
+    # Add Request ID middleware for header propagation
+    app.add_middleware(RequestIdMiddleware)
 
     def error(message: str, status_code: int, kind: str = "invalid_request_error"):
         state.metrics.inc_error(kind)
@@ -421,10 +553,14 @@ def create_app(
         return {"removed_entries": removed}
 
     @app.post("/v1/chat/completions")
-    async def chat_completions(request: Request, authorization: Optional[str] = Header(default=None)):
+    async def chat_completions(request: Request, authorization: str | None = Header(default=None)):
         if not authorized(authorization):
             return error("invalid API key", 401, "authentication_error")
-        # Bucket by client IP, not Authorization: with one shared bearer
+        # Check global rate limit first
+        if not state.allow_global_rate():
+            state.metrics.inc_request("rate_limited")
+            return error("global request rate limit exceeded", 429, "rate_limit_error")
+        # Bucket by client IP, not Authorization: with a shared bearer
         # token every LAN client would otherwise share a single bucket.
         client_key = request.client.host if request.client else "local"
         if not state.allow_client(client_key):
@@ -485,6 +621,7 @@ def create_app(
             state.release()
             state.metrics.inc_request("memory_rejected")
             return error("insufficient free model memory; retry after active requests finish", 503, "server_overloaded_error")
+        state.start_request()
         request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
 
@@ -552,6 +689,11 @@ def create_app(
             include_usage = isinstance(stream_options, dict) and bool(
                 stream_options.get("include_usage")
             )
+
+            def _stream_cleanup():
+                gen.release_slot()
+                state.finish_request()
+
             return StreamingResponse(
                 _stream_response(
                     state, gen, request_id, created, request, include_usage
@@ -563,7 +705,7 @@ def create_app(
                 },
                 # Runs after the response cycle ends on every path, including
                 # a disconnect before the generator is first iterated.
-                background=BackgroundTask(gen.release_slot),
+                background=BackgroundTask(_stream_cleanup),
             )
 
         try:
@@ -591,6 +733,7 @@ def create_app(
             state.metrics.inc_request("failed")
             raise
         finally:
+            state.finish_request()
             gen.release_slot()
         message: dict = {"role": "assistant", "content": result["text"] or None}
         if result["reasoning"]:
