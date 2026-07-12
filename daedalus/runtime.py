@@ -2,19 +2,25 @@
 
 from __future__ import annotations
 
+import hashlib
 import platform
 
 
 def cache_identity(model: str, *, kv_bits: int | None, kv_group_size: int = 64,
                    tokenizer_id: str | None = None, model_revision: str | None = None,
                    draft_model: str | None = None) -> str:
-    """Return a cache namespace that cannot cross incompatible runtimes."""
-    try:
-        import mlx
-        import mlx_lm
+    """Return a cache namespace that cannot cross incompatible runtimes.
 
-        mlx_version = mlx.__version__
-        mlx_lm_version = mlx_lm.__version__
+    The result becomes a directory name, so it must stay short: macOS caps
+    filenames at 255 bytes, and tokenizer_id is often a full local snapshot
+    path. Format: ``<model-tail>--<16-hex digest of all fields>``.
+    """
+    try:
+        import mlx.core as _mx
+        import mlx_lm as _mlx_lm
+
+        mlx_version = getattr(_mx, "__version__", "unknown")
+        mlx_lm_version = getattr(_mlx_lm, "__version__", "unknown")
     except Exception:
         mlx_version = mlx_lm_version = "unknown"
     fields = {
@@ -30,4 +36,8 @@ def cache_identity(model: str, *, kv_bits: int | None, kv_group_size: int = 64,
         "mlx_lm": mlx_lm_version,
         "machine": platform.machine(),
     }
-    return "|".join(f"{name}={value}" for name, value in fields.items())
+    canonical = "|".join(f"{name}={value}" for name, value in fields.items())
+    digest = hashlib.sha256(canonical.encode()).hexdigest()[:16]
+    # Keep the model name visible for humans browsing ~/.cache/daedalus.
+    tail = model.rsplit("/", 1)[-1][:80]
+    return f"{tail}--{digest}"
