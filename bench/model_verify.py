@@ -15,7 +15,6 @@ import json
 import sys
 
 from daedalus.engine import Engine, EngineConfig
-from daedalus.governor import ThermalGovernor
 from daedalus.sensors import ThermalMonitor
 from daedalus.tools import make_stream_filter
 

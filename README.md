@@ -192,6 +192,11 @@ then load it with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.d
 Keep the API secret in a root-readable environment file or secret manager rather
 than committing it into the plist.
 
+Tagged releases include `SHA256SUMS` and `requirements.lock.txt` alongside the
+wheel and source archive. Verify the checksum before installing an artifact;
+the locked manifest records the exact runtime dependency resolution used for
+that release.
+
 Design lineage: runtime = mlx-lm public primitives (no monkey-patching of internals);
 cache design informed by vllm-mlx and Rapid-MLX (Apache-2.0); prefix-cache semantics
 inspired by baseRT's public C API. The thermal governor exists in none of them.
@@ -199,9 +204,10 @@ inspired by baseRT's public C API. The thermal governor exists in none of them.
 ## Status
 
 v0.2: engine, persistent prefix cache, thermal governor, and OpenAI-compatible server are
-implemented and validated on real hardware (M4 Air 16GB, Qwen3.5-9B-4bit): 144 tests,
+implemented and validated on real hardware (M4 Air 16GB, Qwen3.5-9B-4bit): 153 tests,
 thermal A/B benchmarked (`bench/thermal_validation.py`), tool calls and reasoning
-separation verified against pi. Multi-agent audited 2026-07-11; all P0/P1 findings fixed.
+separation verified against pi. The ongoing audit hardens request validation,
+predictive admission, benchmark comparability, and release quality gates.
 v0.2 adds penalties/stop/usage options, request-ID + CORS + global rate limiting, the
 `daedalus cache` CLI with TTL eviction, and the audit log / OTel observability layer.
 See `CHANGELOG.md`. Next: packaging (Homebrew/PyInstaller), multi-model serving with

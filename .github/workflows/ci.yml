@@ -16,8 +16,10 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
       - run: uv sync --extra dev --locked
+      - run: uv run ruff check .
       - name: Run test suite
         run: uv run --extra dev pytest -q --timeout=120
+      - run: uv build
 
   smoke:
     name: Smoke Benchmark
@@ -71,19 +73,27 @@ jobs:
       - run: uv sync --extra dev --locked
       - name: Run regression gate
         run: |
-          # Find baseline and candidate artifacts
-          BASELINE=$(find bench/results -name "thermal_on.json" -o -name "smoke*.json" | head -1)
-          CANDIDATE=$(find bench/results -name "thermal_off.json" -o -name "smoke*.json" | tail -1)
-          if [ -n "$BASELINE" ] && [ -n "$CANDIDATE" ] && [ "$BASELINE" != "$CANDIDATE" ]; then
-            echo "Running regression gate: baseline=$BASELINE candidate=$CANDIDATE"
-            uv run bench/regression.py "$BASELINE" "$CANDIDATE" \
-              --max-ttft-regression 0.10 \
-              --max-throughput-regression 0.10
-          else
-            echo "Skipping regression gate - need baseline and candidate artifacts"
-            echo "Baseline: $BASELINE"
-            echo "Candidate: $CANDIDATE"
-            # Don't fail - just log and continue
+          # A regression pair is same-config baseline vs candidate. The two
+          # committed thermal artifacts are a governor A/B pair — NOT a
+          # regression pair — so the fingerprint gate rightly refuses them
+          # (exit 2 = incomparable, treated as skip). Exit 1 = regression.
+          BASELINE=$(find bench/results -name "smoke_baseline*.json" | head -1)
+          CANDIDATE=$(find bench/results -name "smoke*.json" ! -name "smoke_baseline*" | head -1)
+          if [ -z "$BASELINE" ] || [ -z "$CANDIDATE" ]; then
+            echo "Skipping regression gate - no committed baseline to compare against"
+            echo "Baseline: $BASELINE  Candidate: $CANDIDATE"
             exit 0
           fi
+          echo "Running regression gate: baseline=$BASELINE candidate=$CANDIDATE"
+          set +e
+          uv run bench/regression.py "$BASELINE" "$CANDIDATE" \
+            --max-ttft-regression 0.10 \
+            --max-throughput-regression 0.10
+          rc=$?
+          set -e
+          if [ "$rc" = "2" ]; then
+            echo "Artifacts not comparable (config fingerprint mismatch) - skipping"
+            exit 0
+          fi
+          exit "$rc"
         timeout-minutes: 10

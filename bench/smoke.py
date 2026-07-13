@@ -7,8 +7,7 @@ import sys
 import time
 
 from daedalus.engine import Engine
-from daedalus.governor import ThermalGovernor
-from daedalus.sensors import ThermalLevel, ThermalMonitor
+from daedalus.sensors import ThermalMonitor
 
 MODEL = sys.argv[1] if len(sys.argv) > 1 else "mlx-community/Qwen3-0.6B-4bit"
 PROMPT_TOKENS = int(sys.argv[2]) if len(sys.argv) > 2 else 4000

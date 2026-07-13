@@ -14,11 +14,18 @@ jobs:
     name: Build binary (macos-14)
     runs-on: macos-14
     timeout-minutes: 30
+    # The homebrew job consumes this; without the outputs mapping the
+    # formula update receives an empty sha256.
+    outputs:
+      sha256: ${{ steps.sha.outputs.sha256 }}
     steps:
       # Actions pinned to commit SHAs: mutable tags are a supply-chain risk.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
       - run: uv sync --extra dev --locked
+      - run: uv run ruff check .
+      - run: uv run --extra dev pytest -q --timeout=120
+      - run: uv build
       - name: Install PyInstaller
         run: uv pip install pyinstaller
       - name: Build with PyInstaller
@@ -28,15 +35,24 @@ jobs:
       - name: Verify binary
         run: |
           ./dist/daedalus --help
+      - name: Release integrity artifacts
+        run: |
+          shasum -a 256 dist/daedalus dist/*.whl dist/*.tar.gz > dist/SHA256SUMS
+          uv export --locked --no-dev --format requirements-txt > dist/requirements.lock.txt
       - name: Compute SHA256
         id: sha
         run: |
           SHA=$(shasum -a 256 dist/daedalus | cut -d' ' -f1)
           echo "sha256=$SHA" >> $GITHUB_OUTPUT
-      - name: Upload binary to release
+      - name: Upload release artifacts
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          files: dist/daedalus
+          files: |
+            dist/daedalus
+            dist/*.whl
+            dist/*.tar.gz
+            dist/SHA256SUMS
+            dist/requirements.lock.txt
           body: |
             Binary built from ${{ github.sha }}
 

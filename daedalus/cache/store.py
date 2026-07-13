@@ -98,6 +98,8 @@ class _Entry:
     # otherwise the most valuable cache write of a request silently vanishes.
     pinned: bool = False
     created: float = 0.0  # wall-clock timestamp of file creation (for TTL eviction)
+    # LRU uses monotonic time; user-facing age and TTL reporting must not.
+    last_used_at: float = 0.0
 
 
 @dataclass
@@ -161,6 +163,8 @@ class PrefixCacheStore:
         self.copy_seconds = 0.0
         self.lookup_seconds = 0.0
         self.load_seconds = 0.0
+        self.candidate_keys_examined = 0
+        self.lookup_count = 0
         self._load_disk_index()
         self._prune_disk_by_ttl()
 
@@ -212,7 +216,10 @@ class PrefixCacheStore:
         lookup_start = time.perf_counter()
         with self._lock:
             best_key, best_usable = None, 0
-            for key in self._candidate_keys(tokens):
+            candidates = self._candidate_keys(tokens)
+            self.candidate_keys_examined += len(candidates)
+            self.lookup_count += 1
+            for key in candidates:
                 entry = self._entries.get(key)
                 if entry is None:
                     continue
@@ -253,6 +260,7 @@ class PrefixCacheStore:
 
         with self._lock:
             entry.last_used = time.monotonic()
+            entry.last_used_at = time.time()
             self.hits += 1
         return CacheHit(cache=cache_obj, matched_tokens=best_usable, source=source)
 
@@ -280,6 +288,7 @@ class PrefixCacheStore:
             return None
         with self._lock:
             entry.last_used = time.monotonic()
+            entry.last_used_at = time.time()
             self.hits += 1
         return CacheHit(cache=cache_obj, matched_tokens=best_len, source=source)
 
@@ -338,6 +347,7 @@ class PrefixCacheStore:
             # disk — RAM eviction must not silently discard them.
             pinned=deferred,
             created=time.time(),
+            last_used_at=time.time(),
         )
         with self._lock:
             old = self._entries.get(key)
@@ -390,6 +400,7 @@ class PrefixCacheStore:
             cache=None,  # disk-only; avoids doubling RAM during prefill
             nbytes=0,
             last_used=time.monotonic(),
+            last_used_at=time.time(),
         )
         path = self._write_entry_files(key, prefix, prompt_cache)
         if path is None:
@@ -488,6 +499,7 @@ class PrefixCacheStore:
                     last_used=stat.st_mtime,
                     path=data_path,
                     created=meta.get("created", stat.st_mtime),
+                    last_used_at=stat.st_mtime,
                 )
                 self._index(key, tokens)
                 self._disk_usage[data_path] = (stat.st_size, stat.st_mtime)
@@ -576,6 +588,8 @@ class PrefixCacheStore:
                 "copy_seconds": self.copy_seconds,
                 "lookup_seconds": self.lookup_seconds,
                 "load_seconds": self.load_seconds,
+                "candidate_keys_examined": self.candidate_keys_examined,
+                "lookup_count": self.lookup_count,
             }
 
     def clear(self) -> int:
@@ -665,7 +679,7 @@ class PrefixCacheStore:
                     continue  # RAM-only — not on disk
                 if entry.pinned:
                     continue
-                created = entry.created if entry.created > 0 else entry.last_used
+                created = entry.created if entry.created > 0 else entry.last_used_at
                 if created < cutoff:
                     victims.append((key, entry.path))
 
@@ -722,8 +736,8 @@ class PrefixCacheStore:
                     ),
                     "in_ram": entry.cache is not None,
                     "on_disk": entry.path is not None and entry.path.exists(),
-                    "last_used": entry.last_used,
-                    "age_seconds": time.time() - entry.last_used,
+                    "last_used": entry.last_used_at,
+                    "age_seconds": max(0.0, time.time() - entry.last_used_at),
                     "path": str(entry.path) if entry.path else None,
                     "created": entry.created,
                     "hits": 0,
@@ -749,7 +763,7 @@ class PrefixCacheStore:
                         "in_ram": entry.cache is not None,
                         "on_disk": entry.path is not None and entry.path.exists(),
                         "path": str(entry.path) if entry.path else None,
-                        "last_used": entry.last_used,
+                        "last_used": entry.last_used_at,
                         "created": entry.created,
                         "version": FORMAT_VERSION,
                         "hits": 0,
