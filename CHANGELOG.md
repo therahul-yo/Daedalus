@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.2.0 — 2026-07-13
+
+Multi-agent development round: features built by three coding agents,
+review-hardened (every PR adversarially verified before merge).
+
+### API
+- `frequency_penalty` / `presence_penalty` via mlx-lm logits processors,
+  built only when a request sets them.
+- `stop` sequences (string or list): rolling cross-chunk match, output
+  truncated at the matched string.
+- `stream_options: {"include_usage": true}` — OpenAI-spec trailing usage
+  chunk with empty `choices`; the default keeps usage on the final content
+  chunk so unguarded `choices[0]` clients (OpenCode) never break.
+
+### Server hardening
+- `X-Request-ID` extracted/generated and echoed on every response.
+- Configurable CORS (`--cors-origin`, repeatable; off by default).
+- Global token-bucket rate limiter (`--global-rps`) alongside the per-IP
+  window; queued-abort-safe FifoLock (an aborting waiter can no longer
+  hand the engine lock to two holders).
+- Shutdown drain now tracks in-flight requests on both response paths.
+- psutil-based low-memory guard feeding cache trim before admission.
+
+### Cache
+- `daedalus cache list | inspect | prune` CLI with exclusive-lock
+  fail-fast when a server owns the cache dir.
+- TTL-based disk eviction (`--cache-ttl-days`), pin-aware, incremental
+  accounting preserved.
+- Sidecar format v2 (adds `created`); v1 entries migrate in place on
+  first load, indexed in the same pass.
+
+### Observability
+- Structured NDJSON audit log (`--audit-log`): auth failures, rate-limit
+  hits, queue/memory rejections, cache-admin ops — real client addresses,
+  10 MiB rotation.
+- `--log-json` structured logging (structlog when installed, stdlib
+  fallback); OpenTelemetry OTLP tracing auto-enables via standard
+  `OTEL_*` env vars when the optional packages are present.
+
+### Tests
+- 144 tests (was 111): FifoLock fairness, stop/penalty/usage regression,
+  request-ID/global-limit/drain, cache TTL/migration/prune, audit and
+  observability coverage; deflaked thermal-sensor test.
+
 ## v0.1.0 — 2026-07-11
 
 First working release, built and validated in one day on the target hardware
