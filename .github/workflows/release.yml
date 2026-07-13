@@ -2,30 +2,60 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    tags:
+      - 'v*'
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
-  package:
+  build:
+    name: Build binary (macos-14)
     runs-on: macos-14
+    timeout-minutes: 30
     steps:
       # Actions pinned to commit SHAs: mutable tags are a supply-chain risk.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
       - run: uv sync --extra dev --locked
-      - run: uv run --extra dev pytest -q
-      - run: uv build
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - name: Install PyInstaller
+        run: uv pip install pyinstaller
+      - name: Build with PyInstaller
+        run: |
+          uv run pyinstaller --clean --noconfirm packaging/pyinstaller/daedalus.spec
+          ls -la dist/daedalus
+      - name: Verify binary
+        run: |
+          ./dist/daedalus --help
+      - name: Compute SHA256
+        id: sha
+        run: |
+          SHA=$(shasum -a 256 dist/daedalus | cut -d' ' -f1)
+          echo "sha256=$SHA" >> $GITHUB_OUTPUT
+      - name: Upload binary to release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          name: daedalus-dist
-          path: dist/*
-      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        with:
-          generate_release_notes: true
-          files: dist/*
+          files: dist/daedalus
+          body: |
+            Binary built from ${{ github.sha }}
 
-      # Add APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_ID,
-      # APPLE_TEAM_ID, and APPLE_APP_PASSWORD before extending this job with
-      # codesign/notarytool for a signed app bundle or installer.
+            SHA256: ${{ steps.sha.outputs.sha256 }}
+
+  homebrew:
+    name: Update Homebrew formula
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.repository == 'therahul-yo/daedalus'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Update Homebrew formula
+        uses: mislav/bump-homebrew-formula-action@ecd3ec7bf4fa4ecbdaa0c379850187374d076eaa # v3.3
+        with:
+          formula-name: daedalus
+          formula-file: Formula/daedalus.rb
+          download-url: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/daedalus
+          sha256: ${{ needs.build.outputs.sha256 }}
+        env:
+          COMMITTER_TOKEN: ${{ secrets.GITHUB_TOKEN }}
