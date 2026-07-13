@@ -17,10 +17,23 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "httpx>=0.27"]
+dev = ["pytest>=8", "httpx>=0.27", "pytest-timeout>=2.1"]
+observability = [
+    "opentelemetry-api>=1.21",
+    "opentelemetry-sdk>=1.21",
+    "opentelemetry-exporter-otlp>=1.21",
+    "structlog>=24.1",
+]
 
 [project.scripts]
 daedalus = "daedalus.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/therahul-yo/daedalus"
+Repository = "https://github.com/therahul-yo/daedalus"
+Documentation = "https://github.com/therahul-yo/daedalus#readme"
+Homebrew = "https://github.com/therahul-yo/homebrew-daedalus"
+Changelog = "https://github.com/therahul-yo/daedalus/releases"
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -36,3 +49,76 @@ testpaths = ["tests"]
 dev = [
     "ruff>=0.15.21",
 ]
+
+[tool.pyinstaller]
+spec-file = "packaging/pyinstaller/daedalus.spec"
+hidden-imports = [
+    "mlx",
+    "mlx.core",
+    "mlx.nn",
+    "mlx.optimizers",
+    "mlx_lm",
+    "mlx_lm.generate",
+    "mlx_lm.sample",
+    "mlx_lm.utils",
+    "mlx_lm.tokenizer_utils",
+    "mlx_lm.models",
+    "mlx_lm.models.llama",
+    "mlx_lm.models.mistral",
+    "mlx_lm.models.mixtral",
+    "mlx_lm.models.phi",
+    "mlx_lm.models.gemma",
+    "mlx_lm.models.qwen2",
+    "mlx_lm.models.qwen3",
+    "mlx_lm.models.phi3",
+    "mlx_lm.models.llama3",
+    "tokenizers",
+    "transformers",
+    "transformers.models.llama",
+    "transformers.models.mistral",
+    "transformers.models.mixtral",
+    "transformers.models.phi",
+    "transformers.models.gemma",
+    "transformers.models.qwen2",
+    "transformers.models.qwen3",
+    "transformers.models.phi3",
+    "transformers.models.llama3",
+    "fastapi",
+    "uvicorn",
+    "uvicorn.protocols.http.h11_impl",
+    "uvicorn.protocols.http.httptools_impl",
+    "uvicorn.protocols.websockets",
+    "uvicorn.lifespan",
+    "httpx",
+    "pydantic",
+    "pydantic_core",
+    "pydantic_core._pydantic_core",
+    "pydantic.json_schema",
+    "pydantic.types",
+    "pydantic.functional_validators",
+    "pydantic.functional_serializers",
+    "pydantic.main",
+    "pydantic.fields",
+    "pydantic.config",
+    "daedalus.observability",
+    "daedalus.audit",
+    "daedalus.cache.cli",
+]
+datas = [
+    "daedalus:daedalus",
+]
+exclude-modules = [
+    "test",
+    "tests",
+    "pytest",
+    "unittest",
+    "doctest",
+]
+upx = true
+upx-exclude = [
+    "vcruntime140.dll",
+]
+console = true
+icon = ""
+disable-windowed-traceback = true
+argv-emulation = false

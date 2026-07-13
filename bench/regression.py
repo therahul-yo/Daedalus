@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Fail a benchmark comparison when a candidate regresses beyond a threshold.
 
 Usage: python bench/regression.py baseline.json candidate.json
@@ -9,7 +10,6 @@ import argparse
 import json
 import sys
 from pathlib import Path
-
 
 FINGERPRINT_FIELDS = (
     "model",
@@ -25,7 +25,12 @@ FINGERPRINT_FIELDS = (
 
 
 def comparable(baseline: dict, candidate: dict) -> list[str]:
-    """Return configuration mismatches that make a speed comparison invalid."""
+    """Return configuration mismatches that make a speed comparison invalid.
+
+    Artifacts without any config/software fingerprint (smoke flat output,
+    thermal rounds) can't be checked — the caller decides whether unlike
+    shapes may still be compared.
+    """
     base_config = baseline.get("config", {})
     candidate_config = candidate.get("config", {})
     mismatches = []
@@ -42,6 +47,35 @@ def comparable(baseline: dict, candidate: dict) -> list[str]:
     return mismatches
 
 
+def _has_fingerprint(artifact: dict) -> bool:
+    return bool(artifact.get("config")) or bool(artifact.get("software"))
+
+
+def _load_metrics(data: dict, path: Path) -> dict:
+    """Extract the metrics dict from bench, smoke, or thermal output."""
+    # bench.py / smoke.py structured output: {"metrics": {...}}
+    if "metrics" in data:
+        return data["metrics"]
+
+    # smoke.py flat output (already has ttft_s, prefill_tps_wall)
+    if "ttft_s" in data and "prefill_tps_wall" in data:
+        return data
+
+    # thermal_validation.py output: {"rounds": [...], ...}
+    if "rounds" in data and data["rounds"]:
+        # Average first two rounds (steady state)
+        rounds = data["rounds"]
+        tps_wall = sum(r["tps_wall"] for r in rounds[:2]) / min(2, len(rounds))
+        tps_burn = sum(r["tps_burn"] for r in rounds[:2]) / min(2, len(rounds))
+        return {
+            "ttft_s": 0,  # thermal validation doesn't measure TTFT
+            "prefill_tps_wall": tps_wall,
+            "prefill_tps_burn": tps_burn,
+        }
+
+    raise ValueError(f"Unrecognized benchmark format: {path}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("baseline")
@@ -51,23 +85,48 @@ def main() -> int:
     parser.add_argument("--allow-config-mismatch", action="store_true",
                         help="compare unlike artifacts only when explicitly justified")
     args = parser.parse_args()
+
     baseline_artifact = json.loads(Path(args.baseline).read_text())
     candidate_artifact = json.loads(Path(args.candidate).read_text())
-    mismatches = comparable(baseline_artifact, candidate_artifact)
-    if mismatches and not args.allow_config_mismatch:
-        print("Benchmark artifacts are not comparable:\n- " + "\n- ".join(mismatches), file=sys.stderr)
-        return 2
-    baseline = baseline_artifact["metrics"]
-    candidate = candidate_artifact["metrics"]
+
+    # Fingerprint gate: only enforceable when at least one artifact carries a
+    # config/software section. Legacy flat smoke and thermal-rounds artifacts
+    # have none, and the CI smoke gate compares those routinely.
+    if _has_fingerprint(baseline_artifact) or _has_fingerprint(candidate_artifact):
+        mismatches = comparable(baseline_artifact, candidate_artifact)
+        if mismatches and not args.allow_config_mismatch:
+            print(
+                "Benchmark artifacts are not comparable:\n- " + "\n- ".join(mismatches),
+                file=sys.stderr,
+            )
+            return 2
+
+    baseline = _load_metrics(baseline_artifact, Path(args.baseline))
+    candidate = _load_metrics(candidate_artifact, Path(args.candidate))
+
     failures = []
-    if candidate["ttft_s"] > baseline["ttft_s"] * (1 + args.max_ttft_regression):
-        failures.append(f"TTFT regressed: {baseline['ttft_s']}s -> {candidate['ttft_s']}s")
-    if candidate["prefill_tps_wall"] < baseline["prefill_tps_wall"] * (1 - args.max_throughput_regression):
-        failures.append("prefill throughput regressed: "
-                        f"{baseline['prefill_tps_wall']} -> {candidate['prefill_tps_wall']} tok/s")
+
+    if baseline.get("ttft_s", 0) > 0 and candidate.get("ttft_s", 0) > 0:
+        if candidate["ttft_s"] > baseline["ttft_s"] * (1 + args.max_ttft_regression):
+            failures.append(
+                f"TTFT regressed: {baseline['ttft_s']:.2f}s -> {candidate['ttft_s']:.2f}s"
+            )
+
+    if "prefill_tps_wall" in baseline and "prefill_tps_wall" in candidate:
+        if candidate["prefill_tps_wall"] < baseline["prefill_tps_wall"] * (
+            1 - args.max_throughput_regression
+        ):
+            failures.append(
+                f"prefill throughput regressed: {baseline['prefill_tps_wall']:.1f} -> "
+                f"{candidate['prefill_tps_wall']:.1f} tok/s"
+            )
+
     if failures:
-        print("Benchmark regression detected:\n- " + "\n- ".join(failures), file=sys.stderr)
+        print(
+            "Benchmark regression detected:\n- " + "\n- ".join(failures), file=sys.stderr
+        )
         return 1
+
     print("benchmark gate passed")
     return 0
 
