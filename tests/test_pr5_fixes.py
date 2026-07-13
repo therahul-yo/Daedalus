@@ -129,6 +129,29 @@ def test_stop_sequence_truncates_stream():
     assert "stop" in finishes
 
 
+def test_stop_matcher_streams_long_output_without_retaining_history():
+    """Only a stop-length suffix is held, so long responses stay linear."""
+    engine = FakeEngine(script=["a"] * 200 + ["<END>"])
+    app = create_app(engine, FakeStore(), model_id="test-model")
+    response = TestClient(app).post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+            "stop": "<END>",
+        },
+    )
+    chunks = [
+        json.loads(line[6:]) for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    content = "".join(
+        chunk["choices"][0]["delta"].get("content", "")
+        for chunk in chunks if chunk.get("choices")
+    )
+    assert content == "a" * 200
+
+
 # ---------------------------------------------------------- penalty handling
 
 

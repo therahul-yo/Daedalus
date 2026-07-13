@@ -240,6 +240,27 @@ def test_request_shape_validation(client_and_fakes):
     assert missing.json()["error"]["type"] == "model_not_found"
 
 
+def test_non_finite_sampling_and_zero_max_tokens_are_rejected(client_and_fakes):
+    client, _, _ = client_and_fakes
+    body = {"messages": [{"role": "user", "content": "x"}]}
+    assert client.post("/v1/chat/completions", json={**body, "max_tokens": 0}).status_code == 400
+    assert client.post("/v1/chat/completions", json={**body, "temperature": "nan"}).status_code == 400
+    assert client.post("/v1/chat/completions", json={**body, "temperature": "inf"}).status_code == 400
+
+
+def test_model_context_limit_rejects_impossible_completion():
+    engine, store = FakeEngine(), FakeStore()
+    client = TestClient(create_app(
+        engine, store, model_id="test-model", model_context_tokens=10,
+    ))
+    response = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "too long"}], "max_tokens": 5},
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["message"].startswith("prompt plus completion")
+
+
 def test_request_body_limit_is_enforced_after_reading(client_and_fakes):
     client, engine, store = client_and_fakes
     app = create_app(engine, store, model_id="test-model", max_request_bytes=16)

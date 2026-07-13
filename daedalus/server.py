@@ -26,6 +26,7 @@ import contextvars
 import hmac
 import json
 import logging
+import math
 import threading
 import time
 import uuid
@@ -386,6 +387,19 @@ def validate_tools(tools: Any) -> Optional[str]:
     return None
 
 
+def model_context_limit(model: Any) -> Optional[int]:
+    """Best-effort context-window discovery across common MLX model configs."""
+    config = getattr(model, "config", None)
+    for owner in (config, getattr(config, "text_config", None)):
+        if owner is None:
+            continue
+        for name in ("max_position_embeddings", "max_seq_len", "max_sequence_length"):
+            value = owner.get(name) if isinstance(owner, dict) else getattr(owner, name, None)
+            if isinstance(value, int) and value > 0:
+                return value
+    return None
+
+
 def _sse(data: dict) -> str:
     return f"data: {json.dumps(data)}\n\n"
 
@@ -432,6 +446,7 @@ def create_app(
     shutdown_timeout: float = 30.0,
     cors_origins: Optional[List[str]] = None,
     cors_allow_credentials: bool = False,
+    model_context_tokens: Optional[int] = None,
 ) -> FastAPI:
     if max_pending_requests < 1:
         raise ValueError("max_pending_requests must be at least 1")
@@ -470,6 +485,7 @@ def create_app(
         cors_origins=cors_origins or [],
         cors_allow_credentials=cors_allow_credentials,
     )
+    context_limit = model_context_tokens or model_context_limit(getattr(engine, "model", None))
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -644,15 +660,23 @@ def create_app(
         if not isinstance(messages, list) or not messages:
             return error("messages must be a non-empty array", 400)
         stream = bool(body.get("stream", False))
+        raw_max_tokens = body.get(
+            "max_tokens", body.get("max_completion_tokens", 2048)
+        )
+        if isinstance(raw_max_tokens, bool) or not isinstance(raw_max_tokens, int):
+            return error("max_tokens must be an integer", 400)
+        max_tokens = raw_max_tokens
         try:
-            max_tokens = int(body.get("max_tokens") or body.get("max_completion_tokens") or 2048)
             temperature = float(body.get("temperature", 0.7))
             top_p = float(body.get("top_p", 1.0))
             freq_p = float(body.get("frequency_penalty", 0.0))
             pres_p = float(body.get("presence_penalty", 0.0))
         except (TypeError, ValueError):
             return error("max_tokens, temperature, top_p, frequency_penalty, presence_penalty must be numeric", 400)
-        if max_tokens < 1 or temperature < 0 or not 0 < top_p <= 1 or not -2.0 <= freq_p <= 2.0 or not -2.0 <= pres_p <= 2.0:
+        if (max_tokens < 1 or not math.isfinite(temperature) or temperature < 0
+                or not math.isfinite(top_p) or not 0 < top_p <= 1
+                or not math.isfinite(freq_p) or not -2.0 <= freq_p <= 2.0
+                or not math.isfinite(pres_p) or not -2.0 <= pres_p <= 2.0):
             return error("max_tokens must be positive, temperature non-negative, and top_p in (0, 1]", 400)
         if max_tokens > state.max_completion_tokens:
             return error(f"max_tokens exceeds server limit ({state.max_completion_tokens})", 400)
@@ -685,6 +709,11 @@ def create_app(
             return error("prompt could not be templated", 400)
         if len(tokens) > state.max_prompt_tokens:
             return error(f"prompt exceeds server limit ({state.max_prompt_tokens} tokens)", 413)
+        if context_limit is not None and len(tokens) + max_tokens > context_limit:
+            return error(
+                f"prompt plus completion exceeds model context limit ({context_limit} tokens)",
+                400,
+            )
         if not state.try_admit():
             state.metrics.inc_request("rejected")
             audit_logger.request_rejected(client_key, reason="queue_full",
@@ -1053,7 +1082,13 @@ class _Generation:
                         call_index += len(calls)
                 return events
 
-            buffer = ""
+            # Keep only the suffix that can still form a stop marker.  The
+            # prior implementation retained every decoded character and
+            # rescanned it per token, which turns long generations into an
+            # avoidable O(n²) hot path.
+            stop_suffix = ""
+            max_stop_len = max((len(s) for s in self.stop), default=0)
+            stop_matched = False
             try:
                 # Only engage penalty processors when a client asks for them:
                 # the default path stays byte-identical to plain sampling.
@@ -1088,25 +1123,31 @@ class _Generation:
                         t_first_token = time.monotonic()
                     if resp.text:
                         if self.stop:
-                            buffer += resp.text
-                            matched = False
-                            for s in self.stop:
-                                if s in buffer:
-                                    matched = True
-                                    prev_len = len(buffer) - len(resp.text)
-                                    valid_chunk_len = max(0, buffer.find(s) - prev_len)
-                                    text_to_emit = resp.text[:valid_chunk_len]
-                                    if text_to_emit:
-                                        yield from route(text_to_emit)
-                                    break
-                            if matched:
+                            stop_suffix += resp.text
+                            matches = [
+                                stop_suffix.find(marker)
+                                for marker in self.stop
+                                if marker in stop_suffix
+                            ]
+                            if matches:
+                                text_to_emit = stop_suffix[:min(matches)]
+                                if text_to_emit:
+                                    yield from route(text_to_emit)
+                                stop_matched = True
                                 finish_reason = "stop"
                                 break
-                        yield from route(resp.text)
+                            safe = max(0, len(stop_suffix) - max_stop_len + 1)
+                            if safe:
+                                yield from route(stop_suffix[:safe])
+                                stop_suffix = stop_suffix[safe:]
+                        else:
+                            yield from route(resp.text)
                     n_generated = resp.generation_tokens
                     decode_tps = resp.generation_tps
                     if resp.finish_reason is not None:
                         finish_reason = resp.finish_reason
+                if stop_suffix and not stop_matched and not self.aborted.is_set():
+                    yield from route(stop_suffix)
             except PrefillAborted:
                 logger.info(
                     "  %s · prefill aborted at %d tok (client gone)",

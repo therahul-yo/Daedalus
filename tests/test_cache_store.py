@@ -71,6 +71,13 @@ def test_deferred_persist_keeps_prefix_available_immediately(tmp_path):
     assert store.stats()["copy_seconds"] >= 0
 
 
+def test_resident_entry_reports_wall_clock_age(tmp_path):
+    store = make_store(tmp_path)
+    store.put(list(range(20)), [kv_cache_with(20)], persist=False)
+    entry = store.list_entries()[0]
+    assert 0 <= entry["age_seconds"] < 5
+
+
 def test_exact_prefix_hit_trimmable(tmp_path):
     store = make_store(tmp_path)
     prefix = list(range(100))
