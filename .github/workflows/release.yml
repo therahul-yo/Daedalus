@@ -34,7 +34,7 @@ jobs:
           SHA=$(shasum -a 256 dist/daedalus | cut -d' ' -f1)
           echo "sha256=$SHA" >> $GITHUB_OUTPUT
       - name: Upload binary to release
-        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef0ae4f8 # v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: dist/daedalus
           body: |
@@ -51,7 +51,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Update Homebrew formula
-        uses: mislav/bump-homebrew-formula-action@8b7d3b8e8a2d2a6f5d8c2e7b4f1a9c3d5e6f7a8b # pinned SHA
+        uses: mislav/bump-homebrew-formula-action@ecd3ec7bf4fa4ecbdaa0c379850187374d076eaa # v3.3
         with:
           formula-name: daedalus
           formula-file: Formula/daedalus.rb
