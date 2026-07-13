@@ -1,0 +1,33 @@
+name: Real Model Verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "MLX model id to verify"
+        required: true
+        default: "mlx-community/Qwen3.5-9B-MLX-4bit"
+      benchmark_prompt_tokens:
+        description: "Cold-prefill benchmark size"
+        required: true
+        default: "8000"
+
+jobs:
+  verify:
+    # This is intentionally manual: model downloads and sustained thermal
+    # measurements are not suitable for every pull request.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+      - run: uv sync --extra dev --locked
+      - run: uv run python bench/model_verify.py "${{ inputs.model }}"
+      - run: >-
+          uv run python bench/bench.py
+          --model "${{ inputs.model }}"
+          --prompt-tokens "${{ inputs.benchmark_prompt_tokens }}"
+          --out bench-result.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: real-model-benchmark
+          path: bench-result.json

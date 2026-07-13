@@ -199,9 +199,10 @@ inspired by baseRT's public C API. The thermal governor exists in none of them.
 ## Status
 
 v0.2: engine, persistent prefix cache, thermal governor, and OpenAI-compatible server are
-implemented and validated on real hardware (M4 Air 16GB, Qwen3.5-9B-4bit): 144 tests,
+implemented and validated on real hardware (M4 Air 16GB, Qwen3.5-9B-4bit): 153 tests,
 thermal A/B benchmarked (`bench/thermal_validation.py`), tool calls and reasoning
-separation verified against pi. Multi-agent audited 2026-07-11; all P0/P1 findings fixed.
+separation verified against pi. The ongoing audit hardens request validation,
+predictive admission, benchmark comparability, and release quality gates.
 v0.2 adds penalties/stop/usage options, request-ID + CORS + global rate limiting, the
 `daedalus cache` CLI with TTL eviction, and the audit log / OTel observability layer.
 See `CHANGELOG.md`. Next: packaging (Homebrew/PyInstaller), multi-model serving with
