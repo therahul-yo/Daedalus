@@ -1,6 +1,6 @@
 [project]
 name = "daedalus"
-version = "0.0.1"
+version = "0.2.0"
 description = "MacBook-Air-first MLX inference engine: thermally-governed prefill, persistent prefix cache, OpenAI-compatible server"
 readme = "README.md"
 requires-python = ">=3.12"

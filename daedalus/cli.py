@@ -150,6 +150,70 @@ def cmd_serve(args) -> int:
     return 0
 
 
+def render_status(health: dict, ready: dict, cache: dict) -> str:
+    """Pure formatter for ``daedalus status`` (kept side-effect-free for tests)."""
+    bar = "─" * 62
+    ready_line = ready.get("status", "unknown")
+    if "pending_requests" in ready:
+        ready_line += (
+            f" · {ready['pending_requests']}/{ready.get('max_pending_requests', '?')}"
+            f" requests · queue depth {ready.get('queue_depth', 0)}"
+        )
+    lines = [
+        bar,
+        f"  status   {health.get('status', 'unknown')}"
+        + (f" · {health['model']}" if health.get("model") else ""),
+        f"  ready    {ready_line}",
+    ]
+    if health.get("thermal"):
+        lines.append(f"  thermal  {health['thermal']}")
+    if health.get("active_memory_bytes"):
+        lines.append(f"  memory   {health['active_memory_bytes'] / 1e9:.2f} GB active")
+    if cache:
+        hits, misses = cache.get("hits", 0), cache.get("misses", 0)
+        rate = f" · {100 * hits / (hits + misses):.0f}% hit rate" if hits + misses else ""
+        lines.append(
+            f"  cache    {cache.get('entries', 0)} entries"
+            f" ({cache.get('resident_entries', 0)} in RAM,"
+            f" {cache.get('resident_bytes', 0) / 1e9:.2f} GB){rate}"
+        )
+    lines.append(bar)
+    return "\n".join(lines)
+
+
+def cmd_status(args) -> int:
+    """Show a running server's health, readiness, and cache state."""
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    base = f"http://{args.host}:{args.port}"
+    headers = {"Authorization": f"Bearer {args.api_key}"} if args.api_key else {}
+
+    def get(path: str) -> dict:
+        req = urllib.request.Request(base + path, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return _json.load(r)
+        except urllib.error.HTTPError as exc:
+            # readyz returns 503 with a JSON body while busy — still status.
+            if exc.code == 503:
+                try:
+                    return _json.load(exc)
+                except Exception:
+                    pass
+            return {}
+        except Exception:
+            return {}
+
+    health = get("/health")
+    if not health:
+        print(f"error: no daedalus server responding at {base}", flush=True)
+        return 1
+    print(render_status(health, get("/readyz"), get("/v1/cache/stats")), flush=True)
+    return 0
+
+
 def cmd_doctor(args) -> int:
     import platform
     import subprocess
@@ -391,6 +455,12 @@ def main() -> int:
 
     doctor = sub.add_parser("doctor", help="check thermal sensor + mlx setup")
     doctor.set_defaults(fn=cmd_doctor)
+
+    status = sub.add_parser("status", help="show a running server's health, queue, and cache state")
+    status.add_argument("--host", default="127.0.0.1")
+    status.add_argument("--port", type=int, default=8080)  # matches serve's default
+    status.add_argument("--api-key", help="bearer key for a key-protected server (unlocks full diagnostics)")
+    status.set_defaults(fn=cmd_status)
 
     warm = sub.add_parser("warm", help="pre-prefill prompts into the cache")
     warm.add_argument("--model", required=True)

@@ -650,13 +650,20 @@ def create_app(
         )
 
     @app.get("/health")
-    def health():
-        return {
-            "status": "ok",
-            "model": state.model_id,
-            "thermal": state.engine.governor.effective_level.name,
-            "active_memory_bytes": getattr(state.engine, "active_memory_bytes", lambda: 0)(),
-        }
+    def health(authorization: Optional[str] = Header(default=None)):
+        # Liveness must stay probe-friendly (launchd/uptime checks can't
+        # attach headers), but on a key-protected (LAN-exposed) server the
+        # model identity and memory numbers are diagnostics, not liveness —
+        # they're only included for authorized callers. Local unkeyed
+        # servers keep the full body.
+        body: dict = {"status": "ok"}
+        if authorized(authorization):
+            body.update(
+                model=state.model_id,
+                thermal=state.engine.governor.effective_level.name,
+                active_memory_bytes=getattr(state.engine, "active_memory_bytes", lambda: 0)(),
+            )
+        return body
 
     @app.get("/readyz")
     def readyz():
@@ -1083,6 +1090,7 @@ class _Generation:
         t_start = time.monotonic()
         if not state.lock.acquire(self.aborted):
             return
+        state.metrics.observe_queue_wait(time.monotonic() - t_start)
         try:
             hit = state.store.fetch(self.tokens)
             if hit is not None:
@@ -1308,6 +1316,9 @@ class _Generation:
 
         total_s = time.monotonic() - t_start
         prefill_s = (t_first_token or time.monotonic()) - t_start
+        if t_first_token is not None:
+            state.metrics.observe_ttft(prefill_s)
+        state.metrics.observe_decode_tps(decode_tps)
         fresh = len(self.tokens) - already
         logger.info(
             "← %s · %.1fs · prefill %d tok %.1fs (%d cached) · "

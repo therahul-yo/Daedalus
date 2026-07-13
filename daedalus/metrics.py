@@ -2,8 +2,43 @@
 
 from __future__ import annotations
 
+import bisect
 import threading
 from collections import Counter
+from typing import List, Sequence
+
+
+class Histogram:
+    """Fixed-bucket Prometheus histogram (cumulative, with +Inf/_sum/_count)."""
+
+    def __init__(self, buckets: Sequence[float]) -> None:
+        self.uppers = sorted(buckets)
+        self.counts = [0] * (len(self.uppers) + 1)  # last slot = +Inf
+        self.total = 0.0
+        self.n = 0
+
+    def observe(self, value: float) -> None:
+        self.counts[bisect.bisect_left(self.uppers, value)] += 1
+        self.total += value
+        self.n += 1
+
+    def render(self, name: str, help_text: str) -> List[str]:
+        lines = [f"# HELP {name} {help_text}", f"# TYPE {name} histogram"]
+        cumulative = 0
+        for upper, count in zip(self.uppers, self.counts):
+            cumulative += count
+            lines.append(f'{name}_bucket{{le="{upper}"}} {cumulative}')
+        lines.append(f'{name}_bucket{{le="+Inf"}} {self.n}')
+        lines.append(f"{name}_sum {self.total}")
+        lines.append(f"{name}_count {self.n}")
+        return lines
+
+
+# Prefill on a paced fanless Air legitimately spans 100ms (warm hit) to
+# minutes (cold 40k prompt at MODERATE) — buckets must cover both regimes.
+TTFT_BUCKETS = (0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0)
+QUEUE_WAIT_BUCKETS = (0.01, 0.05, 0.25, 1.0, 5.0, 15.0, 60.0, 180.0)
+DECODE_TPS_BUCKETS = (2.0, 5.0, 10.0, 15.0, 20.0, 30.0, 50.0, 100.0, 200.0)
 
 
 class ServerMetrics:
@@ -14,6 +49,9 @@ class ServerMetrics:
         self.requests = Counter()
         self.errors = Counter()
         self.cache_admin = Counter()
+        self.ttft = Histogram(TTFT_BUCKETS)
+        self.queue_wait = Histogram(QUEUE_WAIT_BUCKETS)
+        self.decode_tps = Histogram(DECODE_TPS_BUCKETS)
 
     def inc_request(self, outcome: str) -> None:
         with self._lock:
@@ -26,6 +64,19 @@ class ServerMetrics:
     def inc_cache_admin(self, action: str) -> None:
         with self._lock:
             self.cache_admin[action] += 1
+
+    def observe_ttft(self, seconds: float) -> None:
+        with self._lock:
+            self.ttft.observe(seconds)
+
+    def observe_queue_wait(self, seconds: float) -> None:
+        with self._lock:
+            self.queue_wait.observe(seconds)
+
+    def observe_decode_tps(self, tps: float) -> None:
+        if tps > 0:
+            with self._lock:
+                self.decode_tps.observe(tps)
 
     def render(self, *, active: int, limit: int, cache: dict, thermal: str) -> str:
         with self._lock:
@@ -84,4 +135,15 @@ class ServerMetrics:
             f"daedalus_thermal_level{{level=\"{thermal.lower()}\"}} {['NOMINAL', 'MODERATE', 'HEAVY', 'TRAPPING', 'SLEEPING'].index(thermal)}",
         ]
         lines += [f'daedalus_cache_admin_total{{action="{k}"}} {v}' for k, v in sorted(cache_admin.items())]
+        with self._lock:
+            lines += self.ttft.render(
+                "daedalus_ttft_seconds", "Time to first generated token."
+            )
+            lines += self.queue_wait.render(
+                "daedalus_queue_wait_seconds",
+                "Time between admission and engine-lock acquisition.",
+            )
+            lines += self.decode_tps.render(
+                "daedalus_decode_tokens_per_second", "Decode throughput per request."
+            )
         return "\n".join(lines) + "\n"
