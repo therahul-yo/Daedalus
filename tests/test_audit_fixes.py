@@ -250,7 +250,7 @@ def test_metrics_requires_auth_when_key_set():
     assert client.get("/readyz").status_code == 200
 
 
-def test_rate_limit_window_expires(monkeypatch):
+def test_client_rate_limit_refills_gradually(monkeypatch):
     engine, store = FakeEngine(), FakeStore()
     app = create_app(
         engine, store, model_id="test-model", requests_per_minute=2
@@ -261,7 +261,8 @@ def test_rate_limit_window_expires(monkeypatch):
     assert not state.allow_client("1.2.3.4")  # limit hit
     # Another client has its own bucket (IP-keyed, finding 11).
     assert state.allow_client("5.6.7.8")
-    # After the 60s window passes, the original client is admitted again.
+    # A token-bucket refills continuously rather than resetting at a hard
+    # minute boundary; 30 seconds earns one of two requests/minute tokens.
     real_monotonic = time.monotonic
-    monkeypatch.setattr(time, "monotonic", lambda: real_monotonic() + 61)
+    monkeypatch.setattr(time, "monotonic", lambda: real_monotonic() + 30)
     assert state.allow_client("1.2.3.4")

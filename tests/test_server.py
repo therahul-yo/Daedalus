@@ -369,6 +369,35 @@ def test_memory_guard_evicts_cache_then_rejects_when_still_over_limit():
     assert store.trimmed
 
 
+def test_predictive_kv_memory_guard_rejects_before_prefill():
+    class Model:
+        config = {
+            "num_hidden_layers": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+        }
+
+    class MemoryEngine(FakeEngine):
+        model = Model()
+
+        class config:
+            kv_bits = 8
+
+        def active_memory_bytes(self):
+            return 90
+
+    engine, store = MemoryEngine(), FakeStore()
+    client = TestClient(create_app(
+        engine, store, model_id="test-model", max_active_memory_bytes=100,
+    ))
+    response = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], "max_tokens": 10},
+    )
+    assert response.status_code == 503
+    assert not engine.generate_calls
+
+
 def test_server_enforces_prompt_and_completion_limits():
     engine, store = FakeEngine(), FakeStore()
     client = TestClient(create_app(

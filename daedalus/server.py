@@ -103,6 +103,19 @@ class GlobalRateLimiter:
             return False
 
 
+class ClientRateLimiter(GlobalRateLimiter):
+    """A per-client token bucket with a bounded, pruneable lifetime."""
+
+    def __init__(self, requests_per_minute: int):
+        super().__init__(requests_per_minute / 60.0, burst=requests_per_minute)
+        self.last_seen = time.monotonic()
+
+    def try_acquire(self) -> bool:
+        allowed = super().try_acquire()
+        self.last_seen = time.monotonic()
+        return allowed
+
+
 @dataclass
 class ServerState:
     engine: Engine
@@ -124,7 +137,7 @@ class ServerState:
     max_prompt_tokens: int = 65536
     max_completion_tokens: int = 4096
     requests_per_minute: int = 0
-    rate_windows: dict[str, tuple[float, int]] = None
+    client_rate_limiters: dict[str, ClientRateLimiter] = None
     max_request_bytes: int = 2 * 1024 * 1024
     global_rate_limiter: Optional[GlobalRateLimiter] = None
     shutdown_timeout: float = 30.0
@@ -145,7 +158,7 @@ class ServerState:
         with self.admission_lock:
             self.admitted_requests = max(0, self.admitted_requests - 1)
 
-    def memory_available(self) -> bool:
+    def memory_available(self, reserve_bytes: int = 0) -> bool:
         if self.max_active_memory_bytes is None:
             return True
         try:
@@ -160,31 +173,33 @@ class ServerState:
             pass
 
         active = getattr(self.engine, "active_memory_bytes", lambda: 0)()
-        if active < self.max_active_memory_bytes:
+        if active + reserve_bytes < self.max_active_memory_bytes:
             return True
         trim = getattr(self.store, "trim_ram", None)
         if trim:
             trim(0)
-        return getattr(self.engine, "active_memory_bytes", lambda: 0)() < self.max_active_memory_bytes
+        return (
+            getattr(self.engine, "active_memory_bytes", lambda: 0)()
+            + reserve_bytes
+            < self.max_active_memory_bytes
+        )
 
     def allow_client(self, key: str) -> bool:
         if self.requests_per_minute <= 0:
             return True
         now = time.monotonic()
         with self.admission_lock:
-            if len(self.rate_windows) > 1024:
-                self.rate_windows = {
-                    client: window for client, window in self.rate_windows.items()
-                    if now - window[0] < 60
+            if len(self.client_rate_limiters) > 1024:
+                self.client_rate_limiters = {
+                    client: limiter
+                    for client, limiter in self.client_rate_limiters.items()
+                    if now - limiter.last_seen < 120
                 }
-            started, count = self.rate_windows.get(key, (now, 0))
-            if now - started >= 60:
-                started, count = now, 0
-            if count >= self.requests_per_minute:
-                self.rate_windows[key] = (started, count)
-                return False
-            self.rate_windows[key] = (started, count + 1)
-            return True
+            limiter = self.client_rate_limiters.get(key)
+            if limiter is None:
+                limiter = ClientRateLimiter(self.requests_per_minute)
+                self.client_rate_limiters[key] = limiter
+            return limiter.try_acquire()
 
     def allow_global_rate(self) -> bool:
         if self.global_rate_limiter is None:
@@ -400,6 +415,41 @@ def model_context_limit(model: Any) -> Optional[int]:
     return None
 
 
+def estimate_kv_cache_bytes(model: Any, tokens: int, kv_bits: Optional[int]) -> Optional[int]:
+    """Conservatively estimate one sequence's target-model KV-cache footprint.
+
+    Returning ``None`` means the architecture does not expose enough standard
+    config fields; callers retain the existing reactive memory guard instead
+    of making up an unsafe number.
+    """
+    config = getattr(model, "config", None)
+    if config is None or tokens < 1:
+        return None
+
+    def get(*names: str) -> Optional[int]:
+        for name in names:
+            value = config.get(name) if isinstance(config, dict) else getattr(config, name, None)
+            if isinstance(value, int) and value > 0:
+                return value
+        return None
+
+    layers = get("num_hidden_layers", "n_layer", "num_layers")
+    heads = get("num_key_value_heads", "num_attention_heads", "n_head")
+    head_dim = get("head_dim")
+    if head_dim is None:
+        hidden = get("hidden_size", "n_embd", "dim")
+        attention_heads = get("num_attention_heads", "n_head")
+        if hidden is not None and attention_heads is not None and hidden % attention_heads == 0:
+            head_dim = hidden // attention_heads
+    if layers is None or heads is None or head_dim is None:
+        return None
+    # keys + values.  Quantized KV has scale/zero-point overhead, so reserve
+    # 20% above the ideal packed size rather than relying on an optimistic bit
+    # count.  Unquantized MLX cache entries are float16.
+    bytes_per_value = 2.0 if kv_bits is None else (kv_bits / 8.0) * 1.2
+    return int(layers * 2 * heads * head_dim * tokens * bytes_per_value)
+
+
 def _sse(data: dict) -> str:
     return f"data: {json.dumps(data)}\n\n"
 
@@ -443,7 +493,7 @@ def create_app(
     audit_log_path: Optional[str] = None,
     global_rps: float = 0.0,
     global_burst: int = 0,
-    shutdown_timeout: float = 30.0,
+    shutdown_timeout: Optional[float] = None,
     cors_origins: Optional[List[str]] = None,
     cors_allow_credentials: bool = False,
     model_context_tokens: Optional[int] = None,
@@ -460,7 +510,8 @@ def create_app(
         raise ValueError("max_request_bytes must be positive")
     if global_rps < 0:
         raise ValueError("global_rps cannot be negative")
-    if shutdown_timeout <= 0:
+    drain_timeout = shutdown_timeout if shutdown_timeout is not None else shutdown_drain_seconds
+    if drain_timeout <= 0:
         raise ValueError("shutdown_timeout must be positive")
 
     # Audit log ########################################################
@@ -478,10 +529,10 @@ def create_app(
         max_prompt_tokens=max_prompt_tokens,
         max_completion_tokens=max_completion_tokens,
         requests_per_minute=requests_per_minute,
-        rate_windows={},
+        client_rate_limiters={},
         max_request_bytes=max_request_bytes,
         global_rate_limiter=GlobalRateLimiter(global_rps, global_burst) if global_rps > 0 else None,
-        shutdown_timeout=shutdown_timeout,
+        shutdown_timeout=drain_timeout,
         cors_origins=cors_origins or [],
         cors_allow_credentials=cors_allow_credentials,
     )
@@ -494,7 +545,7 @@ def create_app(
             state.accepting = False
         # Drain in-flight generations before releasing the cache flock:
         # engine worker threads may still be writing snapshots to disk.
-        deadline = time.monotonic() + shutdown_drain_seconds
+        deadline = time.monotonic() + state.shutdown_timeout
         while time.monotonic() < deadline:
             # Use in_flight_requests in addition to admitted_requests
             in_flight = state.in_flight_requests
@@ -719,7 +770,12 @@ def create_app(
             audit_logger.request_rejected(client_key, reason="queue_full",
                                           limit=state.max_pending_requests)
             return error("server queue is full; retry shortly", 429, "rate_limit_error")
-        if not state.memory_available():
+        reserve_bytes = estimate_kv_cache_bytes(
+            getattr(state.engine, "model", None),
+            len(tokens) + max_tokens,
+            getattr(getattr(state.engine, "config", None), "kv_bits", None),
+        ) or 0
+        if not state.memory_available(reserve_bytes):
             state.release()
             state.metrics.inc_request("memory_rejected")
             audit_logger.request_rejected(client_key, reason="memory_pressure")

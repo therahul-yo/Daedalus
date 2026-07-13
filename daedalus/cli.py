@@ -118,6 +118,7 @@ def cmd_serve(args) -> int:
         audit_log_path=args.audit_log,
         cors_origins=args.cors_origins,
         global_rps=args.global_rps,
+        shutdown_timeout=args.shutdown_timeout,
     )
 
     bar = "─" * 62
@@ -330,6 +331,10 @@ def main() -> int:
                        help="per-client LAN limit; 0 disables rate limiting")
     serve.add_argument("--max-request-bytes", type=int, default=2 * 1024 * 1024)
     serve.add_argument(
+        "--shutdown-timeout", type=float, default=30.0,
+        help="seconds to drain active work before server shutdown closes resources",
+    )
+    serve.add_argument(
         "--audit-log",
         help="path to a structured (NDJSON) audit log for auth failures, rate-limit events, and cache-admin operations",
     )
@@ -421,6 +426,8 @@ def main() -> int:
             ap.error("--requests-per-minute cannot be negative")
         if args.max_request_bytes < 1:
             ap.error("--max-request-bytes must be positive")
+        if args.shutdown_timeout <= 0:
+            ap.error("--shutdown-timeout must be positive")
         if args.num_draft_tokens < 0:
             ap.error("--num-draft-tokens cannot be negative")
         if args.num_draft_tokens and not args.draft_model:
