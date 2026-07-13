@@ -127,8 +127,28 @@ def timed_request(port: int, filler: str, *, cache_prompt: bool = True):
     return first, tps, n_tokens
 
 
-def run_arm(name: str, start_fn, port: int, filler: str, results: dict) -> None:
+def wait_thermal_nominal(timeout: float = 1800) -> None:
+    """Block until macOS reports NOMINAL thermal pressure (fair cold starts)."""
+    try:
+        from daedalus.sensors import make_pressure_reader
+        read = make_pressure_reader()
+    except Exception:
+        return
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        level = read()
+        if level.name == "NOMINAL":
+            return
+        print(f"  (thermal {level.name} — cooling before this arm...)", flush=True)
+        time.sleep(30)
+    print("  (warning: never reached NOMINAL; proceeding warm)", flush=True)
+
+
+def run_arm(name: str, start_fn, port: int, filler: str, results: dict,
+            wait_nominal: bool = False) -> None:
     print(f"\n=== {name} ===", flush=True)
+    if wait_nominal:
+        wait_thermal_nominal()
     proc = start_fn()
     try:
         cold, tps_c, _ = timed_request(port, filler)
@@ -153,6 +173,8 @@ def main() -> int:
     ap.add_argument("--mlx-model", default="mlx-community/Qwen3-0.6B-4bit")
     ap.add_argument("--gguf", default="unsloth/Qwen3-0.6B-GGUF:Q4_K_M")
     ap.add_argument("--prompt-tokens", type=int, default=6000)
+    ap.add_argument("--wait-nominal", action="store_true",
+                    help="cool to NOMINAL thermal pressure before each arm")
     ap.add_argument("--out", help="write results JSON here")
     args = ap.parse_args()
 
@@ -169,9 +191,9 @@ def main() -> int:
 
     results: dict = {}
     run_arm("daedalus", lambda: start_daedalus(args.mlx_model),
-            DAEDALUS_PORT, filler, results)
+            DAEDALUS_PORT, filler, results, wait_nominal=args.wait_nominal)
     run_arm("llama.cpp", lambda: start_llama(args.gguf, args.prompt_tokens + 4096),
-            LLAMA_PORT, filler, results)
+            LLAMA_PORT, filler, results, wait_nominal=args.wait_nominal)
 
     print("\n=== summary (identical prompt, temp 0, stream) ===")
     print(f"{'':12} {'cold TTFT':>10} {'warm TTFT':>10} {'restart TTFT':>13} {'decode':>10}")
