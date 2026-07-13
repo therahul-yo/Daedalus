@@ -102,3 +102,50 @@ def test_custom_policies():
     gov, _, _ = make_governor(policies=policies)
     assert gov.pace(1.0).next_chunk_tokens == 100
     assert gov.initial_chunk_tokens() == 100
+
+
+def test_anticipate_rising_paces_one_level_ahead():
+    """MODERATE-and-rising paces with the HEAVY policy: the macOS pressure
+    signal lags the heat ramp, so react to the trend, not the level."""
+    gov, set_level, _ = make_governor(anticipate_rising=True)
+    set_level(ThermalLevel.MODERATE)  # history: NOMINAL -> MODERATE = rising
+    d = gov.pace(chunk_seconds=2.0)
+    assert gov.effective_level == ThermalLevel.MODERATE  # hysteresis untouched
+    assert d.effective_level == ThermalLevel.HEAVY       # pacing anticipates
+    assert d.next_chunk_tokens == 512
+    # duty 0.25 -> sleep = 2.0 * 0.75/0.25 = 6.0
+    assert abs(d.sleep_seconds - 6.0) < 1e-9
+
+
+def test_anticipation_drops_when_trend_flattens():
+    gov, set_level, _ = make_governor(anticipate_rising=True)
+    set_level(ThermalLevel.MODERATE)
+    assert gov.pace(chunk_seconds=1.0).effective_level == ThermalLevel.HEAVY
+    # Trend flattens: same level re-observed until the rising window ages out.
+    gov._monitor._history.clear()
+    set_level(ThermalLevel.MODERATE)
+    set_level(ThermalLevel.MODERATE)
+    d = gov.pace(chunk_seconds=1.0)
+    # No step_down wait: anticipation is an overlay, not hysteresis state.
+    assert d.effective_level == ThermalLevel.MODERATE
+    assert d.next_chunk_tokens == 1024
+
+
+def test_no_anticipation_below_moderate_or_when_disabled():
+    # Rising at NOMINAL: never anticipate (would slow every cold start).
+    gov, set_level, _ = make_governor(anticipate_rising=True)
+    d = gov.pace(chunk_seconds=1.0)
+    assert d.effective_level == ThermalLevel.NOMINAL
+    # Disabled (default): MODERATE-and-rising paces as MODERATE.
+    gov2, set_level2, _ = make_governor()
+    set_level2(ThermalLevel.MODERATE)
+    d2 = gov2.pace(chunk_seconds=1.0)
+    assert d2.effective_level == ThermalLevel.MODERATE
+    assert d2.next_chunk_tokens == 1024
+
+
+def test_anticipation_capped_at_sleeping():
+    gov, set_level, _ = make_governor(anticipate_rising=True)
+    set_level(ThermalLevel.SLEEPING)
+    d = gov.pace(chunk_seconds=1.0)
+    assert d.effective_level == ThermalLevel.SLEEPING  # no level above

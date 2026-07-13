@@ -86,6 +86,13 @@ class GovernorConfig:
     # TRAPPING): a few seconds of burn adds negligible heat, and pacing it
     # triples an interactive turn's latency for nothing.
     min_pace_job_tokens: int = 4096
+    # Anticipatory pacing: macOS's pressure signal lags the actual heat ramp
+    # on a fanless chassis. When enabled and the trend is rising, pacing uses
+    # the policy one level ABOVE the observed level (MODERATE-and-rising
+    # paces as HEAVY), pre-empting the throttle instead of reacting to it.
+    # Off by default: the measured A/B numbers were taken without it.
+    anticipate_rising: bool = False
+    rising_window_seconds: float = 30.0
 
 
 class ThermalGovernor:
@@ -119,6 +126,24 @@ class ThermalGovernor:
             # step_down_seconds per level.
             self._below_since = now if observed < self._effective else None
 
+    def _pacing_level(self, now: float) -> ThermalLevel:
+        """Level whose policy governs pacing.
+
+        Anticipation is an overlay on top of the hysteresis state machine,
+        never an input to it: the effective level keeps tracking what the
+        sensor actually reported, so a rising edge that flattens out drops
+        the overlay immediately instead of waiting out step_down_seconds.
+        """
+        self._update_effective(self._monitor.level, now)
+        level = self._effective
+        if (
+            self._config.anticipate_rising
+            and ThermalLevel.MODERATE <= level < ThermalLevel.SLEEPING
+            and self._monitor.rising(self._config.rising_window_seconds)
+        ):
+            level = ThermalLevel(int(level) + 1)
+        return level
+
     def pace(
         self, chunk_seconds: float, job_tokens: Optional[int] = None
     ) -> PaceDecision:
@@ -132,13 +157,13 @@ class ThermalGovernor:
         an interactive turn.
         """
         now = self._clock()
-        self._update_effective(self._monitor.level, now)
-        policy = self._config.policies[self._effective]
+        pacing_level = self._pacing_level(now)
+        policy = self._config.policies[pacing_level]
         duty = min(policy.duty, self._config.max_duty)
         small_job = (
             job_tokens is not None
             and job_tokens < self._config.min_pace_job_tokens
-            and self._effective < ThermalLevel.TRAPPING
+            and pacing_level < ThermalLevel.TRAPPING
         )
         if duty >= 1.0 or chunk_seconds <= 0 or small_job:
             sleep = 0.0
@@ -149,10 +174,9 @@ class ThermalGovernor:
         return PaceDecision(
             next_chunk_tokens=policy.chunk_tokens,
             sleep_seconds=sleep,
-            effective_level=self._effective,
+            effective_level=pacing_level,
         )
 
     def initial_chunk_tokens(self) -> int:
         """Chunk size for the first chunk of a prefill (no burn measured yet)."""
-        self._update_effective(self._monitor.level, self._clock())
-        return self._config.policies[self._effective].chunk_tokens
+        return self._config.policies[self._pacing_level(self._clock())].chunk_tokens
