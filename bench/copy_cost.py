@@ -4,6 +4,26 @@ Hypothesis under test: ``copy.deepcopy`` on an mx.array-backed KV cache is
 lazy/COW — near-free at copy time — and the real buffer duplication happens
 on the *first write* to the copy, i.e. inside TTFT on every cache hit.
 
+VERDICT (2026-07-13, closes the audit's deferred "COW ownership redesign"):
+measured on real hardware, the redesign is NOT worth shipping. A loan-out
+fetch (hand the caller the stored object, skip the deepcopy) was implemented
+and A/B-measured on Qwen3.5-9B with an 8k prompt: warm TTFT 0.25s vs 0.22s
+on stock master — no improvement, within noise. Two reasons the synthetic
+number here (~66ms at 8k) does not transfer:
+
+1. The end-of-prefill snapshot ``put()`` deepcopies the request's cache back
+   into the store, making the request's buffers copy-on-write again — the
+   first decode write pays one materialization regardless of what fetch()
+   avoided. The last copy before the first decode write is the one that
+   bills; removing the fetch-side copy changes nothing.
+2. This bench models 8 full-attention layers with real 8k-token KV. On the
+   actual hybrid model only 8 of 32 layers are GQA; the 24 Gated-DeltaNet
+   layers carry small constant state, so the true per-copy tax is roughly a
+   quarter of the synthetic figure (~15ms) — inside run-to-run noise.
+
+Do not re-attempt without first invalidating one of those two facts (e.g. a
+snapshot mechanism that does not re-share the request's buffers).
+
 Usage: python bench/copy_cost.py [n_tokens]
 No model needed — synthetic KV shaped like Qwen3.5-9B's 8 GQA layers.
 """
