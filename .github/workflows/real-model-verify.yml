@@ -26,6 +26,7 @@ jobs:
           uv run python bench/bench.py
           --model "${{ inputs.model }}"
           --prompt-tokens "${{ inputs.benchmark_prompt_tokens }}"
+          --require-nominal
           --out bench-result.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
