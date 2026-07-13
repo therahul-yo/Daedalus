@@ -57,7 +57,8 @@ def cmd_serve(args) -> int:
     governor = ThermalGovernor(
         monitor,
         GovernorConfig(
-            policies=dict(PROFILES[args.profile]), max_duty=args.max_duty
+            policies=dict(PROFILES[args.profile]), max_duty=args.max_duty,
+            anticipate_rising=args.anticipate_rising,
         ),
     )
 
@@ -357,6 +358,12 @@ def main() -> int:
         type=float,
         default=1.0,
         help="global GPU duty ceiling (0-1); e.g. 0.5 for quiet mode",
+    )
+    serve.add_argument(
+        "--anticipate-rising",
+        action="store_true",
+        help="pace one thermal level ahead while pressure is rising — the "
+        "macOS signal lags the heat ramp on a fanless chassis",
     )
     serve.add_argument(
         "--log-level",
