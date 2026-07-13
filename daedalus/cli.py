@@ -105,6 +105,7 @@ def cmd_serve(args) -> int:
         max_ram_bytes=args.cache_ram_mb * 1024**2 if args.cache_ram_mb else None,
         max_disk_bytes=args.cache_disk_gb * 1024**3,
         exclusive=True,
+        cache_ttl_days=args.cache_ttl_days,
     )
     cache_stats = store.stats()
     app = create_app(
@@ -119,6 +120,7 @@ def cmd_serve(args) -> int:
         cors_origins=args.cors_origins,
         global_rps=args.global_rps,
         shutdown_timeout=args.shutdown_timeout,
+        trusted_proxy_hosts=args.trusted_proxy_hosts,
     )
 
     bar = "─" * 62
@@ -321,6 +323,10 @@ def main() -> int:
         help="disk budget for prefix cache in GiB (default: 10)",
     )
     serve.add_argument(
+        "--cache-ttl-days", type=int,
+        help="evict persisted cache entries older than this many days at startup",
+    )
+    serve.add_argument(
         "--max-active-memory-gb", type=float,
         help="reject new work after cache eviction if MLX active memory exceeds this limit",
     )
@@ -374,6 +380,10 @@ def main() -> int:
         help="permitted CORS origin; repeat for multiple origins",
     )
     serve.add_argument(
+        "--trusted-proxy-host", action="append", dest="trusted_proxy_hosts", default=None,
+        help="proxy peer IP/hostname allowed to supply X-Forwarded-For; repeat as needed",
+    )
+    serve.add_argument(
         "--global-rps", type=float, default=0.0,
         help="global rate limit across all clients in requests per second (0 = disabled)",
     )
@@ -410,6 +420,8 @@ def main() -> int:
             ap.error("--cache-ram-mb must be positive")
         if args.cache_disk_gb < 1:
             ap.error("--cache-disk-gb must be positive")
+        if args.cache_ttl_days is not None and args.cache_ttl_days < 1:
+            ap.error("--cache-ttl-days must be positive")
         if args.host not in {"127.0.0.1", "::1", "localhost"} and not args.api_key:
             if not args.api_key_env and not args.api_key_file:
                 ap.error("an API key source is required when binding outside localhost")

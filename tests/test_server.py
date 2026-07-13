@@ -419,6 +419,23 @@ def test_server_rate_limit():
     assert client.post("/v1/chat/completions", json=payload).status_code == 429
 
 
+def test_trusted_proxy_can_supply_distinct_rate_limit_clients():
+    engine, store = FakeEngine(), FakeStore()
+    client = TestClient(create_app(
+        engine, store, model_id="test-model", requests_per_minute=1,
+        trusted_proxy_hosts=["testclient"],
+    ))
+    payload = {"messages": [{"role": "user", "content": "hi"}]}
+    assert client.post(
+        "/v1/chat/completions", json=payload,
+        headers={"X-Forwarded-For": "10.0.0.1"},
+    ).status_code == 200
+    assert client.post(
+        "/v1/chat/completions", json=payload,
+        headers={"X-Forwarded-For": "10.0.0.2, testclient"},
+    ).status_code == 200
+
+
 def test_server_rejects_oversized_content_length():
     client = TestClient(create_app(FakeEngine(), FakeStore(), "test-model", max_request_bytes=10))
     response = client.post(

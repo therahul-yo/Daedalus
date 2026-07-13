@@ -143,6 +143,7 @@ class ServerState:
     shutdown_timeout: float = 30.0
     cors_origins: List[str] = field(default_factory=list)
     cors_allow_credentials: bool = False
+    trusted_proxy_hosts: frozenset[str] = field(default_factory=frozenset)
     in_flight_requests: int = 0
     in_flight_lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -415,6 +416,19 @@ def model_context_limit(model: Any) -> Optional[int]:
     return None
 
 
+def request_client_ip(request: Request, trusted_proxy_hosts: frozenset[str]) -> str:
+    """Use forwarded client IPs only from an explicitly trusted proxy."""
+    peer = request.client.host if request.client else "local"
+    if peer not in trusted_proxy_hosts:
+        return peer
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        candidate = forwarded.split(",", 1)[0].strip()
+        if candidate:
+            return candidate
+    return peer
+
+
 def estimate_kv_cache_bytes(model: Any, tokens: int, kv_bits: Optional[int]) -> Optional[int]:
     """Conservatively estimate one sequence's target-model KV-cache footprint.
 
@@ -497,6 +511,7 @@ def create_app(
     cors_origins: Optional[List[str]] = None,
     cors_allow_credentials: bool = False,
     model_context_tokens: Optional[int] = None,
+    trusted_proxy_hosts: Optional[List[str]] = None,
 ) -> FastAPI:
     if max_pending_requests < 1:
         raise ValueError("max_pending_requests must be at least 1")
@@ -535,6 +550,7 @@ def create_app(
         shutdown_timeout=drain_timeout,
         cors_origins=cors_origins or [],
         cors_allow_credentials=cors_allow_credentials,
+        trusted_proxy_hosts=frozenset(trusted_proxy_hosts or []),
     )
     context_limit = model_context_tokens or model_context_limit(getattr(engine, "model", None))
 
@@ -612,7 +628,7 @@ def create_app(
                              "max_pending_requests": state.max_pending_requests}, status_code=status)
 
     def client_ip(request: Request) -> str:
-        return request.client.host if request.client else "local"
+        return request_client_ip(request, state.trusted_proxy_hosts)
 
     @app.get("/metrics")
     def metrics(request: Request, authorization: Optional[str] = Header(default=None)):
@@ -670,8 +686,8 @@ def create_app(
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request, authorization: str | None = Header(default=None)):
         if not authorized(authorization):
-            client_ip = request.client.host if request.client else "local"
-            audit_logger.auth_failure(client_ip)
+            source_ip = client_ip(request)
+            audit_logger.auth_failure(source_ip)
             return error("invalid API key", 401, "authentication_error")
         # Check global rate limit first
         if not state.allow_global_rate():
@@ -679,7 +695,7 @@ def create_app(
             return error("global request rate limit exceeded", 429, "rate_limit_error")
         # Bucket by client IP, not Authorization: with a shared bearer
         # token every LAN client would otherwise share a single bucket.
-        client_key = request.client.host if request.client else "local"
+        client_key = client_ip(request)
         if not state.allow_client(client_key):
             state.metrics.inc_request("rate_limited")
             audit_logger.rate_limit_hit(
