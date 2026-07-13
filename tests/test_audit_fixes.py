@@ -129,8 +129,8 @@ class FakeDisconnectingRequest:
         self.client = None
         self.polls = 0
 
-    async def json(self):
-        return self._body
+    async def stream(self):
+        yield json.dumps(self._body).encode()
 
     async def is_disconnected(self):
         self.polls += 1

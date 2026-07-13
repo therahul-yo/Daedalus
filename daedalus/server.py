@@ -112,6 +112,9 @@ class ServerState:
     api_key: Optional[str]
     metrics: ServerMetrics
     admission_lock: threading.Lock
+    # Serializes cache maintenance with admission.  A clear must never race a
+    # request that has passed the idle check but has not started using a cache.
+    maintenance_lock: threading.Lock = field(default_factory=threading.Lock)
     admitted_requests: int = 0
     accepting: bool = True
     token_cache: "PromptTokenCache" = None
@@ -130,11 +133,12 @@ class ServerState:
     in_flight_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def try_admit(self) -> bool:
-        with self.admission_lock:
-            if not self.accepting or self.admitted_requests >= self.max_pending_requests:
-                return False
-            self.admitted_requests += 1
-            return True
+        with self.maintenance_lock:
+            with self.admission_lock:
+                if not self.accepting or self.admitted_requests >= self.max_pending_requests:
+                    return False
+                self.admitted_requests += 1
+                return True
 
     def release(self) -> None:
         with self.admission_lock:
@@ -337,6 +341,51 @@ def build_prompt_tokens(
     )
 
 
+class RequestBodyTooLarge(ValueError):
+    """Raised when a streamed request body exceeds the configured limit."""
+
+
+async def read_json_body(request: Request, max_bytes: int) -> dict:
+    """Read JSON with a hard byte cap even for chunked requests.
+
+    Starlette's ``request.json()`` buffers the entire body.  Checking only
+    Content-Length therefore leaves a memory-exhaustion path for chunked or
+    deliberately headerless clients.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > max_bytes:
+            raise RequestBodyTooLarge
+        chunks.append(chunk)
+    try:
+        body = json.loads(b"".join(chunks))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("request body must be valid JSON") from exc
+    if not isinstance(body, dict):
+        raise ValueError("request body must be a JSON object")
+    return body
+
+
+def validate_tools(tools: Any) -> Optional[str]:
+    """Return a public validation error for malformed OpenAI tool schemas."""
+    if tools is None:
+        return None
+    if not isinstance(tools, list):
+        return "tools must be an array"
+    for tool in tools:
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            return "each tool must be a function definition"
+        function = tool.get("function")
+        if not isinstance(function, dict) or not isinstance(function.get("name"), str) or not function["name"].strip():
+            return "each tool function must have a non-empty name"
+        parameters = function.get("parameters")
+        if parameters is not None and not isinstance(parameters, dict):
+            return "tool function parameters must be an object"
+    return None
+
+
 def _sse(data: dict) -> str:
     return f"data: {json.dumps(data)}\n\n"
 
@@ -446,6 +495,9 @@ def create_app(
         close = getattr(state.store, "close", None)
         if close:
             close()
+        engine_close = getattr(state.engine, "close", None)
+        if engine_close:
+            engine_close()
         audit_logger.close()
 
     app = FastAPI(title="daedalus", lifespan=lifespan)
@@ -537,9 +589,13 @@ def create_app(
         if not authorized(authorization):
             audit_logger.auth_failure(client_ip(request), reason="missing_api_key")
             return error("invalid API key", 401, "authentication_error")
-        if state.admitted_requests:
-            return error("cache cannot be cleared while requests are active", 409, "conflict_error")
-        removed = state.store.clear()
+        # Admission also takes this lock, so a request cannot slip in after
+        # the idle check but before the cache contents are removed.
+        with state.maintenance_lock:
+            with state.admission_lock:
+                if state.admitted_requests:
+                    return error("cache cannot be cleared while requests are active", 409, "conflict_error")
+            removed = state.store.clear()
         state.metrics.inc_cache_admin("clear")
         audit_logger.cache_admin("clear", client_ip=client_ip(request))
         return {"removed_entries": removed}
@@ -572,11 +628,18 @@ def create_app(
             except ValueError:
                 return error("invalid Content-Length header", 400)
         try:
-            body = await request.json()
-        except Exception:
-            return error("request body must be valid JSON", 400)
-        if not isinstance(body, dict):
-            return error("request body must be a JSON object", 400)
+            body = await read_json_body(request, state.max_request_bytes)
+        except RequestBodyTooLarge:
+            audit_logger.request_rejected(client_key, reason="request_too_large")
+            return error("request body exceeds server limit", 413)
+        except ValueError as exc:
+            return error(str(exc), 400)
+        requested_model = body.get("model")
+        if requested_model is not None:
+            if not isinstance(requested_model, str):
+                return error("model must be a string", 400)
+            if requested_model != state.model_id:
+                return error(f"model {requested_model!r} is not served", 404, "model_not_found")
         messages = body.get("messages", [])
         if not isinstance(messages, list) or not messages:
             return error("messages must be a non-empty array", 400)
@@ -593,15 +656,25 @@ def create_app(
             return error("max_tokens must be positive, temperature non-negative, and top_p in (0, 1]", 400)
         if max_tokens > state.max_completion_tokens:
             return error(f"max_tokens exceeds server limit ({state.max_completion_tokens})", 400)
-        tools = body.get("tools") or None
+        tools = body.get("tools") if "tools" in body else None
+        tools_error = validate_tools(tools)
+        if tools_error:
+            return error(tools_error, 400)
+        # Keep downstream template handling simple while retaining validation
+        # above (an explicitly supplied empty array is valid and means none).
+        tools = tools or None
         if body.get("tool_choice") == "none":
             tools = None
             
         stop = body.get("stop")
         if isinstance(stop, str):
             stop = [stop]
-        elif not isinstance(stop, list):
+        elif stop is None:
             stop = []
+        elif not isinstance(stop, list) or not all(
+            isinstance(value, str) and value for value in stop
+        ):
+            return error("stop must be a string or an array of non-empty strings", 400)
 
         try:
             tokens = build_prompt_tokens(state, messages, tools)
