@@ -36,6 +36,22 @@ takes 20% fewer GPU-seconds (less total heat) at a stable rate that does not dec
 exchange for longer wall-clock spread across idle gaps that keep the machine usable.
 With the prefix cache, this cost is paid once per unique prefix, ever.
 
+**vs llama.cpp** — same machine, same 8,000-token agent prompt, Qwen3.5-9B at 4-bit
+(MLX 4-bit vs GGUF Q4_K_M), identical protocol via `bench/head_to_head.py`:
+
+| | cold TTFT | warm TTFT | TTFT after server restart | decode |
+|---|---|---|---|---|
+| daedalus | 52.5 s | 0.23 s | **0.62 s** | 16.9 tok/s |
+| llama-server | 54.6 s | 0.50 s | 69.9 s | 14.4 tok/s |
+
+Raw cold prefill and decode are comparable engine-to-engine — the separation is what
+survives a restart: llama.cpp's slot cache dies with the process, so every daemon
+restart, crash, or reboot re-pays the full prefill; daedalus reloads it from disk in
+under a second. (llama.cpp's arm ran second on an already-warm chassis, which inflated
+its restart prefill and dropped its decode to 11.7 tok/s — thermal decay compounding
+with the lost cache is precisely the failure mode daedalus removes.) Reproduce with
+`python bench/head_to_head.py --mlx-model <mlx-id> --gguf <hf-repo:quant>`.
+
 ## How it works
 
 1. **The best prefill is no prefill** — persistent prefix cache (RAM LRU + disk
