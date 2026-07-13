@@ -403,16 +403,41 @@ def validate_tools(tools: Any) -> Optional[str]:
     return None
 
 
+def _model_config_owners(model: Any) -> List[Any]:
+    """Config-bearing objects for a model, outermost first.
+
+    mlx-lm models expose ``model.args`` (a ModelArgs dataclass), not
+    ``.config`` — reading only ``.config`` made every downstream helper a
+    silent no-op on real models. Vision-wrapped checkpoints (Qwen3.5) nest
+    the text fields another level down in ``text_config``, which may be a
+    dict or a dataclass depending on where in mlx-lm it was materialized.
+    """
+    owners: List[Any] = []
+    for attr in ("config", "args"):
+        cfg = getattr(model, attr, None)
+        if cfg is None:
+            continue
+        owners.append(cfg)
+        text = cfg.get("text_config") if isinstance(cfg, dict) else getattr(cfg, "text_config", None)
+        if text is not None:
+            owners.append(text)
+    return owners
+
+
+def _cfg_get(owner: Any, *names: str) -> Optional[int]:
+    for name in names:
+        value = owner.get(name) if isinstance(owner, dict) else getattr(owner, name, None)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return None
+
+
 def model_context_limit(model: Any) -> Optional[int]:
     """Best-effort context-window discovery across common MLX model configs."""
-    config = getattr(model, "config", None)
-    for owner in (config, getattr(config, "text_config", None)):
-        if owner is None:
-            continue
-        for name in ("max_position_embeddings", "max_seq_len", "max_sequence_length"):
-            value = owner.get(name) if isinstance(owner, dict) else getattr(owner, name, None)
-            if isinstance(value, int) and value > 0:
-                return value
+    for owner in _model_config_owners(model):
+        value = _cfg_get(owner, "max_position_embeddings", "max_seq_len", "max_sequence_length")
+        if value is not None:
+            return value
     return None
 
 
@@ -436,32 +461,48 @@ def estimate_kv_cache_bytes(model: Any, tokens: int, kv_bits: Optional[int]) -> 
     config fields; callers retain the existing reactive memory guard instead
     of making up an unsafe number.
     """
-    config = getattr(model, "config", None)
-    if config is None or tokens < 1:
+    if tokens < 1:
         return None
+    for config in _model_config_owners(model):
+        def get(*names: str) -> Optional[int]:
+            return _cfg_get(config, *names)
 
-    def get(*names: str) -> Optional[int]:
-        for name in names:
-            value = config.get(name) if isinstance(config, dict) else getattr(config, name, None)
-            if isinstance(value, int) and value > 0:
-                return value
-        return None
-
-    layers = get("num_hidden_layers", "n_layer", "num_layers")
-    heads = get("num_key_value_heads", "num_attention_heads", "n_head")
-    head_dim = get("head_dim")
-    if head_dim is None:
-        hidden = get("hidden_size", "n_embd", "dim")
-        attention_heads = get("num_attention_heads", "n_head")
-        if hidden is not None and attention_heads is not None and hidden % attention_heads == 0:
-            head_dim = hidden // attention_heads
-    if layers is None or heads is None or head_dim is None:
-        return None
-    # keys + values.  Quantized KV has scale/zero-point overhead, so reserve
-    # 20% above the ideal packed size rather than relying on an optimistic bit
-    # count.  Unquantized MLX cache entries are float16.
-    bytes_per_value = 2.0 if kv_bits is None else (kv_bits / 8.0) * 1.2
-    return int(layers * 2 * heads * head_dim * tokens * bytes_per_value)
+        layers = get("num_hidden_layers", "n_layer", "num_layers")
+        heads = get("num_key_value_heads", "num_attention_heads", "n_head")
+        head_dim = get("head_dim")
+        if head_dim is None:
+            hidden = get("hidden_size", "n_embd", "dim")
+            attention_heads = get("num_attention_heads", "n_head")
+            if hidden is not None and attention_heads is not None and hidden % attention_heads == 0:
+                head_dim = hidden // attention_heads
+        if layers is None or heads is None or head_dim is None:
+            continue
+        # Hybrid architectures grow per-token KV only in their full-attention
+        # layers; the recurrent (Gated-DeltaNet/SSM) layers hold small
+        # constant state. Counting every layer would over-reserve ~4x on
+        # Qwen3.5 and spuriously reject long prompts. Two config spellings:
+        # an explicit per-layer type list (HF) or an interval (mlx-lm).
+        layer_types = (
+            config.get("layer_types") if isinstance(config, dict)
+            else getattr(config, "layer_types", None)
+        )
+        if isinstance(layer_types, (list, tuple)) and layer_types:
+            kv_layers = sum(
+                1 for t in layer_types if isinstance(t, str) and "full" in t
+            )
+            if kv_layers == 0:
+                return None  # pure-recurrent: constant state, nothing to reserve
+            layers = kv_layers
+        else:
+            interval = get("full_attention_interval")
+            if interval is not None and interval > 1:
+                layers = max(1, layers // interval)
+        # keys + values.  Quantized KV has scale/zero-point overhead, so
+        # reserve 20% above the ideal packed size rather than relying on an
+        # optimistic bit count.  Unquantized MLX cache entries are float16.
+        bytes_per_value = 2.0 if kv_bits is None else (kv_bits / 8.0) * 1.2
+        return int(layers * 2 * heads * head_dim * tokens * bytes_per_value)
+    return None
 
 
 def _sse(data: dict) -> str:
