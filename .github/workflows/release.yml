@@ -18,6 +18,8 @@ jobs:
       - run: uv run ruff check .
       - run: uv run --extra dev pytest -q
       - run: uv build
+      - run: shasum -a 256 dist/* > dist/SHA256SUMS
+      - run: uv export --locked --no-dev --format requirements-txt > dist/requirements.lock.txt
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: daedalus-dist

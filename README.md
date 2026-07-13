@@ -192,6 +192,11 @@ then load it with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.d
 Keep the API secret in a root-readable environment file or secret manager rather
 than committing it into the plist.
 
+Tagged releases include `SHA256SUMS` and `requirements.lock.txt` alongside the
+wheel and source archive. Verify the checksum before installing an artifact;
+the locked manifest records the exact runtime dependency resolution used for
+that release.
+
 Design lineage: runtime = mlx-lm public primitives (no monkey-patching of internals);
 cache design informed by vllm-mlx and Rapid-MLX (Apache-2.0); prefix-cache semantics
 inspired by baseRT's public C API. The thermal governor exists in none of them.
