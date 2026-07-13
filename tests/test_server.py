@@ -158,9 +158,9 @@ def test_streaming_completion_format(client_and_fakes):
         assert r.headers["content-type"].startswith("text/event-stream")
         raw = "".join(r.iter_text())
 
-    lines = [l for l in raw.split("\n") if l.startswith("data: ")]
+    lines = [line for line in raw.split("\n") if line.startswith("data: ")]
     assert lines[-1] == "data: [DONE]"
-    chunks = [json.loads(l[len("data: ") :]) for l in lines[:-1]]
+    chunks = [json.loads(line[len("data: ") :]) for line in lines[:-1]]
     # First chunk: role delta.
     assert chunks[0]["choices"][0]["delta"] == {"role": "assistant"}
     # Reassembled content.
@@ -477,8 +477,8 @@ def test_streaming_tool_call_deltas():
         },
     ) as r:
         raw = "".join(r.iter_text())
-    lines = [l for l in raw.split("\n") if l.startswith("data: ")]
-    chunks = [json.loads(l[6:]) for l in lines[:-1]]
+    lines = [line for line in raw.split("\n") if line.startswith("data: ")]
+    chunks = [json.loads(line[6:]) for line in lines[:-1]]
 
     tool_chunks = [
         c for c in chunks if "tool_calls" in c["choices"][0]["delta"]
@@ -552,9 +552,9 @@ def test_reasoning_separated_streaming():
     ) as r:
         raw = "".join(r.iter_text())
     lines = [
-        l for l in raw.split("\n") if l.startswith("data: ") and l != "data: [DONE]"
+        line for line in raw.split("\n") if line.startswith("data: ") and line != "data: [DONE]"
     ]
-    chunks = [json.loads(l[6:]) for l in lines]
+    chunks = [json.loads(line[6:]) for line in lines]
     reasoning = "".join(
         c["choices"][0]["delta"].get("reasoning_content", "") for c in chunks
     )

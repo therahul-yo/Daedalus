@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from daedalus.cache.store import PrefixCacheStore, _default_cache_dir, _sanitize_model_key
+from daedalus.cache.store import PrefixCacheStore, _default_cache_dir
 
 
 def _open_store(model_key: str, cache_dir: Path, **kwargs) -> Optional[PrefixCacheStore]:

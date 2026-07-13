@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
 
 from daedalus import audit as audit_logger
 
@@ -150,7 +149,7 @@ def test_endpoint_auth_failure_audits_real_client_ip(tmp_path: Path):
         assert client.get("/metrics").status_code == 401
         assert client.delete("/v1/cache").status_code == 401
 
-    lines = [json.loads(l) for l in log_path.read_text().strip().split("\n")]
+    lines = [json.loads(line) for line in log_path.read_text().strip().split("\n")]
     assert len(lines) == 4
     for rec in lines:
         assert rec["event"] == "auth_failure"

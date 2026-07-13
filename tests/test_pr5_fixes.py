@@ -113,9 +113,9 @@ def test_stop_sequence_truncates_stream():
     )
     assert r.status_code == 200
     chunks = [
-        json.loads(l[6:])
-        for l in r.text.splitlines()
-        if l.startswith("data: ") and l != "data: [DONE]"
+        json.loads(line[6:])
+        for line in r.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
     ]
     content = "".join(
         c["choices"][0]["delta"].get("content", "")
@@ -215,9 +215,9 @@ def test_usage_chunk_only_when_requested():
     # are never empty (OpenCode and friends index choices[0] unguarded).
     r = client.post("/v1/chat/completions", json=body)
     chunks = [
-        json.loads(l[6:])
-        for l in r.text.splitlines()
-        if l.startswith("data: ") and l != "data: [DONE]"
+        json.loads(line[6:])
+        for line in r.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
     ]
     assert all(c.get("choices") for c in chunks)
     assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
@@ -230,9 +230,9 @@ def test_usage_chunk_only_when_requested():
         json={**body, "stream_options": {"include_usage": True}},
     )
     chunks = [
-        json.loads(l[6:])
-        for l in r.text.splitlines()
-        if l.startswith("data: ") and l != "data: [DONE]"
+        json.loads(line[6:])
+        for line in r.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
     ]
     assert chunks[-2]["choices"][0]["finish_reason"] == "stop"
     assert chunks[-2].get("usage") is None

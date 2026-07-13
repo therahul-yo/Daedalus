@@ -152,7 +152,7 @@ def cmd_doctor(args) -> int:
     import platform
     import subprocess
 
-    from daedalus.sensors import ThermalMonitor, make_pressure_reader
+    from daedalus.sensors import make_pressure_reader
 
     hw = subprocess.run(
         ["sysctl", "-n", "machdep.cpu.brand_string", "hw.memsize"],
@@ -189,7 +189,6 @@ def cmd_warm(args) -> int:
     from daedalus.cache.store import PrefixCacheStore
     from daedalus.engine import Engine, EngineConfig
     from daedalus.runtime import cache_identity
-    from daedalus.governor import ThermalGovernor
     from daedalus.sensors import ThermalMonitor
 
     # Validate the prompts file BEFORE the multi-minute model load.

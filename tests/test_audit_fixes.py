@@ -9,7 +9,6 @@ import threading
 import time
 
 import mlx.core as mx
-import pytest
 from fastapi.testclient import TestClient
 from mlx_lm.models.cache import KVCache
 
