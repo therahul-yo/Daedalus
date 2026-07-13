@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v*.*.*'
+      - 'v*'
 
 permissions:
   contents: write
@@ -11,50 +11,50 @@ permissions:
 
 jobs:
   build:
-    name: Build Binary
+    name: Build binary (macos-14)
     runs-on: macos-14
     timeout-minutes: 30
-    outputs:
-      artifact_path: ${{ steps.build.outputs.artifact_path }}
-      sha256: ${{ steps.sha256.outputs.value }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+      - run: uv sync --extra dev --locked
       - name: Install PyInstaller
         run: uv pip install pyinstaller
-      - name: Build binary
-        id: build
+      - name: Build with PyInstaller
         run: |
-          uv run pyinstaller --clean packaging/pyinstaller/daedalus.spec
-          echo "artifact_path=dist/daedalus" >> $GITHUB_OUTPUT
+          uv run pyinstaller --clean --noconfirm packaging/pyinstaller/daedalus.spec
+          ls -la dist/daedalus
+      - name: Verify binary
+        run: |
+          ./dist/daedalus --help
       - name: Compute SHA256
-        id: sha256
+        id: sha
         run: |
           SHA=$(shasum -a 256 dist/daedalus | cut -d' ' -f1)
-          echo "value=$SHA" >> $GITHUB_OUTPUT
-
-  release:
-    name: Create Release
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    needs: build
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Download artifact
-        uses: actions/download-artifact@5f0e7b3f4e5b0e9c2a4d5e6f7a8b9c0d1e2f3a4b # v4
-        with:
-          name: daedalus-binary
-          path: dist/
-      - name: Create Release
-        uses: softprops/action-gh-release@14914a7e7e8c8b7b6c5d4e3f2a1b0c9d8e7f6a5b # v1
+          echo "sha256=$SHA" >> $GITHUB_OUTPUT
+      - name: Upload binary to release
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef0ae4f8 # v2
         with:
           files: dist/daedalus
-          generate_release_notes: true
-      - name: Prepare Homebrew formula update
-        run: |
-          # This step prepares a PR to update the Homebrew formula with the new SHA256
-          # The actual PR creation is manual or requires a PAT with repo scope
-          echo "Release binary uploaded. SHA256: ${{ needs.build.outputs.sha256 }}"
-          echo "Update homebrew-daedalus/Formula/daedalus.rb with:"
-          echo "  sha256 \"${{ needs.build.outputs.sha256 }}\""
-          echo "  url \"https://github.com/nousresearch/daedalus/archive/refs/tags/${{ github.ref_name }}.tar.gz\""
+          body: |
+            Binary built from ${{ github.sha }}
+
+            SHA256: ${{ steps.sha.outputs.sha256 }}
+
+  homebrew:
+    name: Update Homebrew formula
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.repository == 'nousresearch/daedalus'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Update Homebrew formula
+        uses: mislav/bump-homebrew-formula-action@v3
+        with:
+          formula-name: daedalus
+          formula-file: Formula/daedalus.rb
+          download-url: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/daedalus
+          sha256: ${{ needs.build.outputs.sha256 }}
+        env:
+          COMMITTER_TOKEN: ${{ secrets.GITHUB_TOKEN }}
