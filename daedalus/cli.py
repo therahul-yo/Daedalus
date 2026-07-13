@@ -88,6 +88,30 @@ def cmd_serve(args) -> int:
         return 1
     load_s = time.monotonic() - t0
 
+    # Preload swap-eligible models so a hot-swap never blocks on a download.
+    model_specs: dict = {}
+    for swap_id in args.swap_model:
+        try:
+            swap_eng = Engine.from_pretrained(
+                swap_id, monitor=monitor, governor=governor,
+                config=EngineConfig(kv_bits=args.kv_bits or None,
+                                    prefill_chunk_tokens=args.prefill_chunk_tokens),
+            )
+            swap_cache_key = cache_identity(
+                swap_id, kv_bits=args.kv_bits or None,
+                tokenizer_id=getattr(swap_eng.tokenizer, "name_or_path", swap_id),
+                model_revision=args.model_revision, draft_model=args.draft_model,
+            )
+            swap_store = PrefixCacheStore(
+                swap_cache_key,
+                max_ram_bytes=args.cache_ram_mb * 1024**2 if args.cache_ram_mb else None,
+                max_disk_bytes=args.cache_disk_gb * 1024**3, exclusive=True,
+            )
+            model_specs[swap_id] = (swap_eng, swap_store, swap_id)
+            log.info("preloaded swap model %s", swap_id)
+        except Exception as exc:
+            log.warning("could not preload swap model %s: %s", swap_id, exc)
+
     import mlx.core as mx
 
     cache_key = cache_identity(
@@ -119,6 +143,7 @@ def cmd_serve(args) -> int:
         audit_log_path=args.audit_log,
         cors_origins=args.cors_origins,
         global_rps=args.global_rps,
+        model_specs=model_specs or None,
     )
 
     bar = "─" * 62
@@ -297,7 +322,12 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     serve = sub.add_parser("serve", help="run the OpenAI-compatible server")
-    serve.add_argument("--model", required=True)
+    serve.add_argument("--model", required=True,
+                       help="default model id/path (also the resident model at startup)")
+    serve.add_argument("--swap-model", action="append", default=[],
+                       metavar="MODEL",
+                       help="additional model id/path the server may hot-swap to on request "
+                            "(repeatable); unknown models in a request still return 404")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8080)
     serve.add_argument(

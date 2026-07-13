@@ -63,6 +63,117 @@ CHECKPOINT_MIN_JOB_TOKENS = 8192
 CHECKPOINT_MIN_INTERVAL_S = 8.0
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Multi-model: memory profiles + admission (16GB M4 Air, swap-only)
+# ──────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class ModelProfile:
+    """Memory profile for a single model.
+
+    Sizes are derived from the checkpoint on disk (exact, zero maintenance);
+    see ``derive_model_profile``. The built-ins below are fallbacks / known
+    hybrid-architecture overrides (where KV only grows on the GQA layers).
+    """
+    model_id: str
+    weights_gb: float
+    kv_gb_per_8k: float
+    kv_gb_per_32k: float
+    context_growing_layers: int = 0
+    total_layers: int = 0
+    hidden_size: int = 0
+    num_attention_heads: int = 0
+
+    def kv_gb(self, context_tokens: int) -> float:
+        """KV cache size at k8v8 for a given context length."""
+        if context_tokens <= 8192:
+            return self.kv_gb_per_8k * (context_tokens / 8192)
+        return self.kv_gb_per_8k * (context_tokens / 8192)
+
+    def total_gb(self, context_tokens: int) -> float:
+        """Total RAM footprint: weights + KV + 0.5GB Metal cache high-water."""
+        return self.weights_gb + self.kv_gb(context_tokens) + 0.5
+
+
+# 16GB M4 Air: 3.5 (macOS/system) + 0.8 (process) + 1.0 (safety) = 5.3 reserved
+# Usable ceiling for (weights + KV) of the active model: 10.7 GB.
+MODEL_MEMORY_CEILING_GB = 10.7
+# Extra headroom kept free during a swap so both engines are never resident.
+SWAP_SAFETY_GB = 1.0
+
+# Known profiles (overrides for hybrid archs where only some layers grow).
+MODEL_PROFILES: dict[str, ModelProfile] = {
+    "qwen3.5-9b": ModelProfile(
+        model_id="qwen3.5-9b", weights_gb=5.2, kv_gb_per_8k=0.65, kv_gb_per_32k=2.6,
+        context_growing_layers=8, total_layers=32, hidden_size=3584, num_attention_heads=28,
+    ),
+    "qwen-7b": ModelProfile(
+        model_id="qwen-7b", weights_gb=4.7, kv_gb_per_8k=0.58, kv_gb_per_32k=2.3,
+        context_growing_layers=28, total_layers=28, hidden_size=3584, num_attention_heads=28,
+    ),
+    "qwen-3b": ModelProfile(
+        model_id="qwen-3b", weights_gb=1.9, kv_gb_per_8k=0.24, kv_gb_per_32k=0.94,
+        context_growing_layers=24, total_layers=24, hidden_size=2048, num_attention_heads=16,
+    ),
+}
+
+
+def derive_model_profile(model_id: str, model_path: str) -> ModelProfile:
+    """Derive a model's memory profile from the checkpoint on disk.
+
+    Exact weights come from the safetensors index header; KV is estimated
+    from ``num_hidden_layers`` (conservative for hybrid models — overcounts
+    the constant-state layers, which is the safe direction). Built-in hybrid
+    profiles (e.g. qwen3.5-9b) take precedence and are exact.
+    """
+    if model_id in MODEL_PROFILES:
+        return MODEL_PROFILES[model_id]
+    try:
+        cfg = Path(model_path) / "config.json"
+        if cfg.exists():
+            config = json.loads(cfg.read_text())
+            n_layers = int(config.get("num_hidden_layers", 0))
+            hidden = int(config.get("hidden_size", 0))
+            n_heads = max(int(config.get("num_attention_heads", 1)), 1)
+            import glob
+            total = 0
+            for sf in glob.glob(str(Path(model_path) / "*.safetensors")):
+                with open(sf, "rb") as f:
+                    n = int.from_bytes(f.read(8), "little")
+                    header = json.loads(f.read(n))
+                for k, v in header.items():
+                    if k == "__metadata__":
+                        continue
+                    total += v["data_offsets"][1] - v["data_offsets"][0]
+            weights_gb = total / 1e9
+            kv_per_8k = (2 * n_layers * (hidden // n_heads) * 8192) / 1e9
+            return ModelProfile(
+                model_id, weights_gb, kv_per_8k, kv_per_8k * 4,
+                n_layers, n_layers, hidden, n_heads,
+            )
+    except Exception:
+        pass
+    return ModelProfile(model_id, 5.0, 0.6, 2.4)
+
+
+def model_fits(
+    candidate: ModelProfile,
+    active: Optional[ModelProfile],
+    max_prompt_tokens: int,
+) -> "tuple[bool, float, float]":
+    """Whether ``candidate`` can be admitted given the ``active`` model.
+
+    Returns (fits, available_gb, required_gb).
+    """
+    required = candidate.total_gb(max_prompt_tokens)
+    if active is not None:
+        available = MODEL_MEMORY_CEILING_GB - active.total_gb(max_prompt_tokens)
+    else:
+        available = MODEL_MEMORY_CEILING_GB
+    # Need SWAP_SAFETY_GB free so both engines are never resident at once.
+    return available >= required + SWAP_SAFETY_GB, available, required
+
+
 class RequestIdMiddleware(BaseHTTPMiddleware):
     """Middleware to extract and propagate X-Request-ID header through all log lines."""
 
@@ -131,6 +242,69 @@ class ServerState:
     cors_allow_credentials: bool = False
     in_flight_requests: int = 0
     in_flight_lock: threading.Lock = field(default_factory=threading.Lock)
+    # ── multi-model swap-only state ───────────────────────────────────────
+    # Map of model_id -> (engine, store, token_cache, head_cache, profile).
+    # Only one engine is ever resident (16GB M4); the active entry is mirrored
+    # into the fields above and swapped atomically behind ``lock``.
+    models: dict[str, "tuple[Engine, PrefixCacheStore, PromptTokenCache, SharedHeadIndex, ModelProfile]"] = field(default_factory=dict)
+    # Models the server will hot-swap to (beyond the default). Unknown -> 404.
+    served_models: set[str] = field(default_factory=set)
+    model_paths: dict[str, str] = field(default_factory=dict)
+    swap_cooldown_seconds: float = 30.0
+    _last_swap_time: float = 0.0
+    swap_lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def register_model(self, model_id: str, model_path: str) -> None:
+        """Mark ``model_id`` as a swap-eligible served model (CLI --model)."""
+        self.served_models.add(model_id)
+        if model_path:
+            self.model_paths[model_id] = model_path
+
+    def swap_model(self, model_id: str) -> "tuple[bool, str]":
+        """Hot-swap to ``model_id`` if admitted.
+
+        Returns (success, message). On success, ``engine``/``store``/caches on
+        this state object are repointed at the swapped-in model; in-flight
+        requests (which already captured ``state`` and the old engine) finish
+        on the old engine, then acquire ``lock`` and see the new one.
+        """
+        if model_id == self.model_id:
+            return True, "already active"
+        if model_id not in self.served_models:
+            return False, f"model {model_id!r} is not served (register with --model)"
+        if model_id not in self.models:
+            return False, f"model {model_id!r} not loaded (pre-load with --model)"
+
+        now = time.monotonic()
+        if now - self._last_swap_time < self.swap_cooldown_seconds:
+            wait = self.swap_cooldown_seconds - (now - self._last_swap_time)
+            return False, f"swap cooldown active: retry after {wait:.0f}s"
+
+        with self.swap_lock:
+            # Re-check after taking the lock (swap may have completed elsewhere).
+            if model_id == self.model_id:
+                return True, "already active"
+            eng, store, tok_cache, head_cache, profile = self.models[model_id]
+            active_profile = self.models[self.model_id][4] if self.model_id in self.models else None
+            fits, available, required = model_fits(profile, active_profile, self.max_prompt_tokens)
+            if not fits:
+                return False, (
+                    f"model {model_id!r} needs {required:.1f} GB (weights+KV), "
+                    f"only {available:.1f} GB free; unload current model first"
+                )
+            # Guard the swap: no request may be mid-engine while we repoint.
+            self.lock.acquire_for_swap()
+            try:
+                self.engine = eng
+                self.store = store
+                self.token_cache = tok_cache
+                self.head_cache = head_cache
+                self.model_id = model_id
+            finally:
+                self.lock.release_after_swap()
+            self._last_swap_time = now
+            audit_logger.model_swap(self.model_id, model_id)
+            return True, "swapped"
 
     def try_admit(self) -> bool:
         with self.maintenance_lock:
@@ -432,6 +606,7 @@ def create_app(
     shutdown_timeout: float = 30.0,
     cors_origins: Optional[List[str]] = None,
     cors_allow_credentials: bool = False,
+    model_specs: Optional[dict[str, "tuple[Engine, PrefixCacheStore, str]"]] = None,
 ) -> FastAPI:
     if max_pending_requests < 1:
         raise ValueError("max_pending_requests must be at least 1")
@@ -470,6 +645,24 @@ def create_app(
         cors_origins=cors_origins or [],
         cors_allow_credentials=cors_allow_credentials,
     )
+    # Register the default model so single-model mode is a subset of the
+    # swap path: admission math and /v1/models just work.
+    state.models[model_id] = (engine, store, state.token_cache, state.head_cache,
+                              derive_model_profile(model_id, model_path=model_id))
+    state.served_models.add(model_id)
+    state.model_paths[model_id] = model_id
+    # Pre-registered swap models (CLI --model, or tests). Each spec is
+    # (engine, store, model_path). Their token/head caches are created here
+    # so each model gets a fully isolated cache namespace.
+    for spec_id, (spec_eng, spec_store, spec_path) in (model_specs or {}).items():
+        spec_tok = PromptTokenCache(token_cache_entries)
+        spec_head = SharedHeadIndex()
+        state.models[spec_id] = (
+            spec_eng, spec_store, spec_tok, spec_head,
+            derive_model_profile(spec_id, model_path=spec_path),
+        )
+        state.served_models.add(spec_id)
+        state.model_paths[spec_id] = spec_path
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -639,7 +832,15 @@ def create_app(
             if not isinstance(requested_model, str):
                 return error("model must be a string", 400)
             if requested_model != state.model_id:
-                return error(f"model {requested_model!r} is not served", 404, "model_not_found")
+                # Build on #17's validation: unknown model -> 404.
+                if requested_model not in state.served_models:
+                    return error(f"model {requested_model!r} is not served", 404, "model_not_found")
+                # Registered but not the resident model: attempt a hot-swap.
+                ok, msg = state.swap_model(requested_model)
+                if not ok:
+                    # Over budget / cooldown -> 409 with detail (not 404).
+                    return error(msg, 409, "model_swap_conflict")
+                # On success state.model_id is now requested_model; continue.
         messages = body.get("messages", [])
         if not isinstance(messages, list) or not messages:
             return error("messages must be a non-empty array", 400)
