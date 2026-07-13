@@ -86,6 +86,7 @@ class Engine:
         governor: ThermalGovernor,
         config: Optional[EngineConfig] = None,
         draft_model: Optional[Any] = None,
+        monitor: Optional[ThermalMonitor] = None,
         clock: Callable[[], float] = time.perf_counter,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -94,6 +95,7 @@ class Engine:
         self.governor = governor
         self.config = config or EngineConfig()
         self.draft_model = draft_model
+        self.monitor = monitor
         self._clock = clock
         self._sleep = sleep
 
@@ -124,7 +126,15 @@ class Engine:
         if governor is None:
             monitor = (monitor or ThermalMonitor()).start()
             governor = ThermalGovernor(monitor)
-        return cls(model, tokenizer, governor, config, draft_model=draft_model)
+        return cls(
+            model, tokenizer, governor, config, draft_model=draft_model,
+            monitor=monitor,
+        )
+
+    def close(self) -> None:
+        """Release engine-owned background resources when the app stops."""
+        if self.monitor is not None:
+            self.monitor.stop()
 
     def make_cache(self) -> List[Any]:
         cache = cache_mod.make_prompt_cache(self.model)

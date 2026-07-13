@@ -67,6 +67,7 @@ def cmd_serve(args) -> int:
     try:
         engine = Engine.from_pretrained(
             args.model,
+            monitor=monitor,
             governor=governor,
             config=EngineConfig(
                 kv_bits=args.kv_bits or None,

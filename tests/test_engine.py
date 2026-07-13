@@ -273,3 +273,17 @@ def test_governor_shrinks_chunks_when_pressure_rises_mid_prefill():
     engine.paced_prefill(tokens, cache_for(model), progress_cb=heat_up)
     assert 2048 in model.chunk_sizes  # started nominal
     assert model.chunk_sizes[-1] <= 512  # ended paced
+
+
+def test_engine_close_stops_attached_monitor():
+    class Monitor:
+        def __init__(self):
+            self.stopped = 0
+
+        def stop(self):
+            self.stopped += 1
+
+    monitor = Monitor()
+    engine = Engine(None, None, None, monitor=monitor)
+    engine.close()
+    assert monitor.stopped == 1

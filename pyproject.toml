@@ -4,7 +4,8 @@ version = "0.0.1"
 description = "MacBook-Air-first MLX inference engine: thermally-governed prefill, persistent prefix cache, OpenAI-compatible server"
 readme = "README.md"
 requires-python = ">=3.12"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 dependencies = [
     "mlx>=0.29",
     "mlx-lm>=0.31",

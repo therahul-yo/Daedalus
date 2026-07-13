@@ -226,6 +226,34 @@ def test_request_validation(client_and_fakes):
     ).status_code == 400
 
 
+def test_request_shape_validation(client_and_fakes):
+    client, _, _ = client_and_fakes
+    base = {"messages": [{"role": "user", "content": "x"}]}
+    assert client.post("/v1/chat/completions", json={**base, "stop": ["ok", 1]}).status_code == 400
+    assert client.post("/v1/chat/completions", json={**base, "tools": {}}).status_code == 400
+    assert client.post(
+        "/v1/chat/completions",
+        json={**base, "tools": [{"type": "function", "function": {"name": ""}}]},
+    ).status_code == 400
+    missing = client.post("/v1/chat/completions", json={**base, "model": "other"})
+    assert missing.status_code == 404
+    assert missing.json()["error"]["type"] == "model_not_found"
+
+
+def test_request_body_limit_is_enforced_after_reading(client_and_fakes):
+    client, engine, store = client_and_fakes
+    app = create_app(engine, store, model_id="test-model", max_request_bytes=16)
+    limited = TestClient(app)
+    # The body is intentionally larger than the configured cap.  The server
+    # re-counts streamed bytes; Content-Length is only an early rejection.
+    response = limited.post(
+        "/v1/chat/completions",
+        content=b'{"messages":[{"role":"user","content":"long"}]}',
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 413
+
+
 def test_api_key_protects_v1_endpoints():
     engine, store = FakeEngine(), FakeStore()
     client = TestClient(create_app(engine, store, model_id="test-model", api_key="secret"))
