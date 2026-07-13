@@ -12,6 +12,7 @@ import argparse
 import json
 import platform
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -33,6 +34,8 @@ def main():
     ap.add_argument("--governor", choices=["on", "off"], default="on")
     ap.add_argument("--kv-bits", type=int, default=8)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--trial", type=int, default=1,
+                    help="repeat identifier recorded in the benchmark artifact")
     ap.add_argument("--metal-capture", default=None,
                     help="write an MLX Metal capture to this path for Xcode analysis")
     args = ap.parse_args()
@@ -109,6 +112,7 @@ def main():
     prefill_wall = chunk_events[-1]["t"] if chunk_events else 0.0
 
     result = {
+        "schema_version": 2,
         "config": {
             "model": args.model,
             "governor": args.governor,
@@ -116,11 +120,19 @@ def main():
             "prompt_tokens": len(tokens),
             "max_tokens": args.max_tokens,
             "machine": platform.machine(),
+            "macos": platform.mac_ver()[0],
+            "python": platform.python_version(),
+            "trial": args.trial,
+            "cache_mode": "cold",
             "hw": subprocess.run(
                 ["sysctl", "-n", "machdep.cpu.brand_string"],
                 capture_output=True,
                 text=True,
             ).stdout.strip(),
+        },
+        "software": {
+            "mlx": getattr(__import__("mlx.core", fromlist=["__version__"]), "__version__", "unknown"),
+            "mlx_lm": getattr(__import__("mlx_lm"), "__version__", "unknown"),
         },
         "metrics": {
             "ttft_s": round(ttft or -1, 3),
