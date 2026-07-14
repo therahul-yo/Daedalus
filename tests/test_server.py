@@ -158,9 +158,9 @@ def test_streaming_completion_format(client_and_fakes):
         assert r.headers["content-type"].startswith("text/event-stream")
         raw = "".join(r.iter_text())
 
-    lines = [l for l in raw.split("\n") if l.startswith("data: ")]
+    lines = [line for line in raw.split("\n") if line.startswith("data: ")]
     assert lines[-1] == "data: [DONE]"
-    chunks = [json.loads(l[len("data: ") :]) for l in lines[:-1]]
+    chunks = [json.loads(line[len("data: ") :]) for line in lines[:-1]]
     # First chunk: role delta.
     assert chunks[0]["choices"][0]["delta"] == {"role": "assistant"}
     # Reassembled content.
@@ -238,6 +238,27 @@ def test_request_shape_validation(client_and_fakes):
     missing = client.post("/v1/chat/completions", json={**base, "model": "other"})
     assert missing.status_code == 404
     assert missing.json()["error"]["type"] == "model_not_found"
+
+
+def test_non_finite_sampling_and_zero_max_tokens_are_rejected(client_and_fakes):
+    client, _, _ = client_and_fakes
+    body = {"messages": [{"role": "user", "content": "x"}]}
+    assert client.post("/v1/chat/completions", json={**body, "max_tokens": 0}).status_code == 400
+    assert client.post("/v1/chat/completions", json={**body, "temperature": "nan"}).status_code == 400
+    assert client.post("/v1/chat/completions", json={**body, "temperature": "inf"}).status_code == 400
+
+
+def test_model_context_limit_rejects_impossible_completion():
+    engine, store = FakeEngine(), FakeStore()
+    client = TestClient(create_app(
+        engine, store, model_id="test-model", model_context_tokens=10,
+    ))
+    response = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "too long"}], "max_tokens": 5},
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["message"].startswith("prompt plus completion")
 
 
 def test_request_body_limit_is_enforced_after_reading(client_and_fakes):
@@ -348,6 +369,35 @@ def test_memory_guard_evicts_cache_then_rejects_when_still_over_limit():
     assert store.trimmed
 
 
+def test_predictive_kv_memory_guard_rejects_before_prefill():
+    class Model:
+        config = {
+            "num_hidden_layers": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+        }
+
+    class MemoryEngine(FakeEngine):
+        model = Model()
+
+        class config:
+            kv_bits = 8
+
+        def active_memory_bytes(self):
+            return 90
+
+    engine, store = MemoryEngine(), FakeStore()
+    client = TestClient(create_app(
+        engine, store, model_id="test-model", max_active_memory_bytes=100,
+    ))
+    response = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], "max_tokens": 10},
+    )
+    assert response.status_code == 503
+    assert not engine.generate_calls
+
+
 def test_server_enforces_prompt_and_completion_limits():
     engine, store = FakeEngine(), FakeStore()
     client = TestClient(create_app(
@@ -367,6 +417,23 @@ def test_server_rate_limit():
     payload = {"messages": [{"role": "user", "content": "hi"}]}
     assert client.post("/v1/chat/completions", json=payload).status_code == 200
     assert client.post("/v1/chat/completions", json=payload).status_code == 429
+
+
+def test_trusted_proxy_can_supply_distinct_rate_limit_clients():
+    engine, store = FakeEngine(), FakeStore()
+    client = TestClient(create_app(
+        engine, store, model_id="test-model", requests_per_minute=1,
+        trusted_proxy_hosts=["testclient"],
+    ))
+    payload = {"messages": [{"role": "user", "content": "hi"}]}
+    assert client.post(
+        "/v1/chat/completions", json=payload,
+        headers={"X-Forwarded-For": "10.0.0.1"},
+    ).status_code == 200
+    assert client.post(
+        "/v1/chat/completions", json=payload,
+        headers={"X-Forwarded-For": "10.0.0.2, testclient"},
+    ).status_code == 200
 
 
 def test_server_rejects_oversized_content_length():
@@ -427,8 +494,8 @@ def test_streaming_tool_call_deltas():
         },
     ) as r:
         raw = "".join(r.iter_text())
-    lines = [l for l in raw.split("\n") if l.startswith("data: ")]
-    chunks = [json.loads(l[6:]) for l in lines[:-1]]
+    lines = [line for line in raw.split("\n") if line.startswith("data: ")]
+    chunks = [json.loads(line[6:]) for line in lines[:-1]]
 
     tool_chunks = [
         c for c in chunks if "tool_calls" in c["choices"][0]["delta"]
@@ -502,9 +569,9 @@ def test_reasoning_separated_streaming():
     ) as r:
         raw = "".join(r.iter_text())
     lines = [
-        l for l in raw.split("\n") if l.startswith("data: ") and l != "data: [DONE]"
+        line for line in raw.split("\n") if line.startswith("data: ") and line != "data: [DONE]"
     ]
-    chunks = [json.loads(l[6:]) for l in lines]
+    chunks = [json.loads(line[6:]) for line in lines]
     reasoning = "".join(
         c["choices"][0]["delta"].get("reasoning_content", "") for c in chunks
     )

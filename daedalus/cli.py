@@ -106,6 +106,7 @@ def cmd_serve(args) -> int:
         max_ram_bytes=args.cache_ram_mb * 1024**2 if args.cache_ram_mb else None,
         max_disk_bytes=args.cache_disk_gb * 1024**3,
         exclusive=True,
+        cache_ttl_days=args.cache_ttl_days,
     )
 
     def load_swap_model(swap_id: str):
@@ -146,6 +147,8 @@ def cmd_serve(args) -> int:
         audit_log_path=args.audit_log,
         cors_origins=args.cors_origins,
         global_rps=args.global_rps,
+        shutdown_timeout=args.shutdown_timeout,
+        trusted_proxy_hosts=args.trusted_proxy_hosts,
         model_paths={swap_id: swap_id for swap_id in args.swap_model},
         model_loader=load_swap_model if args.swap_model else None,
     )
@@ -174,6 +177,70 @@ def cmd_serve(args) -> int:
         uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
     finally:
         monitor.stop()
+    return 0
+
+
+def render_status(health: dict, ready: dict, cache: dict) -> str:
+    """Pure formatter for ``daedalus status`` (kept side-effect-free for tests)."""
+    bar = "─" * 62
+    ready_line = ready.get("status", "unknown")
+    if "pending_requests" in ready:
+        ready_line += (
+            f" · {ready['pending_requests']}/{ready.get('max_pending_requests', '?')}"
+            f" requests · queue depth {ready.get('queue_depth', 0)}"
+        )
+    lines = [
+        bar,
+        f"  status   {health.get('status', 'unknown')}"
+        + (f" · {health['model']}" if health.get("model") else ""),
+        f"  ready    {ready_line}",
+    ]
+    if health.get("thermal"):
+        lines.append(f"  thermal  {health['thermal']}")
+    if health.get("active_memory_bytes"):
+        lines.append(f"  memory   {health['active_memory_bytes'] / 1e9:.2f} GB active")
+    if cache:
+        hits, misses = cache.get("hits", 0), cache.get("misses", 0)
+        rate = f" · {100 * hits / (hits + misses):.0f}% hit rate" if hits + misses else ""
+        lines.append(
+            f"  cache    {cache.get('entries', 0)} entries"
+            f" ({cache.get('resident_entries', 0)} in RAM,"
+            f" {cache.get('resident_bytes', 0) / 1e9:.2f} GB){rate}"
+        )
+    lines.append(bar)
+    return "\n".join(lines)
+
+
+def cmd_status(args) -> int:
+    """Show a running server's health, readiness, and cache state."""
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    base = f"http://{args.host}:{args.port}"
+    headers = {"Authorization": f"Bearer {args.api_key}"} if args.api_key else {}
+
+    def get(path: str) -> dict:
+        req = urllib.request.Request(base + path, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return _json.load(r)
+        except urllib.error.HTTPError as exc:
+            # readyz returns 503 with a JSON body while busy — still status.
+            if exc.code == 503:
+                try:
+                    return _json.load(exc)
+                except Exception:
+                    pass
+            return {}
+        except Exception:
+            return {}
+
+    health = get("/health")
+    if not health:
+        print(f"error: no daedalus server responding at {base}", flush=True)
+        return 1
+    print(render_status(health, get("/readyz"), get("/v1/cache/stats")), flush=True)
     return 0
 
 
@@ -355,6 +422,10 @@ def main() -> int:
         help="disk budget for prefix cache in GiB (default: 10)",
     )
     serve.add_argument(
+        "--cache-ttl-days", type=int,
+        help="evict persisted cache entries older than this many days at startup",
+    )
+    serve.add_argument(
         "--max-active-memory-gb", type=float,
         help="reject new work after cache eviction if MLX active memory exceeds this limit",
     )
@@ -363,6 +434,10 @@ def main() -> int:
     serve.add_argument("--requests-per-minute", type=int, default=0,
                        help="per-client LAN limit; 0 disables rate limiting")
     serve.add_argument("--max-request-bytes", type=int, default=2 * 1024 * 1024)
+    serve.add_argument(
+        "--shutdown-timeout", type=float, default=30.0,
+        help="seconds to drain active work before server shutdown closes resources",
+    )
     serve.add_argument(
         "--audit-log",
         help="path to a structured (NDJSON) audit log for auth failures, rate-limit events, and cache-admin operations",
@@ -410,6 +485,10 @@ def main() -> int:
         help="permitted CORS origin; repeat for multiple origins",
     )
     serve.add_argument(
+        "--trusted-proxy-host", action="append", dest="trusted_proxy_hosts", default=None,
+        help="proxy peer IP/hostname allowed to supply X-Forwarded-For; repeat as needed",
+    )
+    serve.add_argument(
         "--global-rps", type=float, default=0.0,
         help="global rate limit across all clients in requests per second (0 = disabled)",
     )
@@ -417,6 +496,12 @@ def main() -> int:
 
     doctor = sub.add_parser("doctor", help="check thermal sensor + mlx setup")
     doctor.set_defaults(fn=cmd_doctor)
+
+    status = sub.add_parser("status", help="show a running server's health, queue, and cache state")
+    status.add_argument("--host", default="127.0.0.1")
+    status.add_argument("--port", type=int, default=8080)  # matches serve's default
+    status.add_argument("--api-key", help="bearer key for a key-protected server (unlocks full diagnostics)")
+    status.set_defaults(fn=cmd_status)
 
     warm = sub.add_parser("warm", help="pre-prefill prompts into the cache")
     warm.add_argument("--model", required=True)
@@ -446,6 +531,8 @@ def main() -> int:
             ap.error("--cache-ram-mb must be positive")
         if args.cache_disk_gb < 1:
             ap.error("--cache-disk-gb must be positive")
+        if args.cache_ttl_days is not None and args.cache_ttl_days < 1:
+            ap.error("--cache-ttl-days must be positive")
         if args.host not in {"127.0.0.1", "::1", "localhost"} and not args.api_key:
             if not args.api_key_env and not args.api_key_file:
                 ap.error("an API key source is required when binding outside localhost")
@@ -461,6 +548,8 @@ def main() -> int:
             ap.error("--requests-per-minute cannot be negative")
         if args.max_request_bytes < 1:
             ap.error("--max-request-bytes must be positive")
+        if args.shutdown_timeout <= 0:
+            ap.error("--shutdown-timeout must be positive")
         if args.num_draft_tokens < 0:
             ap.error("--num-draft-tokens cannot be negative")
         if args.num_draft_tokens and not args.draft_model:

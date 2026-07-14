@@ -5,7 +5,7 @@ import pytest
 
 import daedalus.engine as engine_module
 from daedalus.engine import Engine, EngineConfig, PrefillAborted
-from daedalus.governor import GovernorConfig, LevelPolicy, ThermalGovernor
+from daedalus.governor import GovernorConfig, ThermalGovernor
 from daedalus.sensors import ThermalLevel, ThermalMonitor
 
 

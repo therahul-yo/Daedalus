@@ -11,43 +11,76 @@ permissions:
 
 jobs:
   build:
-    name: Build binary (macos-14)
+    name: Build and publish (macos-14)
     runs-on: macos-14
     timeout-minutes: 30
+    outputs:
+      # Empty when the standalone binary didn't build; the homebrew job is
+      # gated on this so it no-ops rather than publishing a bad formula.
+      binary_sha256: ${{ steps.sha.outputs.sha256 }}
     steps:
       # Actions pinned to commit SHAs: mutable tags are a supply-chain risk.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
       - run: uv sync --extra dev --locked
-      - name: Install PyInstaller
-        run: uv pip install pyinstaller
-      - name: Build with PyInstaller
+      - run: uv run ruff check .
+      - run: uv run --extra dev pytest -q --timeout=120
+
+      # The wheel + sdist are the primary, verified install path
+      # (uv tool install / pipx). These always build and gate the release.
+      - name: Build wheel and sdist
+        run: uv build
+
+      # Standalone PyInstaller binary is best-effort: MLX ships @rpath-linked
+      # native libs (libmlx/libjaccl) that don't survive PyInstaller's
+      # flattening without dedicated rpath rewriting. Don't let a broken
+      # binary block a release whose wheel install works.
+      - name: Build standalone binary (best-effort)
+        id: pyinstaller
+        continue-on-error: true
         run: |
+          uv pip install pyinstaller
           uv run pyinstaller --clean --noconfirm packaging/pyinstaller/daedalus.spec
-          ls -la dist/daedalus
-      - name: Verify binary
-        run: |
           ./dist/daedalus --help
-      - name: Compute SHA256
+          echo "built=true" >> "$GITHUB_OUTPUT"
+
+      - name: Compute binary SHA256
         id: sha
+        if: steps.pyinstaller.outputs.built == 'true'
+        run: echo "sha256=$(shasum -a 256 dist/daedalus | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Release integrity artifacts
         run: |
-          SHA=$(shasum -a 256 dist/daedalus | cut -d' ' -f1)
-          echo "sha256=$SHA" >> $GITHUB_OUTPUT
-      - name: Upload binary to release
+          cd dist
+          shasum -a 256 *.whl *.tar.gz $( [ -f daedalus ] && echo daedalus ) > SHA256SUMS
+          cd ..
+          uv export --locked --no-dev --format requirements-txt > dist/requirements.lock.txt
+
+      - name: Publish release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          files: dist/daedalus
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/SHA256SUMS
+            dist/requirements.lock.txt
+            dist/daedalus
+          fail_on_unmatched_files: false
           body: |
-            Binary built from ${{ github.sha }}
+            Install: `uv tool install daedalus-${{ github.ref_name }}-py3-none-any.whl`
+            (or `pipx install` the wheel). Requires an Apple Silicon Mac with MLX.
 
-            SHA256: ${{ steps.sha.outputs.sha256 }}
+            Artifacts verified in CI: ruff, full test suite, wheel/sdist build.
+            The standalone binary is best-effort and may be absent.
 
   homebrew:
     name: Update Homebrew formula
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    if: github.repository == 'therahul-yo/daedalus'
+    # Only when this is the canonical repo AND a standalone binary was
+    # actually produced (otherwise there is nothing for the formula to point at).
+    if: github.repository == 'therahul-yo/daedalus' && needs.build.outputs.binary_sha256 != ''
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Update Homebrew formula
@@ -56,6 +89,6 @@ jobs:
           formula-name: daedalus
           formula-file: Formula/daedalus.rb
           download-url: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/daedalus
-          sha256: ${{ needs.build.outputs.sha256 }}
+          sha256: ${{ needs.build.outputs.binary_sha256 }}
         env:
           COMMITTER_TOKEN: ${{ secrets.GITHUB_TOKEN }}

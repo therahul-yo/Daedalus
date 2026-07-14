@@ -19,8 +19,8 @@ Flow for one request:
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
-from typing import Any, Callable, Generator, Iterable, List, Optional
+from dataclasses import dataclass
+from typing import Any, Callable, Generator, List, Optional
 
 import mlx.core as mx
 from mlx_lm.generate import (

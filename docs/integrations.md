@@ -28,6 +28,9 @@ that optional field.
 1. Run with `--host 127.0.0.1 --api-key-env DAEDALUS_API_KEY`.
 2. Terminate TLS in Caddy, nginx, or another local reverse proxy.
 3. Restrict the proxy to the intended LAN/VPN and forward the Authorization
-   header unchanged.
-4. Scrape `/metrics`, probe `/health` and `/readyz`, and set a conservative
+   header unchanged. If rate limits should distinguish downstream clients,
+   pass the proxy's peer address with `--trusted-proxy-host`; Daedalus ignores
+   `X-Forwarded-For` from every other peer.
+4. Consider `--cache-ttl-days 30` for a long-running shared machine. Scrape
+   `/metrics`, probe `/health` and `/readyz`, and set a conservative
    `--max-active-memory-gb` limit.

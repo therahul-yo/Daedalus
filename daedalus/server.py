@@ -26,6 +26,7 @@ import contextvars
 import hmac
 import json
 import logging
+import math
 import threading
 import time
 import uuid
@@ -213,6 +214,19 @@ class GlobalRateLimiter:
             return False
 
 
+class ClientRateLimiter(GlobalRateLimiter):
+    """A per-client token bucket with a bounded, pruneable lifetime."""
+
+    def __init__(self, requests_per_minute: int):
+        super().__init__(requests_per_minute / 60.0, burst=requests_per_minute)
+        self.last_seen = time.monotonic()
+
+    def try_acquire(self) -> bool:
+        allowed = super().try_acquire()
+        self.last_seen = time.monotonic()
+        return allowed
+
+
 @dataclass
 class ServerState:
     engine: Engine
@@ -235,12 +249,13 @@ class ServerState:
     max_prompt_tokens: int = 65536
     max_completion_tokens: int = 4096
     requests_per_minute: int = 0
-    rate_windows: dict[str, tuple[float, int]] = None
+    client_rate_limiters: dict[str, ClientRateLimiter] = None
     max_request_bytes: int = 2 * 1024 * 1024
     global_rate_limiter: Optional[GlobalRateLimiter] = None
     shutdown_timeout: float = 30.0
     cors_origins: List[str] = field(default_factory=list)
     cors_allow_credentials: bool = False
+    trusted_proxy_hosts: frozenset[str] = field(default_factory=frozenset)
     in_flight_requests: int = 0
     in_flight_lock: threading.Lock = field(default_factory=threading.Lock)
     # ── multi-model swap-only state ───────────────────────────────────────
@@ -359,7 +374,7 @@ class ServerState:
         with self.admission_lock:
             self.admitted_requests = max(0, self.admitted_requests - 1)
 
-    def memory_available(self) -> bool:
+    def memory_available(self, reserve_bytes: int = 0) -> bool:
         if self.max_active_memory_bytes is None:
             return True
         try:
@@ -374,31 +389,33 @@ class ServerState:
             pass
 
         active = getattr(self.engine, "active_memory_bytes", lambda: 0)()
-        if active < self.max_active_memory_bytes:
+        if active + reserve_bytes < self.max_active_memory_bytes:
             return True
         trim = getattr(self.store, "trim_ram", None)
         if trim:
             trim(0)
-        return getattr(self.engine, "active_memory_bytes", lambda: 0)() < self.max_active_memory_bytes
+        return (
+            getattr(self.engine, "active_memory_bytes", lambda: 0)()
+            + reserve_bytes
+            < self.max_active_memory_bytes
+        )
 
     def allow_client(self, key: str) -> bool:
         if self.requests_per_minute <= 0:
             return True
         now = time.monotonic()
         with self.admission_lock:
-            if len(self.rate_windows) > 1024:
-                self.rate_windows = {
-                    client: window for client, window in self.rate_windows.items()
-                    if now - window[0] < 60
+            if len(self.client_rate_limiters) > 1024:
+                self.client_rate_limiters = {
+                    client: limiter
+                    for client, limiter in self.client_rate_limiters.items()
+                    if now - limiter.last_seen < 120
                 }
-            started, count = self.rate_windows.get(key, (now, 0))
-            if now - started >= 60:
-                started, count = now, 0
-            if count >= self.requests_per_minute:
-                self.rate_windows[key] = (started, count)
-                return False
-            self.rate_windows[key] = (started, count + 1)
-            return True
+            limiter = self.client_rate_limiters.get(key)
+            if limiter is None:
+                limiter = ClientRateLimiter(self.requests_per_minute)
+                self.client_rate_limiters[key] = limiter
+            return limiter.try_acquire()
 
     def allow_global_rate(self) -> bool:
         if self.global_rate_limiter is None:
@@ -621,6 +638,108 @@ def validate_tools(tools: Any) -> Optional[str]:
     return None
 
 
+def _model_config_owners(model: Any) -> List[Any]:
+    """Config-bearing objects for a model, outermost first.
+
+    mlx-lm models expose ``model.args`` (a ModelArgs dataclass), not
+    ``.config`` — reading only ``.config`` made every downstream helper a
+    silent no-op on real models. Vision-wrapped checkpoints (Qwen3.5) nest
+    the text fields another level down in ``text_config``, which may be a
+    dict or a dataclass depending on where in mlx-lm it was materialized.
+    """
+    owners: List[Any] = []
+    for attr in ("config", "args"):
+        cfg = getattr(model, attr, None)
+        if cfg is None:
+            continue
+        owners.append(cfg)
+        text = cfg.get("text_config") if isinstance(cfg, dict) else getattr(cfg, "text_config", None)
+        if text is not None:
+            owners.append(text)
+    return owners
+
+
+def _cfg_get(owner: Any, *names: str) -> Optional[int]:
+    for name in names:
+        value = owner.get(name) if isinstance(owner, dict) else getattr(owner, name, None)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return None
+
+
+def model_context_limit(model: Any) -> Optional[int]:
+    """Best-effort context-window discovery across common MLX model configs."""
+    for owner in _model_config_owners(model):
+        value = _cfg_get(owner, "max_position_embeddings", "max_seq_len", "max_sequence_length")
+        if value is not None:
+            return value
+    return None
+
+
+def request_client_ip(request: Request, trusted_proxy_hosts: frozenset[str]) -> str:
+    """Use forwarded client IPs only from an explicitly trusted proxy."""
+    peer = request.client.host if request.client else "local"
+    if peer not in trusted_proxy_hosts:
+        return peer
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        candidate = forwarded.split(",", 1)[0].strip()
+        if candidate:
+            return candidate
+    return peer
+
+
+def estimate_kv_cache_bytes(model: Any, tokens: int, kv_bits: Optional[int]) -> Optional[int]:
+    """Conservatively estimate one sequence's target-model KV-cache footprint.
+
+    Returning ``None`` means the architecture does not expose enough standard
+    config fields; callers retain the existing reactive memory guard instead
+    of making up an unsafe number.
+    """
+    if tokens < 1:
+        return None
+    for config in _model_config_owners(model):
+        def get(*names: str) -> Optional[int]:
+            return _cfg_get(config, *names)
+
+        layers = get("num_hidden_layers", "n_layer", "num_layers")
+        heads = get("num_key_value_heads", "num_attention_heads", "n_head")
+        head_dim = get("head_dim")
+        if head_dim is None:
+            hidden = get("hidden_size", "n_embd", "dim")
+            attention_heads = get("num_attention_heads", "n_head")
+            if hidden is not None and attention_heads is not None and hidden % attention_heads == 0:
+                head_dim = hidden // attention_heads
+        if layers is None or heads is None or head_dim is None:
+            continue
+        # Hybrid architectures grow per-token KV only in their full-attention
+        # layers; the recurrent (Gated-DeltaNet/SSM) layers hold small
+        # constant state. Counting every layer would over-reserve ~4x on
+        # Qwen3.5 and spuriously reject long prompts. Two config spellings:
+        # an explicit per-layer type list (HF) or an interval (mlx-lm).
+        layer_types = (
+            config.get("layer_types") if isinstance(config, dict)
+            else getattr(config, "layer_types", None)
+        )
+        if isinstance(layer_types, (list, tuple)) and layer_types:
+            kv_layers = sum(
+                1 for t in layer_types if isinstance(t, str) and "full" in t
+            )
+            if kv_layers == 0:
+                return None  # pure-recurrent: constant state, nothing to reserve
+            layers = kv_layers
+        else:
+            interval = get("full_attention_interval")
+            if interval is not None and interval > 1:
+                layers = max(1, layers // interval)
+        # keys + values.  Quantized KV has scale/zero-point overhead, so
+        # reserve 20% above the ideal packed size rather than relying on an
+        # optimistic bit count.  Unquantized MLX cache entries are float16.
+        bytes_per_value = 2.0 if kv_bits is None else (kv_bits / 8.0) * 1.2
+        return int(layers * 2 * heads * head_dim * tokens * bytes_per_value)
+    return None
+
+
 def _sse(data: dict) -> str:
     return f"data: {json.dumps(data)}\n\n"
 
@@ -664,9 +783,11 @@ def create_app(
     audit_log_path: Optional[str] = None,
     global_rps: float = 0.0,
     global_burst: int = 0,
-    shutdown_timeout: float = 30.0,
+    shutdown_timeout: Optional[float] = None,
     cors_origins: Optional[List[str]] = None,
     cors_allow_credentials: bool = False,
+    model_context_tokens: Optional[int] = None,
+    trusted_proxy_hosts: Optional[List[str]] = None,
     model_paths: Optional[dict[str, str]] = None,
     model_loader: Optional[Callable[[str], "tuple[Engine, PrefixCacheStore]"]] = None,
 ) -> FastAPI:
@@ -682,7 +803,8 @@ def create_app(
         raise ValueError("max_request_bytes must be positive")
     if global_rps < 0:
         raise ValueError("global_rps cannot be negative")
-    if shutdown_timeout <= 0:
+    drain_timeout = shutdown_timeout if shutdown_timeout is not None else shutdown_drain_seconds
+    if drain_timeout <= 0:
         raise ValueError("shutdown_timeout must be positive")
 
     # Audit log ########################################################
@@ -701,14 +823,16 @@ def create_app(
         max_prompt_tokens=max_prompt_tokens,
         max_completion_tokens=max_completion_tokens,
         requests_per_minute=requests_per_minute,
-        rate_windows={},
+        client_rate_limiters={},
         max_request_bytes=max_request_bytes,
         global_rate_limiter=GlobalRateLimiter(global_rps, global_burst) if global_rps > 0 else None,
-        shutdown_timeout=shutdown_timeout,
+        shutdown_timeout=drain_timeout,
         cors_origins=cors_origins or [],
         cors_allow_credentials=cors_allow_credentials,
+        trusted_proxy_hosts=frozenset(trusted_proxy_hosts or []),
         model_loader=model_loader,
     )
+    context_limit = model_context_tokens or model_context_limit(getattr(engine, "model", None))
     # Register the default model so single-model mode is a subset of the
     # swap path: admission math and /v1/models just work.
     state.models[model_id] = (engine, store, state.token_cache, state.head_cache,
@@ -728,7 +852,7 @@ def create_app(
             state.accepting = False
         # Drain in-flight generations before releasing the cache flock:
         # engine worker threads may still be writing snapshots to disk.
-        deadline = time.monotonic() + shutdown_drain_seconds
+        deadline = time.monotonic() + state.shutdown_timeout
         while time.monotonic() < deadline:
             # Use in_flight_requests in addition to admitted_requests
             in_flight = state.in_flight_requests
@@ -776,13 +900,20 @@ def create_app(
         )
 
     @app.get("/health")
-    def health():
-        return {
-            "status": "ok",
-            "model": state.model_id,
-            "thermal": state.engine.governor.effective_level.name,
-            "active_memory_bytes": getattr(state.engine, "active_memory_bytes", lambda: 0)(),
-        }
+    def health(authorization: Optional[str] = Header(default=None)):
+        # Liveness must stay probe-friendly (launchd/uptime checks can't
+        # attach headers), but on a key-protected (LAN-exposed) server the
+        # model identity and memory numbers are diagnostics, not liveness —
+        # they're only included for authorized callers. Local unkeyed
+        # servers keep the full body.
+        body: dict = {"status": "ok"}
+        if authorized(authorization):
+            body.update(
+                model=state.model_id,
+                thermal=state.engine.governor.effective_level.name,
+                active_memory_bytes=getattr(state.engine, "active_memory_bytes", lambda: 0)(),
+            )
+        return body
 
     @app.get("/readyz")
     def readyz():
@@ -795,7 +926,7 @@ def create_app(
                              "max_pending_requests": state.max_pending_requests}, status_code=status)
 
     def client_ip(request: Request) -> str:
-        return request.client.host if request.client else "local"
+        return request_client_ip(request, state.trusted_proxy_hosts)
 
     @app.get("/metrics")
     def metrics(request: Request, authorization: Optional[str] = Header(default=None)):
@@ -853,8 +984,8 @@ def create_app(
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request, authorization: str | None = Header(default=None)):
         if not authorized(authorization):
-            client_ip = request.client.host if request.client else "local"
-            audit_logger.auth_failure(client_ip)
+            source_ip = client_ip(request)
+            audit_logger.auth_failure(source_ip)
             return error("invalid API key", 401, "authentication_error")
         # Check global rate limit first
         if not state.allow_global_rate():
@@ -862,7 +993,7 @@ def create_app(
             return error("global request rate limit exceeded", 429, "rate_limit_error")
         # Bucket by client IP, not Authorization: with a shared bearer
         # token every LAN client would otherwise share a single bucket.
-        client_key = request.client.host if request.client else "local"
+        client_key = client_ip(request)
         if not state.allow_client(client_key):
             state.metrics.inc_request("rate_limited")
             audit_logger.rate_limit_hit(
@@ -902,15 +1033,23 @@ def create_app(
         if not isinstance(messages, list) or not messages:
             return error("messages must be a non-empty array", 400)
         stream = bool(body.get("stream", False))
+        raw_max_tokens = body.get(
+            "max_tokens", body.get("max_completion_tokens", 2048)
+        )
+        if isinstance(raw_max_tokens, bool) or not isinstance(raw_max_tokens, int):
+            return error("max_tokens must be an integer", 400)
+        max_tokens = raw_max_tokens
         try:
-            max_tokens = int(body.get("max_tokens") or body.get("max_completion_tokens") or 2048)
             temperature = float(body.get("temperature", 0.7))
             top_p = float(body.get("top_p", 1.0))
             freq_p = float(body.get("frequency_penalty", 0.0))
             pres_p = float(body.get("presence_penalty", 0.0))
         except (TypeError, ValueError):
             return error("max_tokens, temperature, top_p, frequency_penalty, presence_penalty must be numeric", 400)
-        if max_tokens < 1 or temperature < 0 or not 0 < top_p <= 1 or not -2.0 <= freq_p <= 2.0 or not -2.0 <= pres_p <= 2.0:
+        if (max_tokens < 1 or not math.isfinite(temperature) or temperature < 0
+                or not math.isfinite(top_p) or not 0 < top_p <= 1
+                or not math.isfinite(freq_p) or not -2.0 <= freq_p <= 2.0
+                or not math.isfinite(pres_p) or not -2.0 <= pres_p <= 2.0):
             return error("max_tokens must be positive, temperature non-negative, and top_p in (0, 1]", 400)
         if max_tokens > state.max_completion_tokens:
             return error(f"max_tokens exceeds server limit ({state.max_completion_tokens})", 400)
@@ -943,12 +1082,22 @@ def create_app(
             return error("prompt could not be templated", 400)
         if len(tokens) > state.max_prompt_tokens:
             return error(f"prompt exceeds server limit ({state.max_prompt_tokens} tokens)", 413)
+        if context_limit is not None and len(tokens) + max_tokens > context_limit:
+            return error(
+                f"prompt plus completion exceeds model context limit ({context_limit} tokens)",
+                400,
+            )
         if not state.try_admit():
             state.metrics.inc_request("rejected")
             audit_logger.request_rejected(client_key, reason="queue_full",
                                           limit=state.max_pending_requests)
             return error("server queue is full; retry shortly", 429, "rate_limit_error")
-        if not state.memory_available():
+        reserve_bytes = estimate_kv_cache_bytes(
+            getattr(state.engine, "model", None),
+            len(tokens) + max_tokens,
+            getattr(getattr(state.engine, "config", None), "kv_bits", None),
+        ) or 0
+        if not state.memory_available(reserve_bytes):
             state.release()
             state.metrics.inc_request("memory_rejected")
             audit_logger.request_rejected(client_key, reason="memory_pressure")
@@ -1196,8 +1345,10 @@ class _Generation:
     def _run_engine(self):
         """Sync generator of events: prefill progress, text deltas, done."""
         state = self.state
+        t_queue_start = time.monotonic()
         if not state.lock.acquire(self.aborted):
             return
+        state.metrics.observe_queue_wait(time.monotonic() - t_queue_start)
         # This counter includes the post-lock tail which persists pinned
         # snapshots.  A swap waits for it before closing the old cache store.
         state.start_engine_task()
@@ -1324,7 +1475,13 @@ class _Generation:
                         call_index += len(calls)
                 return events
 
-            buffer = ""
+            # Keep only the suffix that can still form a stop marker.  The
+            # prior implementation retained every decoded character and
+            # rescanned it per token, which turns long generations into an
+            # avoidable O(n²) hot path.
+            stop_suffix = ""
+            max_stop_len = max((len(s) for s in self.stop), default=0)
+            stop_matched = False
             try:
                 # Only engage penalty processors when a client asks for them:
                 # the default path stays byte-identical to plain sampling.
@@ -1359,25 +1516,31 @@ class _Generation:
                         t_first_token = time.monotonic()
                     if resp.text:
                         if self.stop:
-                            buffer += resp.text
-                            matched = False
-                            for s in self.stop:
-                                if s in buffer:
-                                    matched = True
-                                    prev_len = len(buffer) - len(resp.text)
-                                    valid_chunk_len = max(0, buffer.find(s) - prev_len)
-                                    text_to_emit = resp.text[:valid_chunk_len]
-                                    if text_to_emit:
-                                        yield from route(text_to_emit)
-                                    break
-                            if matched:
+                            stop_suffix += resp.text
+                            matches = [
+                                stop_suffix.find(marker)
+                                for marker in self.stop
+                                if marker in stop_suffix
+                            ]
+                            if matches:
+                                text_to_emit = stop_suffix[:min(matches)]
+                                if text_to_emit:
+                                    yield from route(text_to_emit)
+                                stop_matched = True
                                 finish_reason = "stop"
                                 break
-                        yield from route(resp.text)
+                            safe = max(0, len(stop_suffix) - max_stop_len + 1)
+                            if safe:
+                                yield from route(stop_suffix[:safe])
+                                stop_suffix = stop_suffix[safe:]
+                        else:
+                            yield from route(resp.text)
                     n_generated = resp.generation_tokens
                     decode_tps = resp.generation_tps
                     if resp.finish_reason is not None:
                         finish_reason = resp.finish_reason
+                if stop_suffix and not stop_matched and not self.aborted.is_set():
+                    yield from route(stop_suffix)
             except PrefillAborted:
                 logger.info(
                     "  %s · prefill aborted at %d tok (client gone)",
@@ -1425,6 +1588,9 @@ class _Generation:
 
         total_s = time.monotonic() - t_start
         prefill_s = (t_first_token or time.monotonic()) - t_start
+        if t_first_token is not None:
+            state.metrics.observe_ttft(prefill_s)
+        state.metrics.observe_decode_tps(decode_tps)
         fresh = len(self.tokens) - already
         logger.info(
             "← %s · %.1fs · prefill %d tok %.1fs (%d cached) · "
