@@ -222,11 +222,19 @@ and latency histograms; `daedalus status`; and a SHA-pinned release shipping a w
 checksums. See [`CHANGELOG.md`](CHANGELOG.md) and the
 [v0.2.0 release](https://github.com/therahul-yo/Daedalus/releases/tag/v0.2.0).
 
+**On `main`, toward v0.3** — swap-only multi-model serving: register extra models with
+`--swap-model`, and a request for a non-resident model triggers a hot-swap that tears down
+the current engine (releasing its Metal memory and cache flock) before loading the target,
+so only one model is ever resident on your 16GB. Admission is checked against a derived,
+hybrid-aware weights+KV estimate; swaps are rate-limited by a cooldown, and a failed target
+load restores the previous model rather than stranding the server. Implemented and
+unit-tested (180 tests) — **real-hardware swap validation is still pending**, so it is not
+in the v0.2.0 release.
+
 Deliberately deferred: the MTP decode head (the 4-bit checkpoint ships no MTP weights)
 and a COW cache-copy redesign (implemented, A/B-measured, no gain — see
-`bench/copy_cost.py`). Next (v0.3): a correct swap-only multi-model design (lazy-load with
-teardown), Gemma 4 real-model run, and a signed standalone binary (the current build is
-best-effort — MLX's `@rpath` native libs don't survive PyInstaller yet).
+`bench/copy_cost.py`). Also next: Gemma 4 real-model run, and a signed standalone binary
+(the current build is best-effort — MLX's `@rpath` native libs don't survive PyInstaller yet).
 
 ## License
 

@@ -393,6 +393,14 @@
         it never leaks into the visible reply. pi, OpenCode, and any OpenAI-compatible client
         just work.</p>
       </div>
+      <div class="cell">
+        <div class="ic mono">⇄</div>
+        <h3>Single-resident model swap <span style="color:var(--gray-dark);font-weight:400;font-size:12px;">· on main, v0.3</span></h3>
+        <p>Register extra models with <code>--swap-model</code>; a request for another one
+        tears the current engine down — freeing its Metal memory before loading the target —
+        so only one model is ever resident on 16&nbsp;GB. Admission-checked, cooldown-limited,
+        and it restores the previous model if a load fails.</p>
+      </div>
     </div>
   </div>
 
