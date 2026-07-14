@@ -80,10 +80,16 @@ streaming marker filter, so any model mlx-lm can parse tools for works here too.
 ## Install
 
 ```bash
-# recommended: uv (or pipx) puts `daedalus` on your PATH
+# from a release wheel (recommended) — puts `daedalus` on your PATH
+uv tool install https://github.com/therahul-yo/Daedalus/releases/download/v0.2.0/daedalus-0.2.0-py3-none-any.whl
+# or from source (editable):
 uv tool install --editable . --with "transformers>=5.0,<5.11"
 # or: pipx install .
 ```
+
+Requires an Apple Silicon Mac (MLX). `--audit-log`, `--log-json`, and the
+`observability` extra (`pip install 'daedalus[observability]'` for structlog +
+OpenTelemetry) are optional.
 
 ## Usage
 
@@ -203,15 +209,24 @@ inspired by baseRT's public C API. The thermal governor exists in none of them.
 
 ## Status
 
-v0.2: engine, persistent prefix cache, thermal governor, and OpenAI-compatible server are
-implemented and validated on real hardware (M4 Air 16GB, Qwen3.5-9B-4bit): 153 tests,
-thermal A/B benchmarked (`bench/thermal_validation.py`), tool calls and reasoning
-separation verified against pi. The ongoing audit hardens request validation,
-predictive admission, benchmark comparability, and release quality gates.
-v0.2 adds penalties/stop/usage options, request-ID + CORS + global rate limiting, the
-`daedalus cache` CLI with TTL eviction, and the audit log / OTel observability layer.
-See `CHANGELOG.md`. Next: packaging (Homebrew/PyInstaller), multi-model serving with
-16GB admission math, MTP decode head (raw decode speed), Gemma 4 real-model run.
+**v0.2.0 released** — engine, persistent prefix cache, thermal governor, and
+OpenAI-compatible server, validated on real hardware (M4 Air 16GB, Qwen3.5-9B-4bit):
+171 tests, ruff-gated, thermal A/B benchmarked (`bench/thermal_validation.py`), and
+measured head-to-head against llama.cpp (`bench/head_to_head.py`); tool calls and
+reasoning separation verified against pi.
+
+v0.2 adds penalties / stop / usage options; request-ID, CORS, and global + per-client
+rate limiting; predictive (hybrid-aware) KV admission and context-window guards; the
+`daedalus cache` CLI with TTL eviction; the NDJSON audit log, `--log-json`, OpenTelemetry,
+and latency histograms; `daedalus status`; and a SHA-pinned release shipping a wheel +
+checksums. See [`CHANGELOG.md`](CHANGELOG.md) and the
+[v0.2.0 release](https://github.com/therahul-yo/Daedalus/releases/tag/v0.2.0).
+
+Deliberately deferred: the MTP decode head (the 4-bit checkpoint ships no MTP weights)
+and a COW cache-copy redesign (implemented, A/B-measured, no gain — see
+`bench/copy_cost.py`). Next (v0.3): a correct swap-only multi-model design (lazy-load with
+teardown), Gemma 4 real-model run, and a signed standalone binary (the current build is
+best-effort — MLX's `@rpath` native libs don't survive PyInstaller yet).
 
 ## License
 
