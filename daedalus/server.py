@@ -33,7 +33,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncGenerator, List, Optional
+from typing import Any, AsyncGenerator, Callable, List, Optional
 
 from fastapi import FastAPI, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -230,6 +230,7 @@ class ServerState:
     accepting: bool = True
     token_cache: "PromptTokenCache" = None
     head_cache: "SharedHeadIndex" = None
+    token_cache_entries: int = 256
     max_active_memory_bytes: Optional[int] = None
     max_prompt_tokens: int = 65536
     max_completion_tokens: int = 4096
@@ -243,16 +244,20 @@ class ServerState:
     in_flight_requests: int = 0
     in_flight_lock: threading.Lock = field(default_factory=threading.Lock)
     # ── multi-model swap-only state ───────────────────────────────────────
-    # Map of model_id -> (engine, store, token_cache, head_cache, profile).
-    # Only one engine is ever resident (16GB M4); the active entry is mirrored
-    # into the fields above and swapped atomically behind ``lock``.
+    # Contains the resident model only.  Inactive models are paths plus a
+    # loader, never live MLX objects: two 9B models cannot coexist on 16GB.
     models: dict[str, "tuple[Engine, PrefixCacheStore, PromptTokenCache, SharedHeadIndex, ModelProfile]"] = field(default_factory=dict)
     # Models the server will hot-swap to (beyond the default). Unknown -> 404.
     served_models: set[str] = field(default_factory=set)
     model_paths: dict[str, str] = field(default_factory=dict)
+    model_loader: Optional[Callable[[str], "tuple[Engine, PrefixCacheStore]"]] = None
     swap_cooldown_seconds: float = 30.0
     _last_swap_time: float = 0.0
     swap_lock: threading.Lock = field(default_factory=threading.Lock)
+    engine_tasks: int = 0
+    engine_tasks_lock: threading.Condition = field(
+        default_factory=lambda: threading.Condition(threading.Lock())
+    )
 
     def register_model(self, model_id: str, model_path: str) -> None:
         """Mark ``model_id`` as a swap-eligible served model (CLI --model)."""
@@ -272,38 +277,74 @@ class ServerState:
             return True, "already active"
         if model_id not in self.served_models:
             return False, f"model {model_id!r} is not served (register with --model)"
-        if model_id not in self.models:
-            return False, f"model {model_id!r} not loaded (pre-load with --model)"
-
-        now = time.monotonic()
-        if now - self._last_swap_time < self.swap_cooldown_seconds:
-            wait = self.swap_cooldown_seconds - (now - self._last_swap_time)
-            return False, f"swap cooldown active: retry after {wait:.0f}s"
-
         with self.swap_lock:
-            # Re-check after taking the lock (swap may have completed elsewhere).
+            # All admission checks live under this lock: checking the cooldown
+            # before it permits two callers to swap back-to-back.
             if model_id == self.model_id:
                 return True, "already active"
-            eng, store, tok_cache, head_cache, profile = self.models[model_id]
-            active_profile = self.models[self.model_id][4] if self.model_id in self.models else None
-            fits, available, required = model_fits(profile, active_profile, self.max_prompt_tokens)
+            now = time.monotonic()
+            if now - self._last_swap_time < self.swap_cooldown_seconds:
+                wait = self.swap_cooldown_seconds - (now - self._last_swap_time)
+                return False, f"swap cooldown active: retry after {wait:.0f}s"
+            profile = derive_model_profile(model_id, model_path=self.model_paths.get(model_id, model_id))
+            # The old model is released before loading the target, so admission
+            # is for one resident model, not an impossible two-model total.
+            fits, available, required = model_fits(profile, None, self.max_prompt_tokens)
             if not fits:
                 return False, (
                     f"model {model_id!r} needs {required:.1f} GB (weights+KV), "
-                    f"only {available:.1f} GB free; unload current model first"
+                    f"only {available:.1f} GB available for one resident model"
                 )
-            # Guard the swap: no request may be mid-engine while we repoint.
-            self.lock.acquire_for_swap()
+            if self.model_loader is None:
+                return False, "model swapping is not configured"
+            # Block new engine admits, then drain work which is still persisting
+            # pinned snapshots after it has released the FIFO lock.
+            if not self.lock.acquire_for_swap():
+                return False, "engine busy, retry"
             try:
-                self.engine = eng
-                self.store = store
-                self.token_cache = tok_cache
-                self.head_cache = head_cache
+                if not self.wait_for_engine_drain(timeout=10.0):
+                    return False, "engine is still finishing, retry"
+                old_id = self.model_id
+                old_store, old_engine = self.store, self.engine
+                close = getattr(old_store, "close", None)
+                if close:
+                    close()
+                close = getattr(old_engine, "close", None)
+                if close:
+                    close()
+                self.models.clear()
+                # Drop all strong references before asking MLX to free Metal.
+                import gc
+                import mlx.core as mx
+                self.engine = None
+                self.store = None
+                del old_store, old_engine
+                gc.collect()
+                mx.clear_cache()
+                try:
+                    eng, store = self.model_loader(model_id)
+                except Exception as exc:
+                    # A failed target load must not strand the service without
+                    # its prior model; restore it before reporting the error.
+                    try:
+                        eng, store = self.model_loader(old_id)
+                    except Exception:
+                        raise RuntimeError(f"could not load {model_id!r}: {exc}") from exc
+                    self.engine, self.store = eng, store
+                    self.token_cache = PromptTokenCache(self.token_cache_entries)
+                    self.head_cache = SharedHeadIndex()
+                    self.models[old_id] = (eng, store, self.token_cache, self.head_cache,
+                                           derive_model_profile(old_id, self.model_paths.get(old_id, old_id)))
+                    return False, f"could not load {model_id!r}: {exc}"
+                self.engine, self.store = eng, store
+                self.token_cache = PromptTokenCache(self.token_cache_entries)
+                self.head_cache = SharedHeadIndex()
                 self.model_id = model_id
+                self.models[model_id] = (eng, store, self.token_cache, self.head_cache, profile)
             finally:
                 self.lock.release_after_swap()
             self._last_swap_time = now
-            audit_logger.model_swap(self.model_id, model_id)
+            audit_logger.model_swap(old_id, model_id)
             return True, "swapped"
 
     def try_admit(self) -> bool:
@@ -381,6 +422,26 @@ class ServerState:
                     return True
             time.sleep(0.1)
         return False
+
+    def start_engine_task(self) -> None:
+        with self.engine_tasks_lock:
+            self.engine_tasks += 1
+
+    def finish_engine_task(self) -> None:
+        with self.engine_tasks_lock:
+            self.engine_tasks = max(0, self.engine_tasks - 1)
+            self.engine_tasks_lock.notify_all()
+
+    def wait_for_engine_drain(self, timeout: float) -> bool:
+        """Wait for post-generation cache persistence to finish during a swap."""
+        deadline = time.monotonic() + timeout
+        with self.engine_tasks_lock:
+            while self.engine_tasks:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self.engine_tasks_lock.wait(remaining)
+        return True
 
 
 class PromptTokenCache:
@@ -606,7 +667,8 @@ def create_app(
     shutdown_timeout: float = 30.0,
     cors_origins: Optional[List[str]] = None,
     cors_allow_credentials: bool = False,
-    model_specs: Optional[dict[str, "tuple[Engine, PrefixCacheStore, str]"]] = None,
+    model_paths: Optional[dict[str, str]] = None,
+    model_loader: Optional[Callable[[str], "tuple[Engine, PrefixCacheStore]"]] = None,
 ) -> FastAPI:
     if max_pending_requests < 1:
         raise ValueError("max_pending_requests must be at least 1")
@@ -634,6 +696,7 @@ def create_app(
         metrics=ServerMetrics(), admission_lock=threading.Lock(),
         token_cache=PromptTokenCache(token_cache_entries),
         head_cache=SharedHeadIndex(),
+        token_cache_entries=token_cache_entries,
         max_active_memory_bytes=max_active_memory_bytes,
         max_prompt_tokens=max_prompt_tokens,
         max_completion_tokens=max_completion_tokens,
@@ -644,6 +707,7 @@ def create_app(
         shutdown_timeout=shutdown_timeout,
         cors_origins=cors_origins or [],
         cors_allow_credentials=cors_allow_credentials,
+        model_loader=model_loader,
     )
     # Register the default model so single-model mode is a subset of the
     # swap path: admission math and /v1/models just work.
@@ -651,16 +715,9 @@ def create_app(
                               derive_model_profile(model_id, model_path=model_id))
     state.served_models.add(model_id)
     state.model_paths[model_id] = model_id
-    # Pre-registered swap models (CLI --model, or tests). Each spec is
-    # (engine, store, model_path). Their token/head caches are created here
-    # so each model gets a fully isolated cache namespace.
-    for spec_id, (spec_eng, spec_store, spec_path) in (model_specs or {}).items():
-        spec_tok = PromptTokenCache(token_cache_entries)
-        spec_head = SharedHeadIndex()
-        state.models[spec_id] = (
-            spec_eng, spec_store, spec_tok, spec_head,
-            derive_model_profile(spec_id, model_path=spec_path),
-        )
+    # Swap candidates are deliberately paths only.  Loading happens after the
+    # active model has been torn down, keeping residency bounded to one model.
+    for spec_id, spec_path in (model_paths or {}).items():
         state.served_models.add(spec_id)
         state.model_paths[spec_id] = spec_path
 
@@ -1139,11 +1196,24 @@ class _Generation:
     def _run_engine(self):
         """Sync generator of events: prefill progress, text deltas, done."""
         state = self.state
-        t_start = time.monotonic()
         if not state.lock.acquire(self.aborted):
             return
+        # This counter includes the post-lock tail which persists pinned
+        # snapshots.  A swap waits for it before closing the old cache store.
+        state.start_engine_task()
         try:
-            hit = state.store.fetch(self.tokens)
+            yield from self._run_engine_locked()
+        finally:
+            state.finish_engine_task()
+
+    def _run_engine_locked(self):
+        """Run a request after the FIFO engine slot has been acquired."""
+        state = self.state
+        t_start = time.monotonic()
+        engine = state.engine
+        store = state.store
+        try:
+            hit = store.fetch(self.tokens)
             if hit is not None:
                 prompt_cache = hit.cache
                 already = hit.matched_tokens
@@ -1157,7 +1227,7 @@ class _Generation:
                     len(self.tokens) - already,
                 )
             else:
-                prompt_cache = state.engine.make_cache()
+                prompt_cache = engine.make_cache()
                 already = 0
                 logger.info(
                     "  %s · cache miss — cold prefill %d tok",
@@ -1185,7 +1255,7 @@ class _Generation:
                         total,
                         100 * done // max(total, 1),
                         rate,
-                        state.engine.governor.effective_level.name,
+                        engine.governor.effective_level.name,
                     )
                     last_progress_log[0] = now
 
@@ -1196,14 +1266,14 @@ class _Generation:
                     # End-of-prefill snapshot keyed by the prompt: for
                     # non-trimmable (hybrid) caches this is the only state
                     # the next stateless-client turn can reuse.
-                    state.store.put(self.tokens[:done], cache, persist=False)
+                    store.put(self.tokens[:done], cache, persist=False)
                     deferred_persist_tokens = self.tokens[:done]
                 elif done == self.head_boundary and done > already:
                     # Shared-head snapshot: reused by NEW sessions/branches
                     # whose conversation diverges after the system prompt.
                     # RAM-only here (pinned); disk write is deferred past the
                     # response so it never sits inside TTFT.
-                    state.store.put(self.tokens[:done], cache, persist=False)
+                    store.put(self.tokens[:done], cache, persist=False)
                     deferred_head_tokens = self.tokens[:done]
                     logger.info(
                         "  %s · head snapshot at %d tok", self.rid, done
@@ -1214,14 +1284,14 @@ class _Generation:
                     and time.monotonic() - last_checkpoint_time >= CHECKPOINT_MIN_INTERVAL_S
                     and len(self.tokens) - done > CHECKPOINT_EVERY_TOKENS
                 ):
-                    state.store.checkpoint(self.tokens, done, cache)
+                    store.checkpoint(self.tokens, done, cache)
                     last_checkpoint = done
                     last_checkpoint_time = time.monotonic()
 
             think_filter = ThinkStreamFilter(
                 initially_thinking=self.prompt_in_think
             )
-            tool_filter = make_stream_filter(state.engine.tokenizer, self.tools)
+            tool_filter = make_stream_filter(engine.tokenizer, self.tools)
             call_index = 0
             emitted_calls = False
             finish_reason = "stop"
@@ -1267,7 +1337,7 @@ class _Generation:
                         presence_penalty=self.presence_penalty,
                     )
 
-                for resp in state.engine.generate(
+                for resp in engine.generate(
                     self.tokens,
                     **penalty_kwargs,
                     max_tokens=self.max_tokens,
@@ -1318,7 +1388,7 @@ class _Generation:
                 # persist it (rare path; lock hold acceptable) so its pin
                 # is released and the work isn't lost.
                 if deferred_head_tokens is not None:
-                    persist = getattr(state.store, "persist", None)
+                    persist = getattr(store, "persist", None)
                     if persist:
                         persist(deferred_head_tokens)
                 return
@@ -1366,7 +1436,7 @@ class _Generation:
             already,
             n_generated,
             decode_tps,
-            state.engine.governor.effective_level.name,
+            engine.governor.effective_level.name,
             finish_reason,
         )
         yield {
@@ -1385,7 +1455,7 @@ class _Generation:
         # Deferred snapshot persists land after the client already has its
         # final chunk: outside the FifoLock, off the TTFT path, still on
         # this engine worker thread (MLX serialization is stream-bound).
-        persist = getattr(state.store, "persist", None)
+        persist = getattr(store, "persist", None)
         if persist:
             for toks in (deferred_head_tokens, deferred_persist_tokens):
                 if toks is not None:

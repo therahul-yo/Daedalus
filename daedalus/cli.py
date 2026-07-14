@@ -88,30 +88,6 @@ def cmd_serve(args) -> int:
         return 1
     load_s = time.monotonic() - t0
 
-    # Preload swap-eligible models so a hot-swap never blocks on a download.
-    model_specs: dict = {}
-    for swap_id in args.swap_model:
-        try:
-            swap_eng = Engine.from_pretrained(
-                swap_id, monitor=monitor, governor=governor,
-                config=EngineConfig(kv_bits=args.kv_bits or None,
-                                    prefill_chunk_tokens=args.prefill_chunk_tokens),
-            )
-            swap_cache_key = cache_identity(
-                swap_id, kv_bits=args.kv_bits or None,
-                tokenizer_id=getattr(swap_eng.tokenizer, "name_or_path", swap_id),
-                model_revision=args.model_revision, draft_model=args.draft_model,
-            )
-            swap_store = PrefixCacheStore(
-                swap_cache_key,
-                max_ram_bytes=args.cache_ram_mb * 1024**2 if args.cache_ram_mb else None,
-                max_disk_bytes=args.cache_disk_gb * 1024**3, exclusive=True,
-            )
-            model_specs[swap_id] = (swap_eng, swap_store, swap_id)
-            log.info("preloaded swap model %s", swap_id)
-        except Exception as exc:
-            log.warning("could not preload swap model %s: %s", swap_id, exc)
-
     import mlx.core as mx
 
     cache_key = cache_identity(
@@ -131,6 +107,33 @@ def cmd_serve(args) -> int:
         max_disk_bytes=args.cache_disk_gb * 1024**3,
         exclusive=True,
     )
+
+    def load_swap_model(swap_id: str):
+        """Load one target only after the previous model has been released."""
+        log.info("loading swap model %s", swap_id)
+        swap_eng = Engine.from_pretrained(
+            swap_id,
+            monitor=monitor,
+            governor=governor,
+            config=EngineConfig(
+                kv_bits=args.kv_bits or None,
+                prefill_chunk_tokens=args.prefill_chunk_tokens,
+                clear_metal_cache_between_chunks=args.clear_metal_cache_between_chunks,
+                num_draft_tokens=args.num_draft_tokens,
+            ),
+            draft_model_path=args.draft_model,
+        )
+        swap_cache_key = cache_identity(
+            swap_id, kv_bits=args.kv_bits or None,
+            tokenizer_id=getattr(swap_eng.tokenizer, "name_or_path", swap_id),
+            model_revision=args.model_revision, draft_model=args.draft_model,
+        )
+        return swap_eng, PrefixCacheStore(
+            swap_cache_key,
+            max_ram_bytes=args.cache_ram_mb * 1024**2 if args.cache_ram_mb else None,
+            max_disk_bytes=args.cache_disk_gb * 1024**3,
+            exclusive=True,
+        )
     cache_stats = store.stats()
     app = create_app(
         engine, store, model_id=args.model, max_pending_requests=args.max_pending_requests,
@@ -143,7 +146,8 @@ def cmd_serve(args) -> int:
         audit_log_path=args.audit_log,
         cors_origins=args.cors_origins,
         global_rps=args.global_rps,
-        model_specs=model_specs or None,
+        model_paths={swap_id: swap_id for swap_id in args.swap_model},
+        model_loader=load_swap_model if args.swap_model else None,
     )
 
     bar = "─" * 62
@@ -177,7 +181,7 @@ def cmd_doctor(args) -> int:
     import platform
     import subprocess
 
-    from daedalus.sensors import ThermalMonitor, make_pressure_reader
+    from daedalus.sensors import make_pressure_reader
 
     hw = subprocess.run(
         ["sysctl", "-n", "machdep.cpu.brand_string", "hw.memsize"],
@@ -214,7 +218,6 @@ def cmd_warm(args) -> int:
     from daedalus.cache.store import PrefixCacheStore
     from daedalus.engine import Engine, EngineConfig
     from daedalus.runtime import cache_identity
-    from daedalus.governor import ThermalGovernor
     from daedalus.sensors import ThermalMonitor
 
     # Validate the prompts file BEFORE the multi-minute model load.

@@ -6,13 +6,12 @@ response proves which engine actually served the request after a swap.
 
 from daedalus.server import (
     create_app,
-    derive_model_profile,
     model_fits,
     MODEL_PROFILES,
     MODEL_MEMORY_CEILING_GB,
 )
 from daedalus.server import ModelProfile
-from test_server import FakeEngine, FakeStore, FakeGovernor, FakeTokenizer
+from test_server import FakeEngine, FakeStore
 
 # Give the test model ids deliberately small profiles so two fit under the
 # 16GB ceiling (the fallback profile would otherwise over-count KV at 64K ctx
@@ -35,11 +34,14 @@ def make_app():
     a_eng, a_store, a_path = make_spec("model-a-text")
     b_eng, b_store, b_path = make_spec("model-b-text")
     specs = {
-        "model-a": (a_eng, a_store, a_path),
-        "model-b": (b_eng, b_store, b_path),
+        "default": (default_eng, default_store),
+        "model-a": (a_eng, a_store),
+        "model-b": (b_eng, b_store),
     }
     app = create_app(
-        default_eng, default_store, model_id="default", model_specs=specs
+        default_eng, default_store, model_id="default",
+        model_paths={"model-a": a_path, "model-b": b_path},
+        model_loader=specs.__getitem__,
     )
     return app, default_eng, a_eng, b_eng
 
@@ -80,6 +82,29 @@ def test_swap_to_registered_model_serves_with_that_engine():
     assert "model-a-text" in r.json()["choices"][0]["message"]["content"]
 
 
+def test_swap_candidates_are_not_loaded_at_startup():
+    default_eng, default_store, _ = make_spec("default-model-text")
+    a_eng, a_store, a_path = make_spec("model-a-text")
+    loaded = []
+
+    def loader(model_id):
+        loaded.append(model_id)
+        assert model_id == "model-a"
+        return a_eng, a_store
+
+    app = create_app(
+        default_eng,
+        default_store,
+        model_id="default",
+        model_paths={"model-a": a_path},
+        model_loader=loader,
+    )
+    assert loaded == []
+    ok, message = app.state.daedalus.swap_model("model-a")
+    assert ok, message
+    assert loaded == ["model-a"]
+
+
 def test_swap_cooldown_rejects_second_swap():
     app, default_eng, a_eng, b_eng = make_app()
     client = __import__("fastapi.testclient", fromlist=["TestClient"]).TestClient(app)
@@ -96,6 +121,27 @@ def test_swap_cooldown_rejects_second_swap():
     )
     assert r.status_code == 409
     assert r.json()["error"]["type"] == "model_swap_conflict"
+
+
+def test_swap_timeout_does_not_repoint_or_release_an_unheld_gate(monkeypatch):
+    app, default_eng, a_eng, _ = make_app()
+    state = app.state.daedalus
+    monkeypatch.setattr(state.lock, "acquire_for_swap", lambda timeout=5.0: False)
+    ok, message = state.swap_model("model-a")
+    assert not ok
+    assert message == "engine busy, retry"
+    assert state.engine is default_eng
+    assert state.model_id == "default"
+    assert a_eng.generate_calls == []
+
+
+def test_swap_waits_for_post_engine_work_before_teardown():
+    app, *_ = make_app()
+    state = app.state.daedalus
+    state.start_engine_task()
+    assert not state.wait_for_engine_drain(timeout=0.0)
+    state.finish_engine_task()
+    assert state.wait_for_engine_drain(timeout=0.0)
 
 
 def test_cache_isolation_across_models():
@@ -115,21 +161,21 @@ def test_cache_isolation_across_models():
 
 def test_admission_rejects_unfit_model():
     """A model that exceeds the memory ceiling (given active) is rejected at 409."""
-    # Force model-b profile to a huge size by monkeypatching the registry.
-    big = MODEL_PROFILES["qwen-14b"] if "qwen-14b" in MODEL_PROFILES else None
     # Use derive_model_profile on a fake big id by injecting into MODEL_PROFILES.
     MODEL_PROFILES["big-fake"] = type(MODEL_PROFILES["qwen-7b"])(
         model_id="big-fake", weights_gb=12.0, kv_gb_per_8k=1.0, kv_gb_per_32k=4.0
     )
     app, default_eng, a_eng, b_eng = make_app()
-    # Register big-fake with its own engine/store.
+    # Register big-fake lazily; admission must reject it before loading.
     big_eng, big_store, _ = make_spec("big-text")
-    app.state.daedalus.models["big-fake"] = (
-        big_eng, big_store, app.state.daedalus.token_cache,
-        app.state.daedalus.head_cache,
-        derive_model_profile("big-fake", model_path="/models/big"),
+    previous_loader = app.state.daedalus.model_loader
+    app.state.daedalus.model_loader = (
+        lambda model_id: (big_eng, big_store)
+        if model_id == "big-fake"
+        else previous_loader(model_id)
     )
     app.state.daedalus.served_models.add("big-fake")
+    app.state.daedalus.model_paths["big-fake"] = "/models/big"
     client = __import__("fastapi.testclient", fromlist=["TestClient"]).TestClient(app)
     r = client.post(
         "/v1/chat/completions",
