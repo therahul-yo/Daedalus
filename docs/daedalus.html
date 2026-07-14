@@ -267,7 +267,7 @@
         <div class="term-bar"><i></i><i></i><i></i><span>daedalus serve — 127.0.0.1:8484</span></div>
         <pre>
 <span class="t">──────────────────────────────────────────────────</span>
-  daedalus v0.1 — wings that don't melt
+  daedalus v0.2 — wings that don't melt
 <span class="t">──────────────────────────────────────────────────</span>
   model    mlx-community/Qwen3.5-9B-MLX-4bit
   loaded   4.2s · 6.10 GB weights · kv cache 8-bit
@@ -327,6 +327,22 @@
       <p class="footnote">Every number measured on real hardware — raw traces in
       <code>bench/results/</code>, reproduce with <code>bench/thermal_validation.py</code>.
       With the prefix cache, a given prompt pays its cold prefill exactly once, ever.</p>
+
+      <p class="lede" style="margin-top: 72px;">Same 8k-token agent prompt,
+      Qwen3.5-9B 4-bit, both engines — then restart the server. llama.cpp's slot
+      cache dies with the process; daedalus reloads the prefix from disk.</p>
+      <div class="compare">
+        <div class="cbar bad">
+          <div class="label"><span class="who">llama.cpp — TTFT after restart</span><span class="val">78.6s · re-runs the whole prefill</span></div>
+          <div class="track"><div class="fill" data-w="100%"></div></div>
+          <p class="note">Every daemon restart, crash, or reboot re-pays the full cold prefill — on a chassis its own last run just heated.</p>
+        </div>
+        <div class="cbar good">
+          <div class="label"><span class="who">daedalus — TTFT after restart</span><span class="val">0.55s · reloads KV from disk</span></div>
+          <div class="track"><div class="fill" data-w="0.7%"></div></div>
+          <p class="note">143× faster. The persistent cache outlives the process. Reproduce with <code>bench/head_to_head.py</code>.</p>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -385,8 +401,8 @@
       <p class="kicker">Install</p>
       <h2>Up in three commands.</h2>
       <div class="cmd">
-        <span><span class="dollar">$</span>uv tool install --editable . --with "transformers&gt;=5.0,&lt;5.11"</span>
-        <button data-copy='uv tool install --editable . --with "transformers>=5.0,<5.11"'>Copy</button>
+        <span><span class="dollar">$</span>uv tool install https://github.com/therahul-yo/Daedalus/releases/download/v0.2.0/daedalus-0.2.0-py3-none-any.whl</span>
+        <button data-copy='uv tool install https://github.com/therahul-yo/Daedalus/releases/download/v0.2.0/daedalus-0.2.0-py3-none-any.whl'>Copy</button>
       </div>
       <div class="cmd">
         <span><span class="dollar">$</span>daedalus serve --model mlx-community/Qwen3.5-9B-MLX-4bit --port 8484</span>
