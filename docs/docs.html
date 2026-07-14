@@ -1,0 +1,747 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="daedalus documentation — install, CLI reference, configuration flags, the HTTP API, agent integrations, and how the prefix cache and thermal governor work.">
+<title>daedalus docs — the thermal inference engine for MacBook Air</title>
+<style>
+  :root {
+    --bg: #000000;
+    --panel: #0a0a0a;
+    --border: #1f1f1f;
+    --border-lit: #333333;
+    --ink: #ededed;
+    --gray: #a1a1a1;
+    --gray-dark: #666666;
+    --red-a: #ff0f0f; --red-b: #ff5a3c;
+    --orange-a: #ff6a00; --orange-b: #ffa32e;
+    --yellow-a: #ffce0a; --yellow-b: #ffef7a;
+    --sidebar-w: 244px;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: 16px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+  pre, code, .mono { font-family: "SF Mono", Menlo, Monaco, "Courier New", monospace; }
+  a { color: inherit; text-decoration: none; }
+  ::selection { background: #333; color: #fff; }
+
+  /* ---------- shell ---------- */
+  .shell { max-width: 1024px; margin: 0 auto; position: relative; }
+  @media (min-width: 1080px) {
+    .shell { border-left: 1px solid var(--border); border-right: 1px solid var(--border); }
+  }
+  .band { border-top: 1px solid var(--border); position: relative; }
+  @media (min-width: 1080px) {
+    .band::before, .band::after {
+      content: "+"; position: absolute; top: -11px; color: #444;
+      font: 400 14px/1 "SF Mono", Menlo, monospace; background: var(--bg); z-index: 2;
+    }
+    .band::before { left: -7px; }
+    .band::after { right: -7px; }
+  }
+
+  /* ---------- nav ---------- */
+  nav {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 18px 32px; position: sticky; top: 0; z-index: 20;
+    background: rgba(0,0,0,0.72); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border);
+  }
+  .logo { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 15px; letter-spacing: -0.01em; }
+  nav .links { display: flex; align-items: center; gap: 26px; font-size: 14px; color: var(--gray); }
+  nav .links a:hover { color: var(--ink); }
+  nav .links a.on { color: var(--ink); }
+  .pill {
+    display: inline-block; font-size: 14px; font-weight: 500;
+    padding: 8px 18px; border-radius: 9999px;
+    background: var(--ink); color: #000; transition: background 0.15s;
+  }
+  .pill:hover { background: #cccccc; }
+  @media (max-width: 720px) { nav .links a:not(.pill):not(.gh) { display: none; } }
+
+  /* ---------- docs layout ---------- */
+  .doc {
+    display: grid;
+    grid-template-columns: var(--sidebar-w) 1fr;
+    align-items: start;
+  }
+  @media (max-width: 900px) { .doc { grid-template-columns: 1fr; } }
+
+  /* sidebar */
+  aside {
+    position: sticky; top: 61px; align-self: start;
+    height: calc(100vh - 61px); overflow-y: auto;
+    border-right: 1px solid var(--border);
+    padding: 34px 22px 60px;
+  }
+  @media (max-width: 900px) {
+    aside {
+      position: static; height: auto; border-right: 0;
+      border-bottom: 1px solid var(--border); padding: 22px 20px;
+    }
+  }
+  aside .grp { font-family: "SF Mono", Menlo, monospace; font-size: 11px; letter-spacing: 0.12em;
+    text-transform: uppercase; color: var(--gray-dark); margin: 26px 0 10px; }
+  aside .grp:first-child { margin-top: 0; }
+  aside a {
+    display: block; font-size: 13.5px; color: var(--gray);
+    padding: 5px 10px; border-radius: 6px; margin-left: -10px;
+    line-height: 1.4; transition: color 0.12s, background 0.12s;
+  }
+  aside a:hover { color: var(--ink); background: #0d0d0d; }
+  aside a.active { color: var(--ink); background: #121212; }
+
+  /* content */
+  main { padding: 48px 44px 100px; min-width: 0; }
+  @media (max-width: 900px) { main { padding: 40px 24px 80px; } }
+  @media (max-width: 600px) { main { padding: 34px 18px 70px; } }
+
+  .doc-hero { margin-bottom: 8px; }
+  .doc-hero .eyebrow { font-family: "SF Mono", Menlo, monospace; font-size: 12px; letter-spacing: 0.1em;
+    text-transform: uppercase; color: var(--gray-dark); margin-bottom: 14px; }
+  .doc-hero h1 { font-size: clamp(34px, 5vw, 46px); font-weight: 800; letter-spacing: -0.045em; line-height: 1.05; }
+  .doc-hero h1 em { font-style: normal; -webkit-background-clip: text; background-clip: text; color: transparent;
+    background-image: linear-gradient(90deg, var(--orange-a), var(--yellow-a)); }
+  .doc-hero p.tag { margin-top: 18px; max-width: 620px; color: var(--gray); font-size: 17px; }
+
+  section { scroll-margin-top: 78px; padding-top: 56px; }
+  section > h2 {
+    font-size: 25px; font-weight: 700; letter-spacing: -0.025em; margin-bottom: 6px;
+    padding-bottom: 14px; border-bottom: 1px solid var(--border);
+  }
+  section > h2 .hash { color: var(--gray-dark); font-weight: 400; margin-right: 10px; opacity: 0; transition: opacity 0.12s; }
+  section > h2:hover .hash { opacity: 1; }
+  h3 { font-size: 17px; font-weight: 650; letter-spacing: -0.01em; margin: 30px 0 10px; }
+  main p { color: var(--gray); margin: 14px 0; max-width: 680px; }
+  main p b, main li b { color: var(--ink); font-weight: 600; }
+  main ul, main ol { color: var(--gray); margin: 14px 0; padding-left: 22px; max-width: 680px; }
+  main li { margin: 7px 0; }
+  main a.link { color: var(--yellow-b); border-bottom: 1px solid rgba(255,239,122,0.25); }
+  main a.link:hover { border-bottom-color: var(--yellow-b); }
+
+  code.k { font-size: 13px; color: var(--ink); background: #161616; padding: 1.5px 6px; border-radius: 5px;
+    border: 1px solid var(--border); }
+
+  /* code blocks */
+  .code {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    margin: 18px 0; overflow: hidden; max-width: 720px;
+  }
+  .code .bar { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--border); }
+  .code .bar i { width: 10px; height: 10px; border-radius: 50%; background: #2e2e2e; }
+  .code .bar span { margin-left: 8px; font-size: 11.5px; color: var(--gray-dark); font-family: "SF Mono", Menlo, monospace; }
+  .code .bar button {
+    margin-left: auto; font: inherit; font-family: "SF Mono", Menlo, monospace; font-size: 11px;
+    color: var(--gray); background: none; border: 1px solid var(--border-lit); border-radius: 6px;
+    padding: 3px 10px; cursor: pointer;
+  }
+  .code .bar button:hover { color: var(--ink); border-color: var(--ink); }
+  .code pre { padding: 16px 18px; font-size: 12.8px; line-height: 1.85; color: var(--gray); overflow-x: auto; }
+  .code pre .c { color: var(--gray-dark); }
+  .code pre .p { color: var(--gray-dark); }
+  .code pre .s { color: #7fd6c0; }
+  .code pre .ok { color: #50e3c2; }
+  .code pre .hot { color: #f5a623; }
+  .code pre .kw { color: var(--yellow-b); }
+
+  /* tables */
+  .tbl-wrap { overflow-x: auto; margin: 20px 0; max-width: 720px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+  th, td { text-align: left; padding: 11px 14px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--gray-dark); font-weight: 500; font-family: "SF Mono", Menlo, monospace; font-size: 11.5px;
+    letter-spacing: 0.05em; text-transform: uppercase; }
+  td { color: var(--gray); }
+  td:first-child, th:first-child { padding-left: 2px; }
+  td code, th code { font-family: "SF Mono", Menlo, monospace; color: var(--ink); font-size: 12.5px; }
+  td .win { color: #50e3c2; font-weight: 600; }
+  tbody tr:hover { background: #0a0a0a; }
+
+  /* callouts */
+  .note {
+    margin: 20px 0; padding: 14px 18px; border-radius: 10px; max-width: 720px;
+    background: #0b0b0b; border: 1px solid var(--border); border-left: 2px solid var(--orange-a);
+    font-size: 14px; color: var(--gray);
+  }
+  .note b { color: var(--ink); }
+  .note.warn { border-left-color: var(--red-a); }
+  .note .lbl { font-family: "SF Mono", Menlo, monospace; font-size: 11px; letter-spacing: 0.08em;
+    text-transform: uppercase; color: var(--gray-dark); display: block; margin-bottom: 4px; }
+
+  /* endpoint rows */
+  .ep { display: flex; gap: 14px; align-items: baseline; padding: 12px 0; border-bottom: 1px solid var(--border); max-width: 720px; }
+  .ep .m { font-family: "SF Mono", Menlo, monospace; font-size: 11px; font-weight: 600; padding: 2px 8px;
+    border-radius: 5px; flex-shrink: 0; letter-spacing: 0.03em; }
+  .ep .m.get { color: #50e3c2; background: rgba(80,227,194,0.08); border: 1px solid rgba(80,227,194,0.2); }
+  .ep .m.del { color: var(--red-b); background: rgba(255,90,60,0.08); border: 1px solid rgba(255,90,60,0.2); }
+  .ep .m.post { color: var(--yellow-b); background: rgba(255,239,122,0.08); border: 1px solid rgba(255,239,122,0.2); }
+  .ep .path { font-family: "SF Mono", Menlo, monospace; font-size: 13px; color: var(--ink); flex-shrink: 0; }
+  .ep .desc { font-size: 13.5px; color: var(--gray); }
+
+  footer {
+    padding: 36px 44px 60px; display: flex; justify-content: space-between; align-items: center;
+    gap: 16px; flex-wrap: wrap; color: var(--gray-dark); font-size: 13.5px;
+    border-top: 1px solid var(--border); margin-top: 40px;
+  }
+  footer a { color: var(--gray); }
+  footer a:hover { color: var(--ink); }
+
+  .nextprev { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 56px; max-width: 720px; }
+  @media (max-width: 600px) { .nextprev { grid-template-columns: 1fr; } }
+  .nextprev a { border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; transition: border-color 0.15s; }
+  .nextprev a:hover { border-color: var(--border-lit); }
+  .nextprev .k { font-family: "SF Mono", Menlo, monospace; font-size: 11px; color: var(--gray-dark); text-transform: uppercase; letter-spacing: 0.08em; }
+  .nextprev .t { color: var(--ink); font-weight: 600; margin-top: 5px; font-size: 15px; }
+</style>
+
+<div class="shell">
+  <nav>
+    <a class="logo" href="/"><svg width="30" height="14" viewBox="0 0 16 7" shape-rendering="crispEdges" aria-hidden="true"><g fill="#ff0000"><rect x="0" y="0" width="1" height="1"/><rect x="15" y="0" width="1" height="1"/><rect x="0" y="1" width="2" height="1"/><rect x="14" y="1" width="2" height="1"/><rect x="0" y="2" width="4" height="1"/><rect x="12" y="2" width="4" height="1"/><rect x="1" y="3" width="5" height="1"/><rect x="10" y="3" width="5" height="1"/><rect x="2" y="4" width="5" height="1"/><rect x="9" y="4" width="5" height="1"/><rect x="4" y="5" width="4" height="1"/><rect x="8" y="5" width="4" height="1"/><rect x="6" y="6" width="4" height="1"/></g></svg>daedalus</a>
+    <span class="links">
+      <a href="/#benchmarks">Benchmarks</a>
+      <a href="/#features">Features</a>
+      <a class="on" href="/docs">Docs</a>
+      <a class="gh" href="https://github.com/therahul-yo/Daedalus">GitHub</a>
+      <a class="pill" href="/#install">Install</a>
+    </span>
+  </nav>
+
+  <div class="doc">
+    <!-- ---------- sidebar ---------- -->
+    <aside>
+      <div class="grp">Getting started</div>
+      <a href="#overview">Overview</a>
+      <a href="#install">Installation</a>
+      <a href="#quickstart">Quickstart</a>
+
+      <div class="grp">Reference</div>
+      <a href="#cli">CLI commands</a>
+      <a href="#config">Configuration</a>
+      <a href="#api">HTTP API</a>
+      <a href="#integrations">Agent integrations</a>
+
+      <div class="grp">Concepts</div>
+      <a href="#prefix-cache">Prefix cache</a>
+      <a href="#resumable">Resumable prefill</a>
+      <a href="#governor">Thermal governor</a>
+      <a href="#keepalives">Keepalives &amp; streaming</a>
+      <a href="#multimodel">Multi-model swap</a>
+
+      <div class="grp">Operations</div>
+      <a href="#security">Operating safely</a>
+      <a href="#tuning">Tuning &amp; benchmarks</a>
+      <a href="#troubleshooting">Troubleshooting</a>
+      <a href="#faq">FAQ</a>
+    </aside>
+
+    <!-- ---------- content ---------- -->
+    <main>
+      <div class="doc-hero">
+        <p class="eyebrow">Documentation · v0.2</p>
+        <h1>Run a coding model on the Air <em>that everyone owns.</em></h1>
+        <p class="tag">daedalus is a local, OpenAI-compatible MLX server that treats a fanless
+        MacBook&nbsp;Air's thermal envelope as a first-class scheduling constraint. This is the
+        complete reference — install, CLI, configuration, the HTTP API, and how the caching and
+        thermal machinery actually work.</p>
+      </div>
+
+      <!-- OVERVIEW -->
+      <section id="overview">
+        <h2><a class="hash" href="#overview">#</a>Overview</h2>
+        <p>Local coding agents — OpenCode, Hermes Agent, Pi Code — send <b>10–40k-token first
+        prompts</b>. On a passively-cooled Air, prefilling one of those is a multi-minute
+        full-power GPU burn: the machine thermally throttles and the client times out. daedalus
+        is built on <a class="link" href="https://github.com/ml-explore/mlx-lm">mlx-lm</a> and
+        solves that with four ideas working together:</p>
+        <ul>
+          <li><b>The best prefill is no prefill.</b> A persistent prefix cache (RAM + disk) means
+          a given prompt pays its cold prefill exactly once, ever — even across restarts.</li>
+          <li><b>Never redo work.</b> Mid-prefill checkpoints every 4k tokens; a timeout or crash
+          resumes where it stopped instead of restarting a 30k prefill.</li>
+          <li><b>Duty-cycle the burn.</b> A governor reads macOS's 5-level thermal signal and paces
+          prefill so the silicon runs unthrottled whenever it runs.</li>
+          <li><b>Never let the client die.</b> SSE keepalives stream progress, thermal state, and
+          ETA from the first second, and tool-call deltas are always well-formed.</li>
+        </ul>
+        <div class="note">
+          <span class="lbl">Requirements</span>
+          An <b>Apple Silicon Mac</b> (MLX). Validated on an <b>M4 MacBook Air 16&nbsp;GB</b> with
+          <code class="k">Qwen3.5-9B-MLX-4bit</code>. Anything mlx-lm can load will run; the design
+          target is the fanless Air.
+        </div>
+      </section>
+
+      <!-- INSTALL -->
+      <section id="install">
+        <h2><a class="hash" href="#install">#</a>Installation</h2>
+        <p>Install from a release wheel (recommended) — it puts <code class="k">daedalus</code> on
+        your <code class="k">PATH</code>:</p>
+        <div class="code">
+          <div class="bar"><i></i><i></i><i></i><span>shell</span><button data-copy="uv tool install https://github.com/therahul-yo/Daedalus/releases/download/v0.2.0/daedalus-0.2.0-py3-none-any.whl">Copy</button></div>
+          <pre><span class="c"># from a release wheel — recommended</span>
+uv tool install https://github.com/therahul-yo/Daedalus/releases/download/v0.2.0/daedalus-0.2.0-py3-none-any.whl
+
+<span class="c"># or from source (editable)</span>
+uv tool install --editable . --with <span class="s">"transformers>=5.0,&lt;5.11"</span>
+
+<span class="c"># or</span>
+pipx install .</pre>
+        </div>
+        <p>Optional extras: <code class="k">--audit-log</code>, <code class="k">--log-json</code>,
+        and the <code class="k">observability</code> extra
+        (<code class="k">pip install 'daedalus[observability]'</code> for structlog +
+        OpenTelemetry).</p>
+        <p>Confirm the thermal sensor and MLX are wired up before your first serve:</p>
+        <div class="code">
+          <div class="bar"><i></i><i></i><i></i><span>shell</span><button data-copy="daedalus doctor">Copy</button></div>
+          <pre>daedalus doctor
+<span class="c"># ✓ thermal sensor  com.apple.system.thermalpressurelevel → NOMINAL</span>
+<span class="c"># ✓ mlx / mlx-lm    metal backend ready</span>
+<span class="c"># ✓ disk cache      ~/.cache/daedalus writable</span></pre>
+        </div>
+      </section>
+
+      <!-- QUICKSTART -->
+      <section id="quickstart">
+        <h2><a class="hash" href="#quickstart">#</a>Quickstart</h2>
+        <p>Start the server, then point any OpenAI-compatible agent at it.</p>
+        <div class="code">
+          <div class="bar"><i></i><i></i><i></i><span>shell</span><button data-copy="daedalus serve --model mlx-community/Qwen3.5-9B-MLX-4bit --port 8484">Copy</button></div>
+          <pre>daedalus serve --model mlx-community/Qwen3.5-9B-MLX-4bit --port 8484</pre>
+        </div>
+        <p>The banner reports the model, memory, cache entries, and live thermal state. Every
+        request is logged: cache hit/miss, prefill progress with tok/s and thermal level, decode
+        rate, and finish reason.</p>
+        <h3>Call it like OpenAI</h3>
+        <div class="code">
+          <div class="bar"><i></i><i></i><i></i><span>curl</span><button data-copy="curl http://127.0.0.1:8484/v1/chat/completions -H 'Content-Type: application/json' -d '{&quot;model&quot;:&quot;mlx-community/Qwen3.5-9B-MLX-4bit&quot;,&quot;messages&quot;:[{&quot;role&quot;:&quot;user&quot;,&quot;content&quot;:&quot;Refactor this function.&quot;}],&quot;stream&quot;:true}'">Copy</button></div>
+          <pre>curl http://127.0.0.1:8484/v1/chat/completions \
+  -H <span class="s">'Content-Type: application/json'</span> \
+  -d <span class="s">'{
+    "model": "mlx-community/Qwen3.5-9B-MLX-4bit",
+    "messages": [{"role": "user", "content": "Refactor this function."}],
+    "stream": true
+  }'</span></pre>
+        </div>
+        <p>On the first turn you'll see a cold prefill paced by the governor; on the agent's next
+        turn — same prefix, one token longer — the cache serves it in a fraction of a second:</p>
+        <div class="code">
+          <div class="bar"><i></i><i></i><i></i><span>daedalus serve — 127.0.0.1:8484</span></div>
+<pre><span class="p">10:41:22 │</span> → f3ab21 · 8,027 tok · 4 tools · stream
+<span class="p">10:41:22 │</span>   f3ab21 · <span class="ok">cache hit 8,026/8,027 (disk)</span> — prefilling 1
+<span class="p">10:41:24 │</span> ← f3ab21 · 2.4s · decode 48 tok @ 20.4 tok/s · <span class="ok">NOMINAL</span>
+<span class="p">10:44:07 │</span> → 9c11e0 · 21,458 tok · cold prefill
+<span class="p">10:44:39 │</span>   9c11e0 · prefill 52% @ 157 tok/s · <span class="hot">MODERATE — pacing</span>
+<span class="p">10:46:12 │</span> ← 9c11e0 · 124.8s · checkpointed · recovered → <span class="ok">NOMINAL</span></pre>
+        </div>
+        <p>Pre-warm expensive prefixes while the machine is cool so the first real request is
+        already a cache hit:</p>
+        <div class="code">
+          <div class="bar"><i></i><i></i><i></i><span>shell</span><button data-copy="daedalus warm --model mlx-community/Qwen3.5-9B-MLX-4bit --prompts prompts.json">Copy</button></div>
+          <pre>daedalus warm --model mlx-community/Qwen3.5-9B-MLX-4bit --prompts prompts.json</pre>
+        </div>
+      </section>
+
+      <!-- CLI -->
+      <section id="cli">
+        <h2><a class="hash" href="#cli">#</a>CLI commands</h2>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+            <tbody>
+              <tr><td><code>daedalus doctor</code></td><td>Verify the thermal sensor, MLX/Metal backend, and disk-cache path before serving.</td></tr>
+              <tr><td><code>daedalus serve</code></td><td>Start the OpenAI-compatible server. The main command — see <a class="link" href="#config">Configuration</a>.</td></tr>
+              <tr><td><code>daedalus warm</code></td><td>Pre-prefill a set of prompts into the cache while the machine is cool.</td></tr>
+              <tr><td><code>daedalus tune</code></td><td>Measure the fastest safe prefill chunk for this model + Mac, and emit a recommendation.</td></tr>
+              <tr><td><code>daedalus status</code></td><td>Query a running server: model, thermal state, cache, and queue at a glance.</td></tr>
+              <tr><td><code>daedalus cache</code></td><td>Inspect and maintain the persistent cache — stats, TTL eviction, and clearing.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note">
+          <span class="lbl">Tip</span>
+          Every command takes <code class="k">--help</code>. Run <code class="k">daedalus serve --help</code>
+          for the full, version-accurate flag list — the table below covers the ones you'll reach for most.
+        </div>
+      </section>
+
+      <!-- CONFIG -->
+      <section id="config">
+        <h2><a class="hash" href="#config">#</a>Configuration</h2>
+        <p>Flags for <code class="k">daedalus serve</code>, grouped by concern.</p>
+
+        <h3>Model &amp; server</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Flag</th><th>Effect</th></tr></thead>
+            <tbody>
+              <tr><td><code>--model &lt;id&gt;</code></td><td>The MLX model to load (HF repo id or local path).</td></tr>
+              <tr><td><code>--port &lt;n&gt;</code></td><td>Listen port. Examples here use <code>8484</code>.</td></tr>
+              <tr><td><code>--host &lt;addr&gt;</code></td><td>Bind address. Defaults to <code>127.0.0.1</code>; use <code>0.0.0.0</code> only with an API key.</td></tr>
+              <tr><td><code>--model-revision &lt;id&gt;</code></td><td>Pin a mutable model name to an immutable revision so caches stay valid.</td></tr>
+              <tr><td><code>--swap-model &lt;id&gt;</code></td><td>Register an additional swappable model (see <a class="link" href="#multimodel">multi-model swap</a>).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Thermal &amp; prefill</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Flag</th><th>Effect</th></tr></thead>
+            <tbody>
+              <tr><td><code>--profile &lt;p&gt;</code></td><td>Governor profile: <code>performance</code>, <code>balanced</code>, or <code>cool</code>.</td></tr>
+              <tr><td><code>--max-duty &lt;0–1&gt;</code></td><td>Cap the prefill duty cycle. <code>--max-duty 0.5</code> = quiet mode.</td></tr>
+              <tr><td><code>--anticipate-rising</code></td><td>Pace one thermal level ahead when pressure is trending up (opt-in, overlays hysteresis).</td></tr>
+              <tr><td><code>--prefill-chunk-tokens &lt;n&gt;</code></td><td>Nominal-state prefill chunk size — use the value <code>daedalus tune</code> recommends.</td></tr>
+              <tr><td><code>--clear-metal-cache-between-chunks</code></td><td>Free Metal allocations between chunks. Trades throughput for lower memory pressure.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Cache &amp; memory</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Flag</th><th>Effect</th></tr></thead>
+            <tbody>
+              <tr><td><code>--cache-ram-mb &lt;n&gt;</code></td><td>RAM budget for the in-memory LRU KV cache.</td></tr>
+              <tr><td><code>--cache-disk-gb &lt;n&gt;</code></td><td>On-disk budget for persistent KV snapshots.</td></tr>
+              <tr><td><code>--cache-ttl-days &lt;n&gt;</code></td><td>Evict cache entries older than N days (good for shared long-running machines).</td></tr>
+              <tr><td><code>--max-active-memory-gb &lt;n&gt;</code></td><td>Conservative ceiling on active unified memory.</td></tr>
+              <tr><td><code>--max-pending-requests &lt;n&gt;</code></td><td>Active-or-queued request cap (default 8); returns 429 when full.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Security &amp; observability</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Flag</th><th>Effect</th></tr></thead>
+            <tbody>
+              <tr><td><code>--api-key &lt;secret&gt;</code></td><td>Require <code>Authorization: Bearer</code> on <code>/v1</code>. Required to bind non-localhost.</td></tr>
+              <tr><td><code>--api-key-env &lt;VAR&gt;</code></td><td>Read the key from an env var instead of the command line (keeps it out of shell history).</td></tr>
+              <tr><td><code>--api-key-file &lt;path&gt;</code></td><td>Read the key from a file.</td></tr>
+              <tr><td><code>--trusted-proxy-host &lt;addr&gt;</code></td><td>Peer allowed to set <code>X-Forwarded-For</code>; ignored from every other peer.</td></tr>
+              <tr><td><code>--audit-log &lt;path&gt;</code></td><td>Write an NDJSON audit log of requests.</td></tr>
+              <tr><td><code>--log-json</code></td><td>Emit structured JSON logs instead of the human banner.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- API -->
+      <section id="api">
+        <h2><a class="hash" href="#api">#</a>HTTP API</h2>
+        <p>daedalus speaks the OpenAI Chat Completions protocol, so existing clients work unchanged.
+        Base URL:</p>
+        <div class="code">
+          <div class="bar"><i></i><i></i><i></i><span>base url</span><button data-copy="http://127.0.0.1:8484/v1">Copy</button></div>
+          <pre>http://127.0.0.1:8484/v1</pre>
+        </div>
+
+        <h3>Inference</h3>
+        <div class="ep"><span class="m post">POST</span><span class="path">/v1/chat/completions</span><span class="desc">Chat completions, streaming or not — with tool-call deltas and <code class="k">reasoning_content</code> separation.</span></div>
+        <div class="ep"><span class="m get">GET</span><span class="path">/v1/models</span><span class="desc">List the resident (and registered swappable) model IDs.</span></div>
+
+        <h3>Operational</h3>
+        <div class="ep"><span class="m get">GET</span><span class="path">/health</span><span class="desc">Liveness. Returns <code class="k">{"status":"ok"}</code> always; model/thermal/memory detail is added when authorized.</span></div>
+        <div class="ep"><span class="m get">GET</span><span class="path">/readyz</span><span class="desc">Admission readiness — is the server able to accept a request right now.</span></div>
+        <div class="ep"><span class="m get">GET</span><span class="path">/metrics</span><span class="desc">Prometheus text: cache, queue-wait, TTFT / decode histograms, request outcomes, thermal level.</span></div>
+
+        <h3>Cache</h3>
+        <div class="ep"><span class="m get">GET</span><span class="path">/v1/cache/stats</span><span class="desc">Authenticated cache inspection — entries, sizes, hit rates.</span></div>
+        <div class="ep"><span class="m del">DELETE</span><span class="path">/v1/cache</span><span class="desc">Clear the cache when the server is idle (authenticated).</span></div>
+
+        <div class="note">
+          <span class="lbl">Reasoning models</span>
+          Chain-of-thought from thinking models is split into <code class="k">reasoning_content</code>
+          so it never leaks into the visible reply. Clients that don't understand reasoning deltas can
+          ignore that optional field.
+        </div>
+      </section>
+
+      <!-- INTEGRATIONS -->
+      <section id="integrations">
+        <h2><a class="hash" href="#integrations">#</a>Agent integrations</h2>
+        <p>Any OpenAI-compatible client works: set its provider base URL to
+        <code class="k">http://127.0.0.1:8484/v1</code> and select the loaded model ID. Leave
+        streaming on — daedalus sends SSE keepalives while a cold prefill is in progress.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Client</th><th>Setup</th></tr></thead>
+            <tbody>
+              <tr><td><b>OpenCode</b></td><td>OpenAI-compatible provider → base URL above + the daedalus model ID. Keep streaming enabled.</td></tr>
+              <tr><td><b>Pi Code</b></td><td>OpenAI-compatible provider mode. Tool-call deltas and <code>reasoning_content</code> are supported.</td></tr>
+              <tr><td><b>Hermes Agent</b></td><td>Same OpenAI-compatible provider mode; chat streaming + tool calls verified.</td></tr>
+              <tr><td><b>Continue / VS Code</b></td><td>Add an OpenAI-compatible model with the base URL and model ID.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>For a LAN deployment, terminate TLS at a reverse proxy (Caddy, nginx), restrict it to your
+        LAN/VPN, and forward the <code class="k">Authorization</code> header unchanged. Full notes in
+        <a class="link" href="https://github.com/therahul-yo/Daedalus/blob/master/docs/integrations.md">integrations.md</a>.</p>
+      </section>
+
+      <!-- PREFIX CACHE -->
+      <section id="prefix-cache">
+        <h2><a class="hash" href="#prefix-cache">#</a>Prefix cache</h2>
+        <p>Coding agents are stateless — they resend the whole conversation every turn. daedalus
+        keeps a <b>persistent prefix cache</b>: RAM LRU on top of disk safetensors, with atomic,
+        corruption-tolerant writes. After the first prefill, the Air never re-burns the GPU for
+        that prefix again — <b>even across restarts</b>.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Request</th><th>TTFT</th><th>Cached tokens</th></tr></thead>
+            <tbody>
+              <tr><td>cold (first ever)</td><td>52.2 s</td><td>0</td></tr>
+              <tr><td>warm (agent's next turn)</td><td><span class="win">0.24 s</span></td><td>8,026</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Crucially, the cache is correct for <b>hybrid-attention models</b> — Qwen3.5's
+        Gated-DeltaNet layers, Gemma&nbsp;4's sliding windows — whose caches cannot simply be
+        trimmed. It uses exact-prefix matching with end-of-prefill snapshots: the reuse stock
+        mlx-lm's server silently misses for these models.</p>
+        <div class="note">
+          <span class="lbl">Isolation</span>
+          Persistent caches are keyed by model, tokenizer, MLX/MLX-LM versions, KV layout, and
+          machine architecture — so an upgrade can never load an incompatible KV snapshot. Pass
+          <code class="k">--model-revision</code> when a model name may resolve to mutable weights.
+        </div>
+      </section>
+
+      <!-- RESUMABLE -->
+      <section id="resumable">
+        <h2><a class="hash" href="#resumable">#</a>Resumable prefill</h2>
+        <p>A cold 30k prefill can outlast a client's hard timeout. daedalus <b>checkpoints every 4k
+        tokens</b>, so a client timeout, crash, or restart resumes exactly where it stopped instead
+        of restarting the whole prefill. Combined with the prefix cache, completed work is never
+        repeated — the retry picks up mid-prompt.</p>
+      </section>
+
+      <!-- GOVERNOR -->
+      <section id="governor">
+        <h2><a class="hash" href="#governor">#</a>Thermal governor</h2>
+        <p>The governor reads macOS's 5-level thermal-pressure signal
+        (<code class="k">com.apple.system.thermalpressurelevel</code>, no <code class="k">sudo</code> —
+        finer than <code class="k">NSProcessInfo</code>, which hides the level where throttling
+        actually starts) and duty-cycles prefill against it: full speed at Nominal, smaller chunks
+        plus idle gaps at Moderate, hold at Heavy. It escalates instantly and de-escalates with
+        hysteresis, because a fanless chassis cools slowly.</p>
+        <p>Measured over four consecutive distinct 20k-token prefills (80,196 tokens, cache disabled
+        — the unavoidable cold worst case), cooled to Nominal before each arm:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Governor OFF</th><th>Governor ON</th></tr></thead>
+            <tbody>
+              <tr><td>Wall clock</td><td>647 s</td><td>1012 s</td></tr>
+              <tr><td>GPU burn time</td><td>647 s</td><td><span class="win">515 s (−20%)</span></td></tr>
+              <tr><td>Burn rate / round</td><td>133 → 119 tok/s</td><td><span class="win">152 → 157 tok/s</span></td></tr>
+              <tr><td>Time at HEAVY (throttled)</td><td>50%</td><td><span class="win">21%</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Unpaced, the Air hits HEAVY inside the first prefill, throttles ~10% immediately, and
+        keeps degrading. Paced, the silicon runs unthrottled whenever it runs — the same work costs
+        <b>20% fewer GPU-seconds</b> (less total heat) at a stable rate, in exchange for longer
+        wall-clock spread across idle gaps that keep the machine usable. With the prefix cache,
+        this cost is paid once per unique prefix, ever.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Profile</th><th>Behaviour</th></tr></thead>
+            <tbody>
+              <tr><td><code>performance</code></td><td>Push the thermal envelope; pace only at the highest pressure.</td></tr>
+              <tr><td><code>balanced</code></td><td>Default. Trade a little wall-clock for a stable, non-decaying rate.</td></tr>
+              <tr><td><code>cool</code></td><td>Keep the chassis coolest; the quietest, gentlest duty cycle.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- KEEPALIVES -->
+      <section id="keepalives">
+        <h2><a class="hash" href="#keepalives">#</a>Keepalives &amp; streaming</h2>
+        <p>A cold prefill can run for minutes — longer than many clients' idle timeout. daedalus
+        streams <b>SSE keepalives</b> carrying progress, thermal state, and ETA from the first
+        second of prefill, so idle-timeout clients never disconnect.</p>
+        <p>Tool-call streaming is strict: OpenAI-format deltas with explicit <code class="k">index</code>,
+        never an empty <code class="k">tool_calls</code> array — the malformed shapes that hang agents
+        are structurally impossible. Tool calling rides mlx-lm's auto-detected per-model parsers
+        (Qwen, Gemma&nbsp;4, …) behind a streaming marker filter, so any model mlx-lm can parse tools
+        for works here too.</p>
+      </section>
+
+      <!-- MULTI MODEL -->
+      <section id="multimodel">
+        <h2><a class="hash" href="#multimodel">#</a>Multi-model swap</h2>
+        <div class="note">
+          <span class="lbl">On main · toward v0.3</span>
+          Swap-only multi-model serving is implemented and unit-tested on <code class="k">main</code>,
+          but <b>real-hardware swap validation is still pending</b> — it is not in the v0.2.0 release.
+        </div>
+        <p>Register extra models with <code class="k">--swap-model</code>. A request for a
+        non-resident model triggers a hot-swap that <b>tears the current engine down</b> — releasing
+        its Metal memory and cache flock — before loading the target, so only one model is ever
+        resident on your 16&nbsp;GB. Admission is checked against a derived, hybrid-aware weights+KV
+        estimate; swaps are rate-limited by a cooldown; and a failed target load restores the
+        previous model rather than stranding the server.</p>
+      </section>
+
+      <!-- SECURITY -->
+      <section id="security">
+        <h2><a class="hash" href="#security">#</a>Operating safely</h2>
+        <p>daedalus binds to <code class="k">127.0.0.1</code> by default. To expose it on a LAN, an
+        API key is required <b>explicitly</b>:</p>
+        <div class="code">
+          <div class="bar"><i></i><i></i><i></i><span>shell</span><button data-copy='daedalus serve --model ... --host 0.0.0.0 --api-key-env DAEDALUS_API_KEY'>Copy</button></div>
+          <pre>daedalus serve --model ... \
+  --host 0.0.0.0 \
+  --api-key-env DAEDALUS_API_KEY</pre>
+        </div>
+        <ul>
+          <li>Prefer <code class="k">--api-key-env</code> or <code class="k">--api-key-file</code> over
+          <code class="k">--api-key</code> so the secret never lands in shell history.</li>
+          <li>Terminate TLS at a local reverse proxy before the service is LAN-reachable.</li>
+          <li>The server admits at most <b>8</b> active-or-queued requests by default
+          (<code class="k">--max-pending-requests</code>) and returns a standard 429 when full, rather
+          than accumulating unbounded worker threads.</li>
+          <li>Use <code class="k">--trusted-proxy-host</code> so <code class="k">X-Forwarded-For</code>
+          is honored only from your proxy.</li>
+        </ul>
+        <p>For a persistent Mac service, customize
+        <code class="k">scripts/com.daedalus.server.plist.template</code> and load it with
+        <code class="k">launchctl bootstrap</code>. Keep the secret in a root-readable env file or
+        secret manager — never commit it into the plist.</p>
+      </section>
+
+      <!-- TUNING -->
+      <section id="tuning">
+        <h2><a class="hash" href="#tuning">#</a>Tuning &amp; benchmarks</h2>
+        <p>The fastest safe prefill chunk varies by model, RAM, and Mac generation. Measure it from a
+        cool machine, then pass the recommendation to <code class="k">serve</code>:</p>
+        <div class="code">
+          <div class="bar"><i></i><i></i><i></i><span>shell</span><button data-copy="daedalus tune --model mlx-community/Qwen3.5-9B-MLX-4bit --out tune.json">Copy</button></div>
+          <pre>daedalus tune --model mlx-community/Qwen3.5-9B-MLX-4bit --out tune.json
+<span class="c"># use the returned recommended_prefill_chunk_tokens value</span>
+daedalus serve --model ... --prefill-chunk-tokens 4096</pre>
+        </div>
+        <p>The tuned size applies only while thermal pressure is Nominal — daedalus still switches to
+        smaller thermal-profile chunks automatically when the laptop gets hot.</p>
+        <h3>vs llama.cpp</h3>
+        <p>Same machine, same 8,000-token agent prompt, Qwen3.5-9B at 4-bit (MLX 4-bit vs GGUF
+        Q4_K_M), identical protocol via <code class="k">bench/head_to_head.py --wait-nominal</code> so
+        neither engine inherits the other's heat:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>cold TTFT</th><th>warm TTFT</th><th>after restart</th><th>decode</th></tr></thead>
+            <tbody>
+              <tr><td><b>daedalus</b></td><td><span class="win">50.8 s</span></td><td><span class="win">0.22 s</span></td><td><span class="win">0.55 s</span></td><td><span class="win">18.2 tok/s</span></td></tr>
+              <tr><td>llama-server</td><td>57.3 s</td><td>0.60 s</td><td>78.6 s</td><td>13.8 tok/s</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>The decisive column is the restart: llama.cpp's slot cache dies with the process, so a
+        daemon restart re-pays the full 8k prefill — on a chassis its own workload just heated —
+        while daedalus reloads the snapshot from disk in half a second. Reproduce with
+        <code class="k">python bench/head_to_head.py --wait-nominal</code>.</p>
+        <h3>Release gating</h3>
+        <p>Compare two real-model benchmark artifacts; the default gate allows at most 10% TTFT and
+        5% prefill-throughput regression:</p>
+        <div class="code">
+          <div class="bar"><i></i><i></i><i></i><span>shell</span><button data-copy="python bench/regression.py baseline.json candidate.json">Copy</button></div>
+          <pre>python bench/regression.py baseline.json candidate.json</pre>
+        </div>
+      </section>
+
+      <!-- TROUBLESHOOTING -->
+      <section id="troubleshooting">
+        <h2><a class="hash" href="#troubleshooting">#</a>Troubleshooting</h2>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Symptom</th><th>Fix</th></tr></thead>
+            <tbody>
+              <tr><td>Client times out on the first request</td><td>That's the cold prefill. Keep streaming enabled so keepalives flow, or <code>daedalus warm</code> the prefix first while cool.</td></tr>
+              <tr><td>Every request is a cache miss</td><td>The prefix isn't byte-identical, or the cache key changed after an MLX/model upgrade. Pin with <code>--model-revision</code>.</td></tr>
+              <tr><td>Prefill feels slow / throttled</td><td>Expected under HEAVY pressure — the governor is protecting the chassis. Try <code>--profile performance</code> from a cool start, or <code>daedalus tune</code>.</td></tr>
+              <tr><td>429 responses under load</td><td>You hit <code>--max-pending-requests</code> (default 8). Raise it, or let the client back off.</td></tr>
+              <tr><td>Can't reach it from another machine</td><td>It binds <code>127.0.0.1</code>. Add <code>--host 0.0.0.0</code> <em>and</em> an API key — see <a class="link" href="#security">Operating safely</a>.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- FAQ -->
+      <section id="faq">
+        <h2><a class="hash" href="#faq">#</a>FAQ</h2>
+        <h3>Does it work on an Intel Mac or non-Apple hardware?</h3>
+        <p>No. daedalus is built on MLX and requires an Apple Silicon Mac. The thermal governor reads
+        an Apple-specific pressure signal.</p>
+        <h3>Which models are supported?</h3>
+        <p>Anything mlx-lm can load. The validated target is <code class="k">Qwen3.5-9B-MLX-4bit</code>;
+        Gemma&nbsp;4 E4B / 12B MLX 4-bit are designed for and next up for a real-model run.</p>
+        <h3>Why not just use ollama or LM Studio?</h3>
+        <p>They don't persist KV across restarts and they aren't thermally aware. On a fanless Air a
+        cold agent prompt throttles the machine and a restart re-pays the whole prefill — the two
+        exact problems daedalus is built to remove. See the <a class="link" href="/#benchmarks">benchmarks</a>.</p>
+        <h3>Is my chat data sent anywhere?</h3>
+        <p>No. Everything runs locally. The only network access is downloading model weights the first
+        time (via Hugging Face / mlx-lm), exactly like any local MLX setup.</p>
+        <h3>What's the license?</h3>
+        <p>Apache-2.0.</p>
+
+        <div class="nextprev">
+          <a href="/#install">
+            <div class="k">Get started</div>
+            <div class="t">Install &amp; run in three commands →</div>
+          </a>
+          <a href="https://github.com/therahul-yo/Daedalus">
+            <div class="k">Source</div>
+            <div class="t">Read the code on GitHub →</div>
+          </a>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <footer>
+    <span>daedalus — Apache-2.0</span>
+    <span>Built on <a href="https://github.com/ml-explore/mlx-lm">mlx-lm</a> · Validated on a real MacBook Air · No wax was melted</span>
+  </footer>
+</div>
+
+<script>
+  // copy buttons
+  document.querySelectorAll("[data-copy]").forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(btn.dataset.copy);
+        const old = btn.textContent;
+        btn.textContent = "Copied";
+        setTimeout(() => (btn.textContent = old), 1200);
+      } catch {}
+    })
+  );
+
+  // scroll-spy: highlight the sidebar link for the section in view
+  const links = new Map();
+  document.querySelectorAll("aside a").forEach((a) => {
+    const id = a.getAttribute("href").slice(1);
+    if (id) links.set(id, a);
+  });
+  const spy = new IntersectionObserver(
+    (entries) => {
+      entries.forEach((e) => {
+        if (!e.isIntersecting) return;
+        links.forEach((a) => a.classList.remove("active"));
+        const a = links.get(e.target.id);
+        if (a) a.classList.add("active");
+      });
+    },
+    { rootMargin: "-70px 0px -70% 0px", threshold: 0 }
+  );
+  document.querySelectorAll("section[id]").forEach((s) => spy.observe(s));
+</script>

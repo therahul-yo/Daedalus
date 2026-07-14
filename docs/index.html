@@ -1,3 +1,6 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="daedalus is a local, OpenAI-compatible MLX inference server that treats a fanless MacBook Air's thermal envelope as a first-class scheduling constraint — persistent prefix cache, resumable prefill, and a thermal governor.">
 <title>daedalus — the thermal inference engine for MacBook Air</title>
 <style>
   :root {
@@ -194,6 +197,58 @@
   .cell p { font-size: 14px; color: var(--gray); line-height: 1.65; }
   .cell code { font-size: 12.5px; color: var(--ink); background: #161616; padding: 1px 6px; border-radius: 5px; }
 
+  /* ---------- anatomy / flow ---------- */
+  .flow { margin-top: 52px; max-width: 760px; }
+  .step {
+    display: grid; grid-template-columns: 46px 1fr; gap: 22px;
+    padding-bottom: 34px; position: relative;
+  }
+  .step:last-child { padding-bottom: 0; }
+  .step .num {
+    width: 46px; height: 46px; border-radius: 12px;
+    border: 1px solid var(--border-lit); background: var(--panel);
+    display: flex; align-items: center; justify-content: center;
+    font-family: "SF Mono", Menlo, monospace; font-size: 16px; font-weight: 600;
+    color: var(--ink); z-index: 1;
+  }
+  .step:not(:last-child)::before {
+    content: ""; position: absolute; left: 23px; top: 46px; bottom: 0;
+    width: 1px; background: linear-gradient(var(--border-lit), var(--border));
+  }
+  .step .body h3 { font-size: 16px; font-weight: 600; letter-spacing: -0.01em; margin: 10px 0 6px; }
+  .step .body p { font-size: 14.5px; color: var(--gray); line-height: 1.65; max-width: 600px; }
+  .step .body code { font-size: 12.5px; color: var(--ink); background: #161616; padding: 1px 6px; border-radius: 5px; }
+  .step .body .tag {
+    display: inline-block; margin-top: 8px; font-family: "SF Mono", Menlo, monospace;
+    font-size: 11px; letter-spacing: 0.04em; color: var(--gray-dark);
+  }
+
+  /* ---------- comparison matrix ---------- */
+  .matrix-wrap { margin-top: 52px; overflow-x: auto; }
+  .matrix { border-collapse: collapse; width: 100%; min-width: 640px; font-size: 14px; }
+  .matrix th, .matrix td { padding: 15px 14px; text-align: center; border-bottom: 1px solid var(--border); }
+  .matrix thead th {
+    font-family: "SF Mono", Menlo, monospace; font-size: 12px; font-weight: 500;
+    color: var(--gray); letter-spacing: -0.01em;
+  }
+  .matrix thead th.daed { color: var(--ink); }
+  .matrix tbody td:first-child, .matrix thead th:first-child {
+    text-align: left; color: var(--ink); font-weight: 500;
+    font-family: -apple-system, BlinkMacSystemFont, sans-serif; font-size: 14px;
+  }
+  .matrix .daed { background: rgba(255,106,0,0.045); }
+  .matrix tbody tr:hover td { background: #0a0a0a; }
+  .matrix tbody tr:hover td.daed { background: rgba(255,106,0,0.07); }
+  .matrix .yes { color: #50e3c2; font-size: 15px; }
+  .matrix .no { color: var(--gray-dark); font-size: 15px; }
+  .matrix .part { color: var(--yellow-b); font-size: 12px; font-family: "SF Mono", Menlo, monospace; }
+  .matrix-note { margin-top: 22px; font-size: 12.5px; color: var(--gray-dark); }
+
+  /* ---------- docs cta ---------- */
+  .docs-cta { text-align: center; }
+  .docs-cta .row { margin-top: 34px; display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+  .docs-cta .pill { padding: 12px 28px; font-size: 15px; }
+
   /* ---------- install ---------- */
   .install { text-align: center; }
   .install h2 { margin: 0 auto; }
@@ -239,7 +294,8 @@
     <span class="links">
       <a href="#benchmarks">Benchmarks</a>
       <a href="#features">Features</a>
-      <a href="https://github.com/ml-explore/mlx-lm">MLX</a>
+      <a href="/docs">Docs</a>
+      <a class="gh" href="https://github.com/therahul-yo/Daedalus">GitHub</a>
       <a class="pill" href="#install">Install</a>
     </span>
   </nav>
@@ -346,6 +402,65 @@
     </div>
   </div>
 
+  <div class="band" id="how">
+    <div class="sec reveal">
+      <p class="kicker">Anatomy of a request</p>
+      <h2>Five things happen before your agent waits.</h2>
+      <p class="lede">Every prompt runs the same pipeline. The whole design goal is that steps 2–5
+      almost never do the expensive thing twice.</p>
+      <div class="flow">
+        <div class="step">
+          <div class="num">1</div>
+          <div class="body">
+            <h3>Match the prefix</h3>
+            <p>The incoming prompt is looked up in the persistent cache — RAM LRU over disk
+            safetensors, exact-prefix matched. A hit means the KV state is already on disk, so the
+            first <code>N−1</code> tokens are free.</p>
+            <span class="tag">cache · RAM + disk · survives restarts</span>
+          </div>
+        </div>
+        <div class="step">
+          <div class="num">2</div>
+          <div class="body">
+            <h3>Prefill only what's new</h3>
+            <p>Only the uncached tail is prefilled. Coding agents resend the whole conversation each
+            turn, so after the first request the tail is usually a handful of tokens — not 20,000.</p>
+            <span class="tag">correct even for hybrid-attention models</span>
+          </div>
+        </div>
+        <div class="step">
+          <div class="num">3</div>
+          <div class="body">
+            <h3>Pace against the chassis</h3>
+            <p>If a cold prefill is unavoidable, the governor reads the live thermal-pressure level
+            and duty-cycles the burn — full speed at Nominal, idle gaps at Moderate, hold at Heavy —
+            checkpointing every 4k tokens so a timeout resumes where it stopped.</p>
+            <span class="tag">no sudo · escalates instantly · hysteresis on cooldown</span>
+          </div>
+        </div>
+        <div class="step">
+          <div class="num">4</div>
+          <div class="body">
+            <h3>Keep the client alive</h3>
+            <p>SSE keepalives stream progress, thermal state, and ETA from the first second, so a
+            client's idle timeout never fires mid-prefill.</p>
+            <span class="tag">progress · thermal · eta</span>
+          </div>
+        </div>
+        <div class="step">
+          <div class="num">5</div>
+          <div class="body">
+            <h3>Stream a clean reply</h3>
+            <p>Decode streams OpenAI-format deltas with well-formed tool calls; thinking-model
+            chain-of-thought is split into <code>reasoning_content</code>. The finished KV snapshot
+            is saved so the next turn is a step-1 hit.</p>
+            <span class="tag">tool_calls always well-formed · reasoning separated</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div class="band" id="features">
     <div class="sec reveal" style="padding-bottom: 0;">
       <p class="kicker">Why it exists</p>
@@ -404,6 +519,71 @@
     </div>
   </div>
 
+  <div class="band" id="compare">
+    <div class="sec reveal">
+      <p class="kicker">How it compares</p>
+      <h2>Great engines exist. None target this laptop.</h2>
+      <p class="lede">ollama, LM Studio, llama.cpp, and stock mlx-lm are excellent general local
+      servers. daedalus isn't trying to replace them — it optimizes the one machine they don't
+      design for: the fanless, memory-tight Air.</p>
+      <div class="matrix-wrap">
+        <table class="matrix">
+          <thead>
+            <tr>
+              <th>Capability</th>
+              <th class="daed">daedalus</th>
+              <th>ollama</th>
+              <th>LM&nbsp;Studio</th>
+              <th>llama.cpp</th>
+              <th>mlx-lm</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>OpenAI-compatible server</td>
+              <td class="daed"><span class="yes">●</span></td>
+              <td><span class="yes">●</span></td><td><span class="yes">●</span></td><td><span class="yes">●</span></td><td><span class="yes">●</span></td>
+            </tr>
+            <tr>
+              <td>Native MLX (Apple GPU)</td>
+              <td class="daed"><span class="yes">●</span></td>
+              <td><span class="no">○</span></td><td><span class="yes">●</span></td><td><span class="no">○</span></td><td><span class="yes">●</span></td>
+            </tr>
+            <tr>
+              <td>KV cache survives restart</td>
+              <td class="daed"><span class="yes">●</span></td>
+              <td><span class="no">○</span></td><td><span class="no">○</span></td><td><span class="no">○</span></td><td><span class="no">○</span></td>
+            </tr>
+            <tr>
+              <td>Hybrid-attention prefix reuse</td>
+              <td class="daed"><span class="yes">●</span></td>
+              <td><span class="no">○</span></td><td><span class="no">○</span></td><td><span class="no">○</span></td><td><span class="part">partial</span></td>
+            </tr>
+            <tr>
+              <td>Resumable prefill on timeout</td>
+              <td class="daed"><span class="yes">●</span></td>
+              <td><span class="no">○</span></td><td><span class="no">○</span></td><td><span class="no">○</span></td><td><span class="no">○</span></td>
+            </tr>
+            <tr>
+              <td>Thermal-aware pacing</td>
+              <td class="daed"><span class="yes">●</span></td>
+              <td><span class="no">○</span></td><td><span class="no">○</span></td><td><span class="no">○</span></td><td><span class="no">○</span></td>
+            </tr>
+            <tr>
+              <td>Tuned for the fanless Air</td>
+              <td class="daed"><span class="yes">●</span></td>
+              <td><span class="no">○</span></td><td><span class="no">○</span></td><td><span class="no">○</span></td><td><span class="no">○</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="matrix-note">Reflects each engine's default local-server behavior. The restart and
+      thermal rows are the ones measured on real hardware — see the
+      <a href="#benchmarks" style="color:var(--gray);border-bottom:1px solid #333;">benchmarks</a>
+      and the <a href="/docs" style="color:var(--gray);border-bottom:1px solid #333;">docs</a>.</p>
+    </div>
+  </div>
+
   <div class="band" id="install">
     <div class="sec install reveal">
       <p class="kicker">Install</p>
@@ -418,6 +598,19 @@
       </div>
       <p class="then">Then point pi, OpenCode, or any OpenAI-compatible agent at
       <code>http://127.0.0.1:8484/v1</code></p>
+    </div>
+  </div>
+
+  <div class="band">
+    <div class="sec docs-cta reveal">
+      <p class="kicker">Go deeper</p>
+      <h2 style="margin: 0 auto;">The full manual is one click away.</h2>
+      <p class="lede" style="margin: 18px auto 0;">CLI reference, every config flag, the HTTP API, agent
+      setup, and how the cache and governor actually work.</p>
+      <div class="row">
+        <a class="pill" href="/docs">Read the Docs</a>
+        <a class="pill ghost" href="https://github.com/therahul-yo/Daedalus">View Source</a>
+      </div>
     </div>
   </div>
 
