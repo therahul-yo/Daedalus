@@ -1,15 +1,25 @@
 # -*- mode: python ; coding: utf-8 -*-
+from pathlib import Path
+
+from PyInstaller.utils.hooks import collect_submodules
+
+# PyInstaller resolves relative script/data paths against the SPEC file's
+# directory (packaging/pyinstaller/), not the invocation cwd — anchor to the
+# repo root explicitly or the release build dies with "script not found".
+ROOT = Path(SPECPATH).resolve().parent.parent
 
 block_cipher = None
 
+# Import daedalus as a real package (via pathex), NOT as bundled source data:
+# shipping daedalus/ as `datas` made the frozen import of daedalus.cache.store
+# fail ("Modified Name"/ImportError) because the submodules weren't collected.
+# collect_submodules pulls every daedalus.* module into the archive.
 a = Analysis(
-    ['daedalus/cli.py'],
-    pathex=[],
+    [str(ROOT / 'daedalus' / 'cli.py')],
+    pathex=[str(ROOT)],
     binaries=[],
-    datas=[
-        ('daedalus', 'daedalus'),
-    ],
-    hiddenimports=[
+    datas=[],
+    hiddenimports=collect_submodules('daedalus') + [
         'mlx',
         'mlx.core',
         'mlx.nn',
