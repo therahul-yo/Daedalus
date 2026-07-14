@@ -100,6 +100,11 @@ def cache_admin(action: str, client_ip: str, **extra: Any) -> None:
     _emit("cache_admin", action=action, client_ip=client_ip, **extra)
 
 
+def model_swap(from_model: str, to_model: str, **extra: Any) -> None:
+    """Called when the resident model is hot-swapped (multi-model mode)."""
+    _emit("model_swap", from_model=from_model, to_model=to_model, **extra)
+
+
 def close() -> None:
     """Flush and remove the rotating handler so the file can be rotated."""
     global _handler

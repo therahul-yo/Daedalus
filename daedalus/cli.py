@@ -108,6 +108,33 @@ def cmd_serve(args) -> int:
         exclusive=True,
         cache_ttl_days=args.cache_ttl_days,
     )
+
+    def load_swap_model(swap_id: str):
+        """Load one target only after the previous model has been released."""
+        log.info("loading swap model %s", swap_id)
+        swap_eng = Engine.from_pretrained(
+            swap_id,
+            monitor=monitor,
+            governor=governor,
+            config=EngineConfig(
+                kv_bits=args.kv_bits or None,
+                prefill_chunk_tokens=args.prefill_chunk_tokens,
+                clear_metal_cache_between_chunks=args.clear_metal_cache_between_chunks,
+                num_draft_tokens=args.num_draft_tokens,
+            ),
+            draft_model_path=args.draft_model,
+        )
+        swap_cache_key = cache_identity(
+            swap_id, kv_bits=args.kv_bits or None,
+            tokenizer_id=getattr(swap_eng.tokenizer, "name_or_path", swap_id),
+            model_revision=args.model_revision, draft_model=args.draft_model,
+        )
+        return swap_eng, PrefixCacheStore(
+            swap_cache_key,
+            max_ram_bytes=args.cache_ram_mb * 1024**2 if args.cache_ram_mb else None,
+            max_disk_bytes=args.cache_disk_gb * 1024**3,
+            exclusive=True,
+        )
     cache_stats = store.stats()
     app = create_app(
         engine, store, model_id=args.model, max_pending_requests=args.max_pending_requests,
@@ -122,6 +149,8 @@ def cmd_serve(args) -> int:
         global_rps=args.global_rps,
         shutdown_timeout=args.shutdown_timeout,
         trusted_proxy_hosts=args.trusted_proxy_hosts,
+        model_paths={swap_id: swap_id for swap_id in args.swap_model},
+        model_loader=load_swap_model if args.swap_model else None,
     )
 
     bar = "─" * 62
@@ -363,7 +392,12 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     serve = sub.add_parser("serve", help="run the OpenAI-compatible server")
-    serve.add_argument("--model", required=True)
+    serve.add_argument("--model", required=True,
+                       help="default model id/path (also the resident model at startup)")
+    serve.add_argument("--swap-model", action="append", default=[],
+                       metavar="MODEL",
+                       help="additional model id/path the server may hot-swap to on request "
+                            "(repeatable); unknown models in a request still return 404")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8080)
     serve.add_argument(

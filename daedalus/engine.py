@@ -136,6 +136,17 @@ class Engine:
         if self.monitor is not None:
             self.monitor.stop()
 
+    def shutdown(self) -> None:
+        """Release model weights and KV cache; idempotent."""
+        # Drop references so Python GC can free the MLX arrays
+        self.model = None
+        self.tokenizer = None
+        self.draft_model = None
+        self.monitor = None
+        self.governor = None
+        # Clear MLX's internal cache
+        mx.clear_cache()
+
     def make_cache(self) -> List[Any]:
         cache = cache_mod.make_prompt_cache(self.model)
         if self.draft_model is not None:
