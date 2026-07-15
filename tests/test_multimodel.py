@@ -11,7 +11,7 @@ from daedalus.server import (
     MODEL_MEMORY_CEILING_GB,
 )
 from daedalus.server import ModelProfile
-from test_server import FakeEngine, FakeStore
+from test_server import FakeEngine, FakeGovernor, FakeStore
 
 # Give the test model ids deliberately small profiles so two fit under the
 # 16GB ceiling (the fallback profile would otherwise over-count KV at 64K ctx
@@ -105,6 +105,31 @@ def test_swap_candidates_are_not_loaded_at_startup():
     assert loaded == ["model-a"]
 
 
+def test_invalid_request_does_not_trigger_a_model_swap():
+    app, *_ = make_app()
+    loaded = []
+    original_loader = app.state.daedalus.model_loader
+
+    def loader(model_id):
+        loaded.append(model_id)
+        return original_loader(model_id)
+
+    app.state.daedalus.model_loader = loader
+    client = __import__("fastapi.testclient", fromlist=["TestClient"]).TestClient(app)
+    response = client.post("/v1/chat/completions", json={"model": "model-a", "messages": []})
+    assert response.status_code == 400
+    assert loaded == []
+
+
+def test_models_lists_registered_candidates_and_marks_the_active_one():
+    app, *_ = make_app()
+    client = __import__("fastapi.testclient", fromlist=["TestClient"]).TestClient(app)
+    models = {item["id"]: item for item in client.get("/v1/models").json()["data"]}
+    assert set(models) == {"default", "model-a", "model-b"}
+    assert models["default"]["active"] is True
+    assert models["model-a"]["active"] is False
+
+
 def test_swap_cooldown_rejects_second_swap():
     app, default_eng, a_eng, b_eng = make_app()
     client = __import__("fastapi.testclient", fromlist=["TestClient"]).TestClient(app)
@@ -142,6 +167,32 @@ def test_swap_waits_for_post_engine_work_before_teardown():
     assert not state.wait_for_engine_drain(timeout=0.0)
     state.finish_engine_task()
     assert state.wait_for_engine_drain(timeout=0.0)
+
+
+def test_swap_does_not_stop_a_service_owned_monitor():
+    from daedalus.engine import Engine
+
+    class Monitor:
+        def __init__(self):
+            self.stopped = 0
+
+        def stop(self):
+            self.stopped += 1
+
+    _, default_store, _ = make_spec("default-model-text")
+    target_eng, target_store, target_path = make_spec("model-a-text")
+    monitor = Monitor()
+    service_engine = Engine(None, None, FakeGovernor(), monitor=monitor)
+    app = create_app(
+        service_engine,
+        default_store,
+        model_id="default",
+        model_paths={"model-a": target_path},
+        model_loader=lambda _: (target_eng, target_store),
+    )
+    ok, message = app.state.daedalus.swap_model("model-a")
+    assert ok, message
+    assert monitor.stopped == 0
 
 
 def test_cache_isolation_across_models():

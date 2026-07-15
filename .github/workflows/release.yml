@@ -80,7 +80,7 @@ jobs:
     timeout-minutes: 15
     # Only when this is the canonical repo AND a standalone binary was
     # actually produced (otherwise there is nothing for the formula to point at).
-    if: github.repository == 'therahul-yo/daedalus' && needs.build.outputs.binary_sha256 != ''
+    if: github.repository == 'therahul-yo/Daedalus' && needs.build.outputs.binary_sha256 != ''
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Update Homebrew formula

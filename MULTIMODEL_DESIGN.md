@@ -15,7 +15,8 @@
 - Reserved: 3.5 (macOS) + 0.8 (process) + 1.0 (safety) = 5.3 GB
 - Usable ceiling `MODEL_MEMORY_CEILING_GB = 10.7` for weights + KV of the active model.
 - `SWAP_SAFETY_GB = 1.0` kept free during a swap so both engines are never resident.
-- Admission: `candidate.total_gb(ctx) + SWAP_SAFETY_GB <= 10.7 - active.total_gb(ctx)`.
+- Admission: `candidate.total_gb(ctx) + SWAP_SAFETY_GB <= 10.7`. The old model
+  is released before the target loads, so inactive models never consume RAM.
 
 ## Profiles — derived, not hardcoded
 - `derive_model_profile(model_id, model_path)`:
@@ -31,11 +32,12 @@
 1. Request names a registered non-resident model.
 2. `state.swap_model()`:
    - 404 already handled upstream (unknown model).
-   - Reject if model not preloaded → 409 "not loaded".
    - Reject if within `swap_cooldown_seconds` (default 30s) → 409 "swap cooldown".
    - `FifoLock.acquire_for_swap()` blocks new admits and waits until the engine
      is idle (no holder, queue drained).
-   - Repoint `state.engine`/`state.store`/`token_cache`/`head_cache`/`model_id`.
+   - Drain deferred snapshot persistence, close the old store, tear down the
+     old engine, clear Metal memory, then lazy-load the target and repoint
+     `state.engine`/`state.store`/`token_cache`/`head_cache`/`model_id`.
    - `FifoLock.release_after_swap()` lets new admits proceed.
    - Emit `audit_logger.model_swap(from, to)`.
 3. In-flight requests that already hold the lock finish on the *old* engine; the
@@ -48,12 +50,13 @@
   - `model` registered, not resident, fits → swap, then serve.
   - `model` registered, not resident, over budget/cooldown → **409** with detail.
   - `model` unknown → **404** (model_not_found, from #17).
-- `POST /v1/models` lists only the resident model (single-engine server).
+- `GET /v1/models` lists registered models and marks the resident one with
+  `active: true`; selecting another id still performs a swap on demand.
 
 ## CLI
 - `daedalus serve --model qwen-7b --swap-model qwen-3b --swap-model qwen-3.5-9b`
-  preloads each swap model (own engine + own `PrefixCacheStore`). Swap is then
-  instant on first request. Preload failures are non-fatal (logged warning).
+  registers each target path without loading it. The first request for a target
+  pays its load time, but only one model is resident on a 16GB machine.
 
 ## Tests (tests/test_multimodel.py — all green)
 - unknown model → 404

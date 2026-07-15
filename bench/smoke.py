@@ -1,27 +1,31 @@
 """End-to-end smoke test on a real model: paced prefill + decode.
 
-Usage: python bench/smoke.py [model_id] [prompt_tokens]
+Usage: python bench/smoke.py [model_id] [prompt_tokens] [--out result.json]
 """
 
-import sys
+import argparse
+import json
+import platform
 import time
+from pathlib import Path
 
 from daedalus.engine import Engine
 from daedalus.sensors import ThermalMonitor
 
-MODEL = sys.argv[1] if len(sys.argv) > 1 else "mlx-community/Qwen3-0.6B-4bit"
-PROMPT_TOKENS = int(sys.argv[2]) if len(sys.argv) > 2 else 4000
-
-
 def main():
-    print(f"loading {MODEL} ...")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("model", nargs="?", default="mlx-community/Qwen3-0.6B-4bit")
+    parser.add_argument("prompt_tokens", nargs="?", type=int, default=4000)
+    parser.add_argument("--out", help="write a fingerprinted benchmark artifact")
+    args = parser.parse_args()
+    print(f"loading {args.model} ...")
     t0 = time.perf_counter()
     monitor = ThermalMonitor().start()
-    engine = Engine.from_pretrained(MODEL, monitor=monitor)
+    engine = Engine.from_pretrained(args.model, monitor=monitor)
     print(f"loaded in {time.perf_counter() - t0:.1f}s | thermal={monitor.level.name}")
 
     # Build a long-ish prompt: repeated context + a question, chat-templated.
-    filler = "The quick brown fox jumps over the lazy dog. " * (PROMPT_TOKENS // 10)
+    filler = "The quick brown fox jumps over the lazy dog. " * (args.prompt_tokens // 10)
     messages = [
         {"role": "system", "content": "You are a concise assistant. " + filler},
         {"role": "user", "content": "Reply with exactly: SMOKE OK"},
@@ -59,6 +63,35 @@ def main():
     print(f"thermal after: {monitor.level.name}")
     monitor.stop()
     assert len(progress_events) >= 2, "expected chunked prefill progress"
+    if args.out:
+        prefill_wall = first_token_at - t1 if first_token_at else 0.0
+        artifact = {
+            "schema_version": 1,
+            "config": {
+                "model": args.model,
+                "governor": "balanced",
+                "kv_bits": engine.config.kv_bits,
+                "prompt_tokens": len(tokens),
+                "max_tokens": 40,
+                "machine": platform.machine(),
+                "macos": platform.mac_ver()[0],
+                "cache_mode": "cold",
+            },
+            "software": {
+                "mlx": getattr(__import__("mlx.core", fromlist=["__version__"]), "__version__", "unknown"),
+                "mlx_lm": getattr(__import__("mlx_lm"), "__version__", "unknown"),
+            },
+            "metrics": {
+                "ttft_s": round(ttft, 3),
+                "prefill_tps_wall": round((len(tokens) - 1) / prefill_wall, 1)
+                if prefill_wall else 0.0,
+                "generation_tps": round(last.generation_tps, 2) if last else 0.0,
+            },
+        }
+        output = Path(args.out)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(artifact, indent=2) + "\n")
+        print(f"wrote {output}")
     print("SMOKE PASSED")
 
 

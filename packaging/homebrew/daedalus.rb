@@ -1,10 +1,11 @@
 class Daedalus < Formula
   desc "MacBook-Air-first MLX inference engine: thermally-governed prefill, persistent prefix cache, OpenAI-compatible server"
-  homepage "https://github.com/therahul-yo/daedalus"
-  url "https://github.com/therahul-yo/daedalus/archive/refs/tags/v0.2.0.tar.gz"
-  sha256 "PLACEHOLDER_SHA256"
+  homepage "https://github.com/therahul-yo/Daedalus"
+  # The canonical tap receives verified binary releases from release.yml.
+  # This in-repo template intentionally supports head installs only; claiming
+  # a stable artifact without its real SHA256 would be unsafe.
   license "Apache-2.0"
-  head "https://github.com/therahul-yo/daedalus.git", branch: "master"
+  head "https://github.com/therahul-yo/Daedalus.git", branch: "master"
 
   depends_on "uv" => :build
   depends_on "mlx"

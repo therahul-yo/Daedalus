@@ -134,6 +134,7 @@ def cmd_serve(args) -> int:
             max_ram_bytes=args.cache_ram_mb * 1024**2 if args.cache_ram_mb else None,
             max_disk_bytes=args.cache_disk_gb * 1024**3,
             exclusive=True,
+            cache_ttl_days=args.cache_ttl_days,
         )
     cache_stats = store.stats()
     app = create_app(
@@ -308,25 +309,31 @@ def cmd_warm(args) -> int:
         tokenizer_id=getattr(engine.tokenizer, "name_or_path", args.model),
         model_revision=args.model_revision,
     ), exclusive=True)
-    for i, item in enumerate(prompts):
-        tokens = engine.tokenizer.apply_chat_template(
-            item["messages"], add_generation_prompt=True
-        )
-        if store.fetch(tokens) is not None:
-            print(f"[{i}] already cached ({len(tokens)} tokens)")
-            continue
-        cache = engine.make_cache()
-        report = engine.paced_prefill(
-            tokens,
-            cache,
-            progress_cb=lambda done, total: print(
-                f"\r[{i}] prefill {done}/{total}", end="", flush=True
-            ),
-        )
-        store.put(tokens[: report.computed_tokens], cache)
-        print(f"\n[{i}] cached {report.computed_tokens} tokens")
-    print("warm done")
-    return 0
+    try:
+        for i, item in enumerate(prompts):
+            tokens = engine.tokenizer.apply_chat_template(
+                item["messages"], add_generation_prompt=True
+            )
+            if store.fetch(tokens) is not None:
+                print(f"[{i}] already cached ({len(tokens)} tokens)")
+                continue
+            cache = engine.make_cache()
+            report = engine.paced_prefill(
+                tokens,
+                cache,
+                progress_cb=lambda done, total: print(
+                    f"\r[{i}] prefill {done}/{total}", end="", flush=True
+                ),
+            )
+            store.put(tokens[: report.computed_tokens], cache)
+            print(f"\n[{i}] cached {report.computed_tokens} tokens")
+        print("warm done")
+        return 0
+    finally:
+        store.close()
+        engine.close()
+        engine.shutdown()
+        monitor.stop()
 
 
 def cmd_tune(args) -> int:
@@ -540,6 +547,8 @@ def main() -> int:
             ap.error("use only one of --api-key, --api-key-env, or --api-key-file")
         if args.prefill_chunk_tokens is not None and args.prefill_chunk_tokens < 128:
             ap.error("--prefill-chunk-tokens must be at least 128")
+        if not 0 < args.max_duty <= 1:
+            ap.error("--max-duty must be in (0, 1]")
         if args.max_active_memory_gb is not None and args.max_active_memory_gb <= 0:
             ap.error("--max-active-memory-gb must be positive")
         if args.max_prompt_tokens < 1 or args.max_completion_tokens < 1:

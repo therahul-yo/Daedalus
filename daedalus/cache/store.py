@@ -28,6 +28,7 @@ import copy
 import hashlib
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -126,6 +127,12 @@ class PrefixCacheStore:
         self.model_key = model_key
         self.dir = (cache_dir or _default_cache_dir()) / _sanitize_model_key(model_key)
         self.dir.mkdir(parents=True, exist_ok=True)
+        # Prompt tokens can contain proprietary system prompts and user data.
+        # Keep the cache private even when a permissive umask is in effect.
+        try:
+            self.dir.chmod(0o700)
+        except OSError:
+            logger.warning("could not restrict cache directory permissions: %s", self.dir)
         self._process_lock = None
         if exclusive:
             import fcntl
@@ -452,11 +459,25 @@ class PrefixCacheStore:
                     }
                 )
             )
+            tmp.chmod(0o600)
+            sidecar_tmp.chmod(0o600)
+            # Flush both payloads before publishing their names. Directory
+            # fsync after rename makes the crash-consistency claim hold across
+            # sudden power loss, not merely process crashes.
+            with tmp.open("rb") as data_file:
+                os.fsync(data_file.fileno())
+            with sidecar_tmp.open("rb") as sidecar_file:
+                os.fsync(sidecar_file.fileno())
             # Sidecar first: a crash between the two renames then leaves a
             # dangling sidecar (harmless, cleaned by _load_disk_index) rather
             # than an orphaned multi-GB data file invisible to the index.
             sidecar_tmp.rename(Path(str(final) + ".json"))
             tmp.rename(final)
+            dir_fd = os.open(self.dir, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
             size = final.stat().st_size
             with self._lock:
                 self._disk_usage[final] = (size, time.time())

@@ -266,6 +266,8 @@ class ServerState:
     served_models: set[str] = field(default_factory=set)
     model_paths: dict[str, str] = field(default_factory=dict)
     model_loader: Optional[Callable[[str], "tuple[Engine, PrefixCacheStore]"]] = None
+    model_context_override: Optional[int] = None
+    model_context_tokens: Optional[int] = None
     swap_cooldown_seconds: float = 30.0
     _last_swap_time: float = 0.0
     swap_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -293,6 +295,9 @@ class ServerState:
         if model_id not in self.served_models:
             return False, f"model {model_id!r} is not served (register with --model)"
         with self.swap_lock:
+            with self.admission_lock:
+                if not self.accepting:
+                    return False, "server is shutting down"
             # All admission checks live under this lock: checking the cooldown
             # before it permits two callers to swap back-to-back.
             if model_id == self.model_id:
@@ -327,6 +332,9 @@ class ServerState:
                 close = getattr(old_engine, "close", None)
                 if close:
                     close()
+                shutdown = getattr(old_engine, "shutdown", None)
+                if shutdown:
+                    shutdown()
                 self.models.clear()
                 # Drop all strong references before asking MLX to free Metal.
                 import gc
@@ -355,6 +363,10 @@ class ServerState:
                 self.token_cache = PromptTokenCache(self.token_cache_entries)
                 self.head_cache = SharedHeadIndex()
                 self.model_id = model_id
+                self.model_context_tokens = (
+                    self.model_context_override
+                    or model_context_limit(getattr(eng, "model", None))
+                )
                 self.models[model_id] = (eng, store, self.token_cache, self.head_cache, profile)
             finally:
                 self.lock.release_after_swap()
@@ -459,6 +471,11 @@ class ServerState:
                     return False
                 self.engine_tasks_lock.wait(remaining)
         return True
+
+    def runtime_snapshot(self) -> "tuple[Engine, PrefixCacheStore, str, PromptTokenCache, SharedHeadIndex]":
+        """Read a coherent active runtime while a swap may be loading weights."""
+        with self.swap_lock:
+            return self.engine, self.store, self.model_id, self.token_cache, self.head_cache
 
 
 class PromptTokenCache:
@@ -831,8 +848,11 @@ def create_app(
         cors_allow_credentials=cors_allow_credentials,
         trusted_proxy_hosts=frozenset(trusted_proxy_hosts or []),
         model_loader=model_loader,
+        model_context_override=model_context_tokens,
     )
-    context_limit = model_context_tokens or model_context_limit(getattr(engine, "model", None))
+    state.model_context_tokens = (
+        model_context_tokens or model_context_limit(getattr(engine, "model", None))
+    )
     # Register the default model so single-model mode is a subset of the
     # swap path: admission math and /v1/models just work.
     state.models[model_id] = (engine, store, state.token_cache, state.head_cache,
@@ -872,6 +892,9 @@ def create_app(
         engine_close = getattr(state.engine, "close", None)
         if engine_close:
             engine_close()
+        engine_shutdown = getattr(state.engine, "shutdown", None)
+        if engine_shutdown:
+            engine_shutdown()
         audit_logger.close()
 
     app = FastAPI(title="daedalus", lifespan=lifespan)
@@ -908,10 +931,11 @@ def create_app(
         # servers keep the full body.
         body: dict = {"status": "ok"}
         if authorized(authorization):
+            active_engine, _, active_model, _, _ = state.runtime_snapshot()
             body.update(
-                model=state.model_id,
-                thermal=state.engine.governor.effective_level.name,
-                active_memory_bytes=getattr(state.engine, "active_memory_bytes", lambda: 0)(),
+                model=active_model,
+                thermal=active_engine.governor.effective_level.name,
+                active_memory_bytes=getattr(active_engine, "active_memory_bytes", lambda: 0)(),
             )
         return body
 
@@ -939,22 +963,26 @@ def create_app(
             return error("invalid API key", 401, "authentication_error")
         with state.admission_lock:
             active = state.admitted_requests
+        active_engine, active_store, _, token_cache, head_cache = state.runtime_snapshot()
         return PlainTextResponse(state.metrics.render(active=active, limit=state.max_pending_requests,
-            cache={**state.store.stats(), "tokenization": state.token_cache.stats(), "shared_head": state.head_cache.stats()}, thermal=state.engine.governor.effective_level.name), media_type="text/plain; version=0.0.4")
+            cache={**active_store.stats(), "tokenization": token_cache.stats(), "shared_head": head_cache.stats()}, thermal=active_engine.governor.effective_level.name), media_type="text/plain; version=0.0.4")
 
     @app.get("/v1/models")
     def models(request: Request, authorization: Optional[str] = Header(default=None)):
         if not authorized(authorization):
             audit_logger.auth_failure(client_ip(request), reason="missing_api_key")
             return error("invalid API key", 401, "authentication_error")
+        _, _, active_model, _, _ = state.runtime_snapshot()
         return {
             "object": "list",
             "data": [
                 {
-                    "id": state.model_id,
+                    "id": candidate,
                     "object": "model",
                     "owned_by": "daedalus",
+                    "active": candidate == active_model,
                 }
+                for candidate in sorted(state.served_models)
             ],
         }
 
@@ -963,7 +991,8 @@ def create_app(
         if not authorized(authorization):
             audit_logger.auth_failure(client_ip(request), reason="missing_api_key")
             return error("invalid API key", 401, "authentication_error")
-        return state.store.stats()
+        _, active_store, _, _, _ = state.runtime_snapshot()
+        return active_store.stats()
 
     @app.delete("/v1/cache")
     def clear_cache(request: Request, authorization: Optional[str] = Header(default=None)):
@@ -1019,16 +1048,6 @@ def create_app(
         if requested_model is not None:
             if not isinstance(requested_model, str):
                 return error("model must be a string", 400)
-            if requested_model != state.model_id:
-                # Build on #17's validation: unknown model -> 404.
-                if requested_model not in state.served_models:
-                    return error(f"model {requested_model!r} is not served", 404, "model_not_found")
-                # Registered but not the resident model: attempt a hot-swap.
-                ok, msg = state.swap_model(requested_model)
-                if not ok:
-                    # Over budget / cooldown -> 409 with detail (not 404).
-                    return error(msg, 409, "model_swap_conflict")
-                # On success state.model_id is now requested_model; continue.
         messages = body.get("messages", [])
         if not isinstance(messages, list) or not messages:
             return error("messages must be a non-empty array", 400)
@@ -1073,6 +1092,16 @@ def create_app(
         ):
             return error("stop must be a string or an array of non-empty strings", 400)
 
+        # Validate cheap request fields before a potentially multi-second
+        # model swap. This prevents malformed traffic from churning weights.
+        if requested_model is not None and requested_model != state.model_id:
+            if requested_model not in state.served_models:
+                return error(f"model {requested_model!r} is not served", 404, "model_not_found")
+            ok, msg = state.swap_model(requested_model)
+            if not ok:
+                return error(msg, 409, "model_swap_conflict")
+        served_model_id = state.model_id
+
         try:
             tokens = build_prompt_tokens(state, messages, tools)
         except Exception as exc:
@@ -1082,6 +1111,7 @@ def create_app(
             return error("prompt could not be templated", 400)
         if len(tokens) > state.max_prompt_tokens:
             return error(f"prompt exceeds server limit ({state.max_prompt_tokens} tokens)", 413)
+        context_limit = state.model_context_tokens
         if context_limit is not None and len(tokens) + max_tokens > context_limit:
             return error(
                 f"prompt plus completion exceeds model context limit ({context_limit} tokens)",
@@ -1177,7 +1207,7 @@ def create_app(
 
             return StreamingResponse(
                 _stream_response(
-                    state, gen, request_id, created, request, include_usage
+                    state, gen, request_id, created, request, include_usage, served_model_id
                 ),
                 media_type="text/event-stream",
                 headers={
@@ -1230,7 +1260,7 @@ def create_app(
                 "id": request_id,
                 "object": "chat.completion",
                 "created": created,
-                "model": state.model_id,
+                "model": served_model_id,
                 "choices": [
                     {
                         "index": 0,
@@ -1635,8 +1665,9 @@ async def _stream_response(
     created: int,
     request: Request,
     include_usage: bool = False,
+    model: Optional[str] = None,
 ) -> AsyncGenerator[str, None]:
-    model = state.model_id
+    model = model or state.model_id
     queue: asyncio.Queue = asyncio.Queue(maxsize=64)
     loop = asyncio.get_running_loop()
     closed = threading.Event()

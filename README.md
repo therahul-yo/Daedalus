@@ -153,6 +153,10 @@ versions, KV layout, and machine architecture. This prevents an upgrade from
 loading an incompatible KV snapshot. Pass `--model-revision <immutable-id>`
 when a model name may resolve to mutable upstream weights.
 
+Cache directories and snapshot files are restricted to the owning user. They
+can contain tokenized system prompts, so treat `~/.cache/daedalus` as sensitive
+local data and clear it when retiring a project.
+
 ## Tune for speed
 
 The fastest safe prefill chunk varies by model, RAM, and Mac generation. Run
@@ -238,7 +242,7 @@ the current engine (releasing its Metal memory and cache flock) before loading t
 so only one model is ever resident on your 16GB. Admission is checked against a derived,
 hybrid-aware weights+KV estimate; swaps are rate-limited by a cooldown, and a failed target
 load restores the previous model rather than stranding the server. Implemented and
-unit-tested (180 tests) — **real-hardware swap validation is still pending**, so it is not
+unit-tested — **real-hardware swap validation is still pending**, so it is not
 in the v0.2.0 release.
 
 Deliberately deferred: the MTP decode head (the 4-bit checkpoint ships no MTP weights)

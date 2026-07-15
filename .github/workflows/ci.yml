@@ -32,7 +32,11 @@ jobs:
       - name: Run smoke benchmark
         run: |
           mkdir -p bench/results
-          uv run bench/smoke.py mlx-community/Qwen3-0.6B-4bit
+          uv run bench/smoke.py mlx-community/Qwen3-0.6B-4bit --out bench/results/smoke.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: smoke-benchmark
+          path: bench/results/smoke.json
         timeout-minutes: 30
 
   # Thermal validation runs real Metal inference and requires Apple Silicon

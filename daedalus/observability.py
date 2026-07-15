@@ -193,8 +193,12 @@ def get_tracer() -> Any:
         return _NoOpTracer()
     except ImportError:
         # Last resort: a duck-typed no-op.
+        class _NopSpan:
+            def set_attribute(self, *a: Any, **kw: Any) -> None:
+                return None
+
         class _NopTracer:
             def start_as_current_span(self, *a: Any, **kw: Any) -> Any:
                 from contextlib import nullcontext
-                return nullcontext()
+                return nullcontext(_NopSpan())
         return _NopTracer()
