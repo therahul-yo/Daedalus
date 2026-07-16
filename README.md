@@ -1,13 +1,3 @@
-```
-██                            ██
-████                        ████
-████████                ████████
-  ██████████        ██████████
-    ██████████    ██████████
-        ████████████████
-            ████████
-```
-
 # daedalus
 
 **A MacBook-Air-first MLX inference engine.** Local coding agents (OpenCode, Hermes Agent,

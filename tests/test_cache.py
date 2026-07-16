@@ -229,6 +229,53 @@ def test_prune_zero_when_nothing_expired(tmp_store: PrefixCacheStore):
 # 4. Lock contention
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# 5. Torn / temp files left by a crash are never indexed (FIX 2)
+# ---------------------------------------------------------------------------
+
+def test_torn_tmp_files_are_cleaned_and_not_indexed(tmp_path: Path):
+    """A crash mid-persist leaves ``*.tmp.*`` remnants carrying the real
+    token-digest key. _load_disk_index must delete them and index only the
+    committed entry, keeping _disk_usage accounting honest."""
+    model_dir = tmp_path / "test-model"
+    model_dir.mkdir(parents=True)
+
+    tokens = [1, 2, 3, 4]
+    key = _tokens_digest(tokens)
+
+    # A committed (real) entry.
+    _stub_safetensors(model_dir / f"{key}.safetensors")
+    (model_dir / f"{key}.safetensors.json").write_text(json.dumps({
+        "version": FORMAT_VERSION,
+        "model_key": "test-model",
+        "tokens": tokens,
+        "created": time.time(),
+    }))
+
+    # Crash remnants: a torn tmp data file, an old-style tmp sidecar (matches
+    # the *.safetensors.json glob), and a new-style tmp sidecar.
+    (model_dir / f"{key}.tmp.111.safetensors").write_bytes(b"torn-partial")
+    (model_dir / f"{key}.tmp.111.safetensors.json").write_text("{}")
+    (model_dir / f"{key}.tmp.222.sidecar.json").write_text("{}")
+
+    store = PrefixCacheStore("test-model", cache_dir=tmp_path,
+                             max_disk_bytes=1024**2, exclusive=False)
+
+    # Exactly one entry — the torn tmp was not mis-indexed under the real key.
+    assert key in store._entries
+    assert len(store._entries) == 1
+
+    # All temp remnants deleted by the janitor.
+    assert list(model_dir.glob("*.tmp.*")) == []
+
+    # _disk_usage references only the committed file, and it exists.
+    with store._lock:
+        for path in store._disk_usage:
+            assert ".tmp." not in path.name
+            assert path.exists()
+        assert set(store._disk_usage) == {model_dir / f"{key}.safetensors"}
+
+
 def test_prune_fails_fast_when_server_holds_lock(tmp_path: Path):
     """The CLI helper returns None (with error message) when server holds
     the flock on the cache directory."""

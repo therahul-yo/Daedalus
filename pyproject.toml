@@ -14,6 +14,7 @@ dependencies = [
     "transformers>=5.0,<5.11",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
+    "psutil>=5.9",
 ]
 
 [project.optional-dependencies]
@@ -29,11 +30,11 @@ observability = [
 daedalus = "daedalus.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/therahul-yo/daedalus"
-Repository = "https://github.com/therahul-yo/daedalus"
-Documentation = "https://github.com/therahul-yo/daedalus#readme"
+Homepage = "https://github.com/therahul-yo/Daedalus"
+Repository = "https://github.com/therahul-yo/Daedalus"
+Documentation = "https://github.com/therahul-yo/Daedalus#readme"
 Homebrew = "https://github.com/therahul-yo/homebrew-daedalus"
-Changelog = "https://github.com/therahul-yo/daedalus/releases"
+Changelog = "https://github.com/therahul-yo/Daedalus/releases"
 
 [build-system]
 requires = ["setuptools>=68"]
