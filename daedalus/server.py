@@ -36,10 +36,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, List, Optional
 
+import psutil
 from fastapi import FastAPI, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import Response as StarletteResponse
@@ -62,6 +64,13 @@ KEEPALIVE_INTERVAL_S = 1.0
 CHECKPOINT_EVERY_TOKENS = 4096
 CHECKPOINT_MIN_JOB_TOKENS = 8192
 CHECKPOINT_MIN_INTERVAL_S = 8.0
+
+# Quantized KV (the server's k8v8 cache) packs each K/V element into ~1 byte
+# but carries per-group scale/zero-point overhead; reserve 20% above the ideal
+# packed size.  Single source of truth for both the reactive KV estimator
+# (``estimate_kv_cache_bytes``) and the swap-admission profile derivation
+# (``derive_model_profile``).
+KV_QUANT_OVERHEAD = 1.2
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -86,10 +95,15 @@ class ModelProfile:
     num_attention_heads: int = 0
 
     def kv_gb(self, context_tokens: int) -> float:
-        """KV cache size at k8v8 for a given context length."""
+        """KV cache size at k8v8 for a given context length.
+
+        Linearly interpolate between the 8k and 32k anchors, extrapolating on
+        the same slope beyond 32768 (KV grows linearly in context length).
+        """
         if context_tokens <= 8192:
             return self.kv_gb_per_8k * (context_tokens / 8192)
-        return self.kv_gb_per_8k * (context_tokens / 8192)
+        slope = (self.kv_gb_per_32k - self.kv_gb_per_8k) / (32768 - 8192)
+        return self.kv_gb_per_8k + slope * (context_tokens - 8192)
 
     def total_gb(self, context_tokens: int) -> float:
         """Total RAM footprint: weights + KV + 0.5GB Metal cache high-water."""
@@ -136,6 +150,11 @@ def derive_model_profile(model_id: str, model_path: str) -> ModelProfile:
             n_layers = int(config.get("num_hidden_layers", 0))
             hidden = int(config.get("hidden_size", 0))
             n_heads = max(int(config.get("num_attention_heads", 1)), 1)
+            # GQA: KV grows on num_key_value_heads, not the full attention-head
+            # count.  Absent the field, fall back to num_attention_heads (the
+            # conservative, err-high direction — overcounts on GQA models).
+            n_kv_heads = max(int(config.get("num_key_value_heads", n_heads)), 1)
+            head_dim = int(config.get("head_dim", 0)) or (hidden // n_heads if n_heads else 0)
             import glob
             total = 0
             for sf in glob.glob(str(Path(model_path) / "*.safetensors")):
@@ -147,7 +166,11 @@ def derive_model_profile(model_id: str, model_path: str) -> ModelProfile:
                         continue
                     total += v["data_offsets"][1] - v["data_offsets"][0]
             weights_gb = total / 1e9
-            kv_per_8k = (2 * n_layers * (hidden // n_heads) * 8192) / 1e9
+            # KV bytes at 8k = 2 (K and V) * layers * kv_heads * head_dim *
+            # tokens * bytes_per_element (k8v8, see KV_QUANT_OVERHEAD). The old
+            # formula dropped the kv-head count and bytes-per-element and so
+            # undercounted ~10x, defeating the swap-admission guard.
+            kv_per_8k = (2 * n_layers * n_kv_heads * head_dim * 8192 * KV_QUANT_OVERHEAD) / 1e9
             return ModelProfile(
                 model_id, weights_gb, kv_per_8k, kv_per_8k * 4,
                 n_layers, n_layers, hidden, n_heads,
@@ -269,6 +292,20 @@ class ServerState:
     swap_cooldown_seconds: float = 30.0
     _last_swap_time: float = 0.0
     swap_lock: threading.Lock = field(default_factory=threading.Lock)
+    # Monotonic counter bumped under swap_lock on every successful swap.  A
+    # request captures it at admission (tokenization); if it changed by the
+    # time the request reaches the engine, the tokens were built with the old
+    # tokenizer and must be rebuilt against the resident model.
+    swap_epoch: int = 0
+    # Admission context window.  Recomputed on every swap so validation tracks
+    # the resident model, not the one create_app() started with.  The override
+    # (an explicit model_context_tokens argument) always wins when set.
+    context_limit: Optional[int] = None
+    context_limit_override: Optional[int] = None
+    # Degraded mode: set when a swap fails to load the target AND fails to
+    # restore the previous model, leaving no resident engine.
+    degraded: bool = False
+    degraded_reason: Optional[str] = None
     engine_tasks: int = 0
     engine_tasks_lock: threading.Condition = field(
         default_factory=lambda: threading.Condition(threading.Lock())
@@ -339,23 +376,52 @@ class ServerState:
                 try:
                     eng, store = self.model_loader(model_id)
                 except Exception as exc:
+                    # Full detail (with traceback) goes to the server log only;
+                    # the client-visible message carries the class name at most.
+                    logger.exception("model swap: loading %r failed", model_id)
                     # A failed target load must not strand the service without
                     # its prior model; restore it before reporting the error.
                     try:
                         eng, store = self.model_loader(old_id)
                     except Exception:
-                        raise RuntimeError(f"could not load {model_id!r}: {exc}") from exc
+                        # Double failure: neither the target nor the previous
+                        # model loads — there is no resident engine. Enter
+                        # degraded mode so probes/clients get an honest 503
+                        # instead of misleading 400s against a null engine.
+                        logger.critical(
+                            "model swap: reload of %r also failed after %r failed; "
+                            "entering degraded mode", old_id, model_id,
+                        )
+                        self.degraded = True
+                        self.degraded_reason = f"model load failed: {type(exc).__name__}"
+                        with self.admission_lock:
+                            self.accepting = False
+                        audit_logger._emit(
+                            "model_swap_degraded", from_model=old_id,
+                            to_model=model_id, reason=type(exc).__name__,
+                        )
+                        return False, f"could not load {model_id!r}: {type(exc).__name__}"
                     self.engine, self.store = eng, store
                     self.token_cache = PromptTokenCache(self.token_cache_entries)
                     self.head_cache = SharedHeadIndex()
+                    self.context_limit = self.context_limit_override or model_context_limit(
+                        getattr(eng, "model", None)
+                    )
                     self.models[old_id] = (eng, store, self.token_cache, self.head_cache,
                                            derive_model_profile(old_id, self.model_paths.get(old_id, old_id)))
-                    return False, f"could not load {model_id!r}: {exc}"
+                    return False, f"could not load {model_id!r}: {type(exc).__name__}"
                 self.engine, self.store = eng, store
                 self.token_cache = PromptTokenCache(self.token_cache_entries)
                 self.head_cache = SharedHeadIndex()
                 self.model_id = model_id
+                # Admission must validate against the NEW model's window.
+                self.context_limit = self.context_limit_override or model_context_limit(
+                    getattr(eng, "model", None)
+                )
                 self.models[model_id] = (eng, store, self.token_cache, self.head_cache, profile)
+                # In-flight requests captured the pre-swap epoch; bump it so
+                # they re-tokenize against this model's tokenizer.
+                self.swap_epoch += 1
             finally:
                 self.lock.release_after_swap()
             self._last_swap_time = now
@@ -377,16 +443,12 @@ class ServerState:
     def memory_available(self, reserve_bytes: int = 0) -> bool:
         if self.max_active_memory_bytes is None:
             return True
-        try:
-            import psutil
+        if psutil.virtual_memory().available < 1024 * 1024 * 512:
+            trim = getattr(self.store, "trim_ram", None)
+            if trim:
+                trim(0)
             if psutil.virtual_memory().available < 1024 * 1024 * 512:
-                trim = getattr(self.store, "trim_ram", None)
-                if trim:
-                    trim(0)
-                if psutil.virtual_memory().available < 1024 * 1024 * 512:
-                    return False
-        except ImportError:
-            pass
+                return False
 
         active = getattr(self.engine, "active_memory_bytes", lambda: 0)()
         if active + reserve_bytes < self.max_active_memory_bytes:
@@ -735,7 +797,7 @@ def estimate_kv_cache_bytes(model: Any, tokens: int, kv_bits: Optional[int]) -> 
         # keys + values.  Quantized KV has scale/zero-point overhead, so
         # reserve 20% above the ideal packed size rather than relying on an
         # optimistic bit count.  Unquantized MLX cache entries are float16.
-        bytes_per_value = 2.0 if kv_bits is None else (kv_bits / 8.0) * 1.2
+        bytes_per_value = 2.0 if kv_bits is None else (kv_bits / 8.0) * KV_QUANT_OVERHEAD
         return int(layers * 2 * heads * head_dim * tokens * bytes_per_value)
     return None
 
@@ -832,7 +894,10 @@ def create_app(
         trusted_proxy_hosts=frozenset(trusted_proxy_hosts or []),
         model_loader=model_loader,
     )
-    context_limit = model_context_tokens or model_context_limit(getattr(engine, "model", None))
+    # Admission context window lives on state (not a closure local) so a swap
+    # can recompute it; the explicit override always wins when supplied.
+    state.context_limit_override = model_context_tokens
+    state.context_limit = model_context_tokens or model_context_limit(getattr(engine, "model", None))
     # Register the default model so single-model mode is a subset of the
     # swap path: admission math and /v1/models just work.
     state.models[model_id] = (engine, store, state.token_cache, state.head_cache,
@@ -906,13 +971,18 @@ def create_app(
         # model identity and memory numbers are diagnostics, not liveness —
         # they're only included for authorized callers. Local unkeyed
         # servers keep the full body.
-        body: dict = {"status": "ok"}
+        degraded = state.degraded or state.engine is None
+        body: dict = {"status": "degraded" if degraded else "ok"}
         if authorized(authorization):
-            body.update(
-                model=state.model_id,
-                thermal=state.engine.governor.effective_level.name,
-                active_memory_bytes=getattr(state.engine, "active_memory_bytes", lambda: 0)(),
-            )
+            body["model"] = state.model_id
+            # engine can be None in degraded mode; never dereference it blindly.
+            if state.engine is not None:
+                body["thermal"] = state.engine.governor.effective_level.name
+                body["active_memory_bytes"] = getattr(state.engine, "active_memory_bytes", lambda: 0)()
+            if degraded and state.degraded_reason:
+                body["degraded_reason"] = state.degraded_reason
+        if degraded:
+            return JSONResponse(body, status_code=503)
         return body
 
     @app.get("/readyz")
@@ -920,6 +990,8 @@ def create_app(
         with state.admission_lock:
             ready = state.accepting and state.admitted_requests < state.max_pending_requests
             pending = state.admitted_requests
+        if state.degraded or state.engine is None:
+            ready = False
         status = 200 if ready else 503
         return JSONResponse({"status": "ready" if ready else "busy", "pending_requests": pending,
                              "queue_depth": state.lock.queued,
@@ -937,6 +1009,8 @@ def create_app(
         if state.api_key is not None and not authorized(authorization):
             audit_logger.auth_failure(client_ip(request), reason="missing_api_key")
             return error("invalid API key", 401, "authentication_error")
+        if state.degraded or state.engine is None or state.store is None:
+            return error("no model resident", 503, "server_error")
         with state.admission_lock:
             active = state.admitted_requests
         return PlainTextResponse(state.metrics.render(active=active, limit=state.max_pending_requests,
@@ -947,14 +1021,19 @@ def create_app(
         if not authorized(authorization):
             audit_logger.auth_failure(client_ip(request), reason="missing_api_key")
             return error("invalid API key", 401, "authentication_error")
+        # Every swap-eligible model, resident one first then the rest sorted.
+        resident = state.model_id
+        ordered = [resident] + sorted(m for m in state.served_models if m != resident)
         return {
             "object": "list",
             "data": [
                 {
-                    "id": state.model_id,
+                    "id": mid,
                     "object": "model",
                     "owned_by": "daedalus",
+                    "resident": mid == resident,
                 }
+                for mid in ordered
             ],
         }
 
@@ -987,6 +1066,10 @@ def create_app(
             source_ip = client_ip(request)
             audit_logger.auth_failure(source_ip)
             return error("invalid API key", 401, "authentication_error")
+        # Degraded mode (a swap left no resident engine): fail fast and honest
+        # rather than dereferencing a null engine into a misleading 400.
+        if state.degraded or state.engine is None:
+            return error("no model resident", 503, "server_error")
         # Check global rate limit first
         if not state.allow_global_rate():
             state.metrics.inc_request("rate_limited")
@@ -1016,34 +1099,40 @@ def create_app(
         except ValueError as exc:
             return error(str(exc), 400)
         requested_model = body.get("model")
+        needs_swap = False
         if requested_model is not None:
             if not isinstance(requested_model, str):
                 return error("model must be a string", 400)
             if requested_model != state.model_id:
-                # Build on #17's validation: unknown model -> 404.
+                # Unknown model -> 404 (cheap, stays early). A registered but
+                # non-resident model defers its hot-swap until AFTER structural
+                # validation so an invalid request can neither trigger a swap
+                # nor burn the 30s swap cooldown.
                 if requested_model not in state.served_models:
                     return error(f"model {requested_model!r} is not served", 404, "model_not_found")
-                # Registered but not the resident model: attempt a hot-swap.
-                ok, msg = state.swap_model(requested_model)
-                if not ok:
-                    # Over budget / cooldown -> 409 with detail (not 404).
-                    return error(msg, 409, "model_swap_conflict")
-                # On success state.model_id is now requested_model; continue.
+                needs_swap = True
         messages = body.get("messages", [])
         if not isinstance(messages, list) or not messages:
             return error("messages must be a non-empty array", 400)
-        stream = bool(body.get("stream", False))
-        raw_max_tokens = body.get(
-            "max_tokens", body.get("max_completion_tokens", 2048)
-        )
+        # OpenAI SDKs send explicit JSON null for unset optional fields; treat
+        # a null exactly like an absent key (fall through to the default).
+        def _or_default(value: Any, default: Any) -> Any:
+            return default if value is None else value
+
+        stream = bool(_or_default(body.get("stream"), False))
+        raw_max_tokens = body.get("max_tokens")
+        if raw_max_tokens is None:
+            raw_max_tokens = body.get("max_completion_tokens")
+        if raw_max_tokens is None:
+            raw_max_tokens = 2048
         if isinstance(raw_max_tokens, bool) or not isinstance(raw_max_tokens, int):
             return error("max_tokens must be an integer", 400)
         max_tokens = raw_max_tokens
         try:
-            temperature = float(body.get("temperature", 0.7))
-            top_p = float(body.get("top_p", 1.0))
-            freq_p = float(body.get("frequency_penalty", 0.0))
-            pres_p = float(body.get("presence_penalty", 0.0))
+            temperature = float(_or_default(body.get("temperature"), 0.7))
+            top_p = float(_or_default(body.get("top_p"), 1.0))
+            freq_p = float(_or_default(body.get("frequency_penalty"), 0.0))
+            pres_p = float(_or_default(body.get("presence_penalty"), 0.0))
         except (TypeError, ValueError):
             return error("max_tokens, temperature, top_p, frequency_penalty, presence_penalty must be numeric", 400)
         if (max_tokens < 1 or not math.isfinite(temperature) or temperature < 0
@@ -1073,6 +1162,23 @@ def create_app(
         ):
             return error("stop must be a string or an array of non-empty strings", 400)
 
+        # Structural validation has passed: only now may we hot-swap. The swap
+        # is a 30-60s blocking model load, so it runs off the asyncio event
+        # loop (otherwise it freezes every concurrent SSE stream/keepalive).
+        if needs_swap:
+            ok, msg = await run_in_threadpool(state.swap_model, requested_model)
+            if not ok:
+                if state.degraded:
+                    return error("no model resident (model load failed)", 503, "server_error")
+                # Over budget / cooldown -> 409 with detail (not 404).
+                return error(msg, 409, "model_swap_conflict")
+            # On success state.model_id is now requested_model; continue with
+            # the target model's tokenizer and context window below.
+
+        # Capture the swap epoch alongside tokenization: if a concurrent swap
+        # bumps it before this request reaches the engine, the tokens below
+        # were built with the wrong tokenizer and get rebuilt (see _Generation).
+        admission_epoch = state.swap_epoch
         try:
             tokens = build_prompt_tokens(state, messages, tools)
         except Exception as exc:
@@ -1082,9 +1188,9 @@ def create_app(
             return error("prompt could not be templated", 400)
         if len(tokens) > state.max_prompt_tokens:
             return error(f"prompt exceeds server limit ({state.max_prompt_tokens} tokens)", 413)
-        if context_limit is not None and len(tokens) + max_tokens > context_limit:
+        if state.context_limit is not None and len(tokens) + max_tokens > state.context_limit:
             return error(
-                f"prompt plus completion exceeds model context limit ({context_limit} tokens)",
+                f"prompt plus completion exceeds model context limit ({state.context_limit} tokens)",
                 400,
             )
         if not state.try_admit():
@@ -1163,6 +1269,8 @@ def create_app(
             stop=stop,
             frequency_penalty=freq_p,
             presence_penalty=pres_p,
+            messages=messages,
+            captured_epoch=admission_epoch,
         )
 
         if stream:
@@ -1210,6 +1318,11 @@ def create_app(
                     )
             result = engine_task.result()
             state.metrics.inc_request("completed")
+        except _Generation._SwapConflict as exc:
+            # A swap landed between admission and the engine slot and the
+            # re-tokenized prompt no longer fits: retryable client error.
+            state.metrics.inc_request("failed")
+            return error(str(exc), 409, "model_swap_conflict")
         except Exception:
             state.metrics.inc_request("failed")
             raise
@@ -1267,6 +1380,8 @@ class _Generation:
         stop=None,
         frequency_penalty=0.0,
         presence_penalty=0.0,
+        messages=None,
+        captured_epoch=0,
     ):
         self.state = state
         self.tokens = tokens
@@ -1280,6 +1395,10 @@ class _Generation:
         self.stop = stop or []
         self.frequency_penalty = frequency_penalty
         self.presence_penalty = presence_penalty
+        # Kept so the engine loop can re-tokenize if a swap lands between
+        # admission and the engine slot (the captured epoch no longer matches).
+        self.messages = messages
+        self.captured_epoch = captured_epoch
         self.events: "asyncio.Queue[dict]" = None  # set in stream()
         self.aborted = threading.Event()
         self.prefill_done = 0
@@ -1288,6 +1407,37 @@ class _Generation:
         self.cached_tokens = 0
         self._release_lock = threading.Lock()
         self._released = False
+        # Deferred (pinned) cache snapshots recorded during prefill; finalized
+        # (persisted + unpinned) on every exit so pinned RAM never leaks.
+        self._deferred_head_tokens: Optional[List[int]] = None
+        self._deferred_persist_tokens: Optional[List[int]] = None
+        self._pins_finalized = False
+        self._pin_lock = threading.Lock()
+
+    class _SwapConflict(Exception):
+        """Re-tokenized prompt no longer fits after a mid-flight swap."""
+
+    def finalize_deferred(self) -> None:
+        """Persist (and thereby unpin) deferred snapshots exactly once.
+
+        Runs on every exit path — success, engine exception, and client
+        disconnect — so the RAM-only pinned entries created by
+        ``checkpoint_cb`` can never grow un-evictably.
+        """
+        with self._pin_lock:
+            if self._pins_finalized:
+                return
+            self._pins_finalized = True
+            head, full = self._deferred_head_tokens, self._deferred_persist_tokens
+        persist = getattr(self.state.store, "persist", None)
+        if persist is None:
+            return
+        for toks in (head, full):
+            if toks is not None:
+                try:
+                    persist(toks)
+                except Exception:
+                    logger.exception("deferred snapshot persist failed")
 
     def release_slot(self) -> None:
         """Idempotently release this request's admission slot.
@@ -1355,6 +1505,10 @@ class _Generation:
         try:
             yield from self._run_engine_locked()
         finally:
+            # Persist/unpin any deferred snapshots before releasing the swap
+            # drain barrier: still holding an engine task keeps the store this
+            # request generated on from being torn down under us.
+            self.finalize_deferred()
             state.finish_engine_task()
 
     def _run_engine_locked(self):
@@ -1364,6 +1518,28 @@ class _Generation:
         engine = state.engine
         store = state.store
         try:
+            # Cross-tokenizer guard: a swap between admission (where these tokens
+            # were built) and now would run OLD-tokenizer ids on the NEW model —
+            # silent garbage.  Re-tokenize with the resident tokenizer and re-check
+            # the prompt/context limits; a clean 400-style error beats corruption.
+            # NOTE: this must live INSIDE the try whose finally releases
+            # state.lock — raising _SwapConflict before the try would leak the
+            # FIFO lock and deadlock the engine.
+            if state.swap_epoch != self.captured_epoch and self.messages is not None:
+                try:
+                    self.tokens = build_prompt_tokens(state, self.messages, self.tools)
+                except Exception as exc:
+                    logger.warning("re-tokenize after swap failed: %s", exc)
+                    raise self._SwapConflict("prompt could not be re-templated after a model swap") from exc
+                self.captured_epoch = state.swap_epoch
+                self.prefill_total = len(self.tokens)
+                if len(self.tokens) > state.max_prompt_tokens or (
+                    state.context_limit is not None
+                    and len(self.tokens) + self.max_tokens > state.context_limit
+                ):
+                    raise self._SwapConflict(
+                        "prompt no longer fits the resident model's context after a model swap"
+                    )
             hit = store.fetch(self.tokens)
             if hit is not None:
                 prompt_cache = hit.cache
@@ -1388,8 +1564,6 @@ class _Generation:
 
             last_checkpoint = already
             last_checkpoint_time = time.monotonic()
-            deferred_persist_tokens: Optional[List[int]] = None
-            deferred_head_tokens: Optional[List[int]] = None
             last_progress_log = [time.monotonic()]
 
             def progress_cb(done: int, total: int) -> None:
@@ -1412,20 +1586,19 @@ class _Generation:
 
             def checkpoint_cb(done: int, cache: List[Any]) -> None:
                 nonlocal last_checkpoint, last_checkpoint_time
-                nonlocal deferred_persist_tokens, deferred_head_tokens
                 if done >= len(self.tokens) - 1:
                     # End-of-prefill snapshot keyed by the prompt: for
                     # non-trimmable (hybrid) caches this is the only state
                     # the next stateless-client turn can reuse.
                     store.put(self.tokens[:done], cache, persist=False)
-                    deferred_persist_tokens = self.tokens[:done]
+                    self._deferred_persist_tokens = self.tokens[:done]
                 elif done == self.head_boundary and done > already:
                     # Shared-head snapshot: reused by NEW sessions/branches
                     # whose conversation diverges after the system prompt.
                     # RAM-only here (pinned); disk write is deferred past the
                     # response so it never sits inside TTFT.
                     store.put(self.tokens[:done], cache, persist=False)
-                    deferred_head_tokens = self.tokens[:done]
+                    self._deferred_head_tokens = self.tokens[:done]
                     logger.info(
                         "  %s · head snapshot at %d tok", self.rid, done
                     )
@@ -1547,13 +1720,8 @@ class _Generation:
                     self.rid,
                     self.prefill_done,
                 )
-                # A head snapshot taken before the abort is still valuable —
-                # persist it (rare path; lock hold acceptable) so its pin
-                # is released and the work isn't lost.
-                if deferred_head_tokens is not None:
-                    persist = getattr(store, "persist", None)
-                    if persist:
-                        persist(deferred_head_tokens)
+                # A head snapshot taken before the abort is still valuable and
+                # its pin is released by finalize_deferred (runs on every exit).
                 return
         finally:
             state.lock.release()
@@ -1619,13 +1787,11 @@ class _Generation:
         }
 
         # Deferred snapshot persists land after the client already has its
-        # final chunk: outside the FifoLock, off the TTFT path, still on
-        # this engine worker thread (MLX serialization is stream-bound).
-        persist = getattr(store, "persist", None)
-        if persist:
-            for toks in (deferred_head_tokens, deferred_persist_tokens):
-                if toks is not None:
-                    persist(toks)
+        # final chunk: outside the FifoLock, off the TTFT path, still on this
+        # engine worker thread (MLX serialization is stream-bound). Routed
+        # through finalize_deferred so success, exception, and disconnect all
+        # take the same unpin path exactly once.
+        self.finalize_deferred()
 
 
 async def _stream_response(
@@ -1655,15 +1821,24 @@ async def _stream_response(
 
     def worker():
         completed = False
+        engine_gen = gen._run_engine()
         try:
-            for event in gen._run_engine():
+            for event in engine_gen:
                 completed = completed or event["type"] == "done"
                 if not enqueue(event):
                     break
-        except Exception as exc:  # surface engine errors to the client
+        except _Generation._SwapConflict as exc:
+            enqueue({"type": "error", "message": str(exc), "kind": "model_swap_conflict"})
+        except Exception:  # surface engine errors to the client
+            # Never leak raw exception text/stack to the client; the full
+            # detail goes to the server log only.
             logger.exception("engine error")
-            enqueue({"type": "error", "message": str(exc)})
+            enqueue({"type": "error", "message": "internal error during generation"})
         finally:
+            # Deterministically run the generator's finally (finalize_deferred +
+            # finish_engine_task) even when the loop broke early on a slow /
+            # disconnected client, so pinned snapshots never leak.
+            engine_gen.close()
             state.metrics.inc_request("completed" if completed else "cancelled")
             # Idempotent slot release (leak fix from PR #4) + backpressured
             # eof (bounded queue from PR #3): put_nowait could raise on a
@@ -1746,7 +1921,7 @@ async def _stream_response(
                     {
                         "error": {
                             "message": event["message"],
-                            "type": "server_error",
+                            "type": event.get("kind", "server_error"),
                         }
                     }
                 )
