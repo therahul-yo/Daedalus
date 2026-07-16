@@ -244,37 +244,73 @@ def cmd_status(args) -> int:
     return 0
 
 
-def cmd_doctor(args) -> int:
+def _doctor_checks() -> list[dict]:
+    """Gather doctor probes as {name, status, detail} records (pass/warn/fail).
+
+    Shared by the human and --json renderers so both report identical checks.
+    """
     import platform
     import subprocess
 
     from daedalus.sensors import make_pressure_reader
 
+    checks: list[dict] = []
     hw = subprocess.run(
         ["sysctl", "-n", "machdep.cpu.brand_string", "hw.memsize"],
         capture_output=True,
         text=True,
     ).stdout.split()
-    print(f"machine: {' '.join(hw[:-1])} | RAM: {int(hw[-1]) / 1024**3:.0f} GB")
-    print(f"macOS: {platform.mac_ver()[0]}")
+    checks.append({"name": "machine", "status": "pass",
+                   "detail": f"{' '.join(hw[:-1])} | RAM: {int(hw[-1]) / 1024**3:.0f} GB"})
+    checks.append({"name": "macos", "status": "pass", "detail": platform.mac_ver()[0]})
     try:
         level = make_pressure_reader()()
-        print(f"thermal pressure (no sudo): {level.name} — OK")
+        checks.append({"name": "thermal_pressure", "status": "pass", "detail": level.name})
     except Exception as exc:
-        print(f"thermal pressure: FAILED ({exc})")
-        return 1
+        checks.append({"name": "thermal_pressure", "status": "fail", "detail": str(exc)})
     try:
         import mlx.core as mx
-
-        print(f"mlx: {mx.__version__} | metal: {mx.metal.is_available()}")
         import mlx_lm
 
-        print(f"mlx-lm: {mlx_lm.__version__}")
+        metal = mx.metal.is_available()
+        checks.append({
+            "name": "mlx", "status": "pass" if metal else "warn",
+            "detail": f"mlx {mx.__version__} | metal {metal} | mlx-lm {mlx_lm.__version__}",
+        })
     except Exception as exc:
-        print(f"mlx: FAILED ({exc})")
-        return 1
-    print("doctor: all good")
-    return 0
+        checks.append({"name": "mlx", "status": "fail", "detail": str(exc)})
+    return checks
+
+
+def cmd_doctor(args) -> int:
+    # Gather every check first so --json (and the human report) never short-circuit.
+    checks = _doctor_checks()
+    ok = all(c["status"] != "fail" for c in checks)
+    if getattr(args, "json", False):
+        import json as _json
+
+        print(_json.dumps({"ok": ok, "checks": checks}), flush=True)
+        return 0 if ok else 1
+    for c in checks:
+        if c["name"] == "machine":
+            print(f"machine: {c['detail']}")
+        elif c["name"] == "macos":
+            print(f"macOS: {c['detail']}")
+        elif c["name"] == "thermal_pressure":
+            print(f"thermal pressure (no sudo): {c['detail']} — OK" if c["status"] == "pass"
+                  else f"thermal pressure: FAILED ({c['detail']})")
+        elif c["name"] == "mlx":
+            print(f"mlx: {c['detail']}" if c["status"] != "fail"
+                  else f"mlx: FAILED ({c['detail']})")
+    print("doctor: all good" if ok else "doctor: problems found")
+    return 0 if ok else 1
+
+
+def _valid_prompt_pack(prompts) -> bool:
+    """A warm prompts file is a JSON array of {"messages": [...]} objects."""
+    return isinstance(prompts, list) and all(
+        isinstance(p, dict) and isinstance(p.get("messages"), list) for p in prompts
+    )
 
 
 def cmd_warm(args) -> int:
@@ -291,9 +327,7 @@ def cmd_warm(args) -> int:
     try:
         raw = Path(args.prompts).read_text()
         prompts = _json.loads(raw)  # [{"messages": [...]}, ...]
-        if not isinstance(prompts, list) or not all(
-            isinstance(p, dict) and isinstance(p.get("messages"), list) for p in prompts
-        ):
+        if not _valid_prompt_pack(prompts):
             raise ValueError('expected a JSON array of {"messages": [...]} objects')
     except Exception as exc:
         print(f"error: invalid prompts file {args.prompts!r}: {exc}", flush=True)
@@ -495,6 +529,10 @@ def main() -> int:
     serve.set_defaults(fn=cmd_serve)
 
     doctor = sub.add_parser("doctor", help="check thermal sensor + mlx setup")
+    doctor.add_argument(
+        "--json", action="store_true",
+        help="emit a machine-readable JSON report to stdout (no other output)",
+    )
     doctor.set_defaults(fn=cmd_doctor)
 
     status = sub.add_parser("status", help="show a running server's health, queue, and cache state")
