@@ -131,6 +131,12 @@ class PrefixCacheStore:
         self.model_key = model_key
         self.dir = (cache_dir or _default_cache_dir()) / _sanitize_model_key(model_key)
         self.dir.mkdir(parents=True, exist_ok=True)
+        # Prompt tokens can contain proprietary system prompts and user data.
+        # Keep the cache private even when a permissive umask is in effect.
+        try:
+            self.dir.chmod(0o700)
+        except OSError:
+            logger.warning("could not restrict cache directory permissions: %s", self.dir)
         self._process_lock = None
         if exclusive:
             import fcntl
@@ -483,6 +489,16 @@ class PrefixCacheStore:
                     }
                 )
             )
+            # Restrict the payloads and flush their contents before publishing
+            # the final names. The directory fsync after os.replace makes the
+            # crash-consistency claim hold across sudden power loss, not merely
+            # process crashes.
+            tmp.chmod(0o600)
+            sidecar_tmp.chmod(0o600)
+            with tmp.open("rb") as data_file:
+                os.fsync(data_file.fileno())
+            with sidecar_tmp.open("rb") as sidecar_file:
+                os.fsync(sidecar_file.fileno())
             # Swap both files into place and record the index under the lock so
             # a concurrent _evict_disk never deletes the freshly-renamed file it
             # hasn't seen in _disk_usage, nor observes the new file at `final`
@@ -494,6 +510,11 @@ class PrefixCacheStore:
             with self._lock:
                 os.replace(sidecar_tmp, final_sidecar)
                 os.replace(tmp, final)
+                dir_fd = os.open(self.dir, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
                 size = final.stat().st_size
                 self._disk_usage[final] = (size, time.time())
                 if entry is not None:

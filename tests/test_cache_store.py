@@ -394,3 +394,20 @@ def test_fetch_hit_survives_concurrent_trim_ram(tmp_path):
     assert result["hit"] is not None      # no silent miss
     assert result["hit"].matched_tokens == 50
     assert key in store._entries          # pinned entry was not popped
+
+
+def test_cache_directory_and_files_are_user_private(tmp_path):
+    import stat
+
+    store = make_store(tmp_path)
+    # Directory is restricted to the owning user (0o700).
+    assert stat.S_IMODE(store.dir.stat().st_mode) == 0o700
+    tokens = list(range(20))
+    store.put(tokens, [kv_cache_with(20)])
+    store.persist(tokens)
+    data_files = list(store.dir.glob("*.safetensors"))
+    assert data_files
+    for path in data_files:
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    for sidecar in store.dir.glob("*.safetensors.json"):
+        assert stat.S_IMODE(sidecar.stat().st_mode) == 0o600

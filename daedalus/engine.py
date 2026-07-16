@@ -87,6 +87,7 @@ class Engine:
         config: Optional[EngineConfig] = None,
         draft_model: Optional[Any] = None,
         monitor: Optional[ThermalMonitor] = None,
+        owns_monitor: bool = False,
         clock: Callable[[], float] = time.perf_counter,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -96,6 +97,7 @@ class Engine:
         self.config = config or EngineConfig()
         self.draft_model = draft_model
         self.monitor = monitor
+        self._owns_monitor = owns_monitor
         self._clock = clock
         self._sleep = sleep
 
@@ -123,17 +125,19 @@ class Engine:
                 raise ValueError("draft model tokenizer vocabulary does not match target model")
             if not cache_mod.can_trim_prompt_cache(cache_mod.make_prompt_cache(draft_model)):
                 raise ValueError("draft model prompt cache is not trimmable")
+        owns_monitor = False
         if governor is None:
+            owns_monitor = monitor is None
             monitor = (monitor or ThermalMonitor()).start()
             governor = ThermalGovernor(monitor)
         return cls(
             model, tokenizer, governor, config, draft_model=draft_model,
-            monitor=monitor,
+            monitor=monitor, owns_monitor=owns_monitor,
         )
 
     def close(self) -> None:
         """Release engine-owned background resources when the app stops."""
-        if self.monitor is not None:
+        if self._owns_monitor and self.monitor is not None:
             self.monitor.stop()
 
     def shutdown(self) -> None:
@@ -142,6 +146,8 @@ class Engine:
         self.model = None
         self.tokenizer = None
         self.draft_model = None
+        if self._owns_monitor and self.monitor is not None:
+            self.monitor.stop()
         self.monitor = None
         self.governor = None
         # Clear MLX's internal cache

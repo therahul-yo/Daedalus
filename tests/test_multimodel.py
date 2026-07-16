@@ -11,7 +11,7 @@ from daedalus.server import (
     MODEL_MEMORY_CEILING_GB,
 )
 from daedalus.server import ModelProfile
-from test_server import FakeEngine, FakeStore
+from test_server import FakeEngine, FakeGovernor, FakeStore
 
 # Give the test model ids deliberately small profiles so two fit under the
 # 16GB ceiling (the fallback profile would otherwise over-count KV at 64K ctx
@@ -200,3 +200,138 @@ def test_model_fits_math():
     active = MODEL_PROFILES["qwen-7b"]
     fits, avail, req = model_fits(big, active, 8192)
     assert not fits
+
+
+def _client(app):
+    return __import__("fastapi.testclient", fromlist=["TestClient"]).TestClient(app)
+
+
+def test_invalid_request_does_not_trigger_a_model_swap():
+    app, *_ = make_app()
+    loaded = []
+    original_loader = app.state.daedalus.model_loader
+
+    def loader(model_id):
+        loaded.append(model_id)
+        return original_loader(model_id)
+
+    app.state.daedalus.model_loader = loader
+    client = _client(app)
+    # Empty messages fail structural validation (400) BEFORE any swap.
+    response = client.post("/v1/chat/completions", json={"model": "model-a", "messages": []})
+    assert response.status_code == 400
+    assert loaded == []
+
+
+def test_models_lists_registered_candidates_and_marks_the_resident_one():
+    app, *_ = make_app()
+    client = _client(app)
+    models = {item["id"]: item for item in client.get("/v1/models").json()["data"]}
+    assert set(models) == {"default", "model-a", "model-b"}
+    assert models["default"]["resident"] is True
+    assert models["model-a"]["resident"] is False
+
+
+def test_swap_does_not_stop_a_service_owned_monitor():
+    from daedalus.engine import Engine
+
+    class Monitor:
+        def __init__(self):
+            self.stopped = 0
+
+        def stop(self):
+            self.stopped += 1
+
+    _, default_store, _ = make_spec("default-model-text")
+    target_eng, target_store, target_path = make_spec("model-a-text")
+    monitor = Monitor()
+    # owns_monitor defaults False: the service owns the shared monitor, so a
+    # swap that tears down this engine must not stop it.
+    service_engine = Engine(None, None, FakeGovernor(), monitor=monitor)
+    app = create_app(
+        service_engine,
+        default_store,
+        model_id="default",
+        model_paths={"model-a": target_path},
+        model_loader=lambda _: (target_eng, target_store),
+    )
+    ok, message = app.state.daedalus.swap_model("model-a")
+    assert ok, message
+    assert monitor.stopped == 0
+
+
+def test_swap_shuts_down_the_old_engine():
+    calls = []
+
+    class TrackingEngine(FakeEngine):
+        def __init__(self, script):
+            super().__init__(script=script)
+
+        def close(self):
+            calls.append("close")
+
+        def shutdown(self):
+            calls.append("shutdown")
+
+    default_eng = TrackingEngine("default-model-text")
+    _, default_store, _ = make_spec("x")
+    a_eng, a_store, a_path = make_spec("model-a-text")
+    app = create_app(
+        default_eng,
+        default_store,
+        model_id="default",
+        model_paths={"model-a": a_path},
+        model_loader=lambda _: (a_eng, a_store),
+    )
+    ok, message = app.state.daedalus.swap_model("model-a")
+    assert ok, message
+    assert calls == ["close", "shutdown"]
+
+
+def test_runtime_snapshot_is_coherent_after_swap():
+    app, default_eng, a_eng, _ = make_app()
+    state = app.state.daedalus
+    eng, store, model_id, _, _ = state.runtime_snapshot()
+    assert eng is default_eng and model_id == "default"
+    ok, message = state.swap_model("model-a")
+    assert ok, message
+    eng, store, model_id, _, _ = state.runtime_snapshot()
+    assert eng is a_eng and model_id == "model-a"
+    assert store is state.store
+
+
+def test_swap_refused_when_shutting_down():
+    app, *_ = make_app()
+    state = app.state.daedalus
+    with state.admission_lock:
+        state.accepting = False
+    ok, message = state.swap_model("model-a")
+    assert not ok
+    assert message == "server is shutting down"
+
+
+def test_served_model_id_reflects_swap_target_non_streaming():
+    app, *_ = make_app()
+    client = _client(app)
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": "model-a", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["model"] == "model-a"
+
+
+def test_served_model_id_reflects_swap_target_streaming():
+    app, *_ = make_app()
+    client = _client(app)
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={"model": "model-a", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+    ) as r:
+        assert r.status_code == 200
+        raw = "".join(r.iter_text())
+    import json as _json
+    lines = [line for line in raw.split("\n") if line.startswith("data: ") and "[DONE]" not in line]
+    chunks = [_json.loads(line[len("data: "):]) for line in lines]
+    assert all(c["model"] == "model-a" for c in chunks)

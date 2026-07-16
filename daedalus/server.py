@@ -330,6 +330,9 @@ class ServerState:
         if model_id not in self.served_models:
             return False, f"model {model_id!r} is not served (register with --model)"
         with self.swap_lock:
+            with self.admission_lock:
+                if not self.accepting:
+                    return False, "server is shutting down"
             # All admission checks live under this lock: checking the cooldown
             # before it permits two callers to swap back-to-back.
             if model_id == self.model_id:
@@ -364,6 +367,9 @@ class ServerState:
                 close = getattr(old_engine, "close", None)
                 if close:
                     close()
+                shutdown = getattr(old_engine, "shutdown", None)
+                if shutdown:
+                    shutdown()
                 self.models.clear()
                 # Drop all strong references before asking MLX to free Metal.
                 import gc
@@ -521,6 +527,11 @@ class ServerState:
                     return False
                 self.engine_tasks_lock.wait(remaining)
         return True
+
+    def runtime_snapshot(self) -> "tuple[Engine, PrefixCacheStore, str, PromptTokenCache, SharedHeadIndex]":
+        """Read a coherent active runtime while a swap may be loading weights."""
+        with self.swap_lock:
+            return self.engine, self.store, self.model_id, self.token_cache, self.head_cache
 
 
 class PromptTokenCache:
@@ -937,6 +948,9 @@ def create_app(
         engine_close = getattr(state.engine, "close", None)
         if engine_close:
             engine_close()
+        engine_shutdown = getattr(state.engine, "shutdown", None)
+        if engine_shutdown:
+            engine_shutdown()
         audit_logger.close()
 
     app = FastAPI(title="daedalus", lifespan=lifespan)
@@ -971,14 +985,15 @@ def create_app(
         # model identity and memory numbers are diagnostics, not liveness —
         # they're only included for authorized callers. Local unkeyed
         # servers keep the full body.
-        degraded = state.degraded or state.engine is None
+        active_engine, _, active_model, _, _ = state.runtime_snapshot()
+        degraded = state.degraded or active_engine is None
         body: dict = {"status": "degraded" if degraded else "ok"}
         if authorized(authorization):
-            body["model"] = state.model_id
+            body["model"] = active_model
             # engine can be None in degraded mode; never dereference it blindly.
-            if state.engine is not None:
-                body["thermal"] = state.engine.governor.effective_level.name
-                body["active_memory_bytes"] = getattr(state.engine, "active_memory_bytes", lambda: 0)()
+            if active_engine is not None:
+                body["thermal"] = active_engine.governor.effective_level.name
+                body["active_memory_bytes"] = getattr(active_engine, "active_memory_bytes", lambda: 0)()
             if degraded and state.degraded_reason:
                 body["degraded_reason"] = state.degraded_reason
         if degraded:
@@ -1009,12 +1024,13 @@ def create_app(
         if state.api_key is not None and not authorized(authorization):
             audit_logger.auth_failure(client_ip(request), reason="missing_api_key")
             return error("invalid API key", 401, "authentication_error")
-        if state.degraded or state.engine is None or state.store is None:
+        active_engine, active_store, _, token_cache, head_cache = state.runtime_snapshot()
+        if state.degraded or active_engine is None or active_store is None:
             return error("no model resident", 503, "server_error")
         with state.admission_lock:
             active = state.admitted_requests
         return PlainTextResponse(state.metrics.render(active=active, limit=state.max_pending_requests,
-            cache={**state.store.stats(), "tokenization": state.token_cache.stats(), "shared_head": state.head_cache.stats()}, thermal=state.engine.governor.effective_level.name), media_type="text/plain; version=0.0.4")
+            cache={**active_store.stats(), "tokenization": token_cache.stats(), "shared_head": head_cache.stats()}, thermal=active_engine.governor.effective_level.name), media_type="text/plain; version=0.0.4")
 
     @app.get("/v1/models")
     def models(request: Request, authorization: Optional[str] = Header(default=None)):
@@ -1022,7 +1038,7 @@ def create_app(
             audit_logger.auth_failure(client_ip(request), reason="missing_api_key")
             return error("invalid API key", 401, "authentication_error")
         # Every swap-eligible model, resident one first then the rest sorted.
-        resident = state.model_id
+        _, _, resident, _, _ = state.runtime_snapshot()
         ordered = [resident] + sorted(m for m in state.served_models if m != resident)
         return {
             "object": "list",
@@ -1042,7 +1058,8 @@ def create_app(
         if not authorized(authorization):
             audit_logger.auth_failure(client_ip(request), reason="missing_api_key")
             return error("invalid API key", 401, "authentication_error")
-        return state.store.stats()
+        _, active_store, _, _, _ = state.runtime_snapshot()
+        return active_store.stats()
 
     @app.delete("/v1/cache")
     def clear_cache(request: Request, authorization: Optional[str] = Header(default=None)):
@@ -1175,6 +1192,11 @@ def create_app(
             # On success state.model_id is now requested_model; continue with
             # the target model's tokenizer and context window below.
 
+        # The model actually serving this request (after any swap, or the
+        # resident one when the swap was skipped). Used for the response
+        # "model" field so it never reports a model a concurrent swap changed.
+        served_model_id = state.model_id
+
         # Capture the swap epoch alongside tokenization: if a concurrent swap
         # bumps it before this request reaches the engine, the tokens below
         # were built with the wrong tokenizer and get rebuilt (see _Generation).
@@ -1285,7 +1307,7 @@ def create_app(
 
             return StreamingResponse(
                 _stream_response(
-                    state, gen, request_id, created, request, include_usage
+                    state, gen, request_id, created, request, include_usage, served_model_id
                 ),
                 media_type="text/event-stream",
                 headers={
@@ -1343,7 +1365,7 @@ def create_app(
                 "id": request_id,
                 "object": "chat.completion",
                 "created": created,
-                "model": state.model_id,
+                "model": served_model_id,
                 "choices": [
                     {
                         "index": 0,
@@ -1801,8 +1823,9 @@ async def _stream_response(
     created: int,
     request: Request,
     include_usage: bool = False,
+    model: Optional[str] = None,
 ) -> AsyncGenerator[str, None]:
-    model = state.model_id
+    model = model or state.model_id
     queue: asyncio.Queue = asyncio.Queue(maxsize=64)
     loop = asyncio.get_running_loop()
     closed = threading.Event()
