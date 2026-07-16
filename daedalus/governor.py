@@ -94,6 +94,15 @@ class GovernorConfig:
     anticipate_rising: bool = False
     rising_window_seconds: float = 30.0
 
+    def __post_init__(self) -> None:
+        if not 0 < self.max_duty <= 1:
+            raise ValueError("max_duty must be in (0, 1]")
+        if self.step_down_seconds < 0 or self.max_sleep_seconds < 0:
+            raise ValueError("governor timing values cannot be negative")
+        for level, policy in self.policies.items():
+            if policy.chunk_tokens < 1 or not 0 < policy.duty <= 1:
+                raise ValueError(f"invalid policy for {level.name}")
+
 
 class ThermalGovernor:
     def __init__(

@@ -11,6 +11,10 @@ on:
         description: "Cold-prefill benchmark size"
         required: true
         default: "8000"
+      swap_model:
+        description: "Optional registered model to exercise the lazy swap path"
+        required: false
+        default: ""
 
 jobs:
   verify:
@@ -22,6 +26,8 @@ jobs:
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
       - run: uv sync --extra dev --locked
       - run: uv run python bench/model_verify.py "${{ inputs.model }}"
+      - if: inputs.swap_model != ''
+        run: uv run python bench/swap_verify.py "${{ inputs.model }}" "${{ inputs.swap_model }}"
       - run: >-
           uv run python bench/bench.py
           --model "${{ inputs.model }}"

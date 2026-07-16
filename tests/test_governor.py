@@ -92,6 +92,15 @@ def test_quiet_mode_caps_duty_even_when_cool():
     assert abs(d.sleep_seconds - 4.0) < 1e-9  # duty 0.5 -> idle == burn
 
 
+def test_invalid_duty_is_rejected_before_pacing_can_divide_by_zero():
+    import pytest
+
+    with pytest.raises(ValueError, match="max_duty"):
+        GovernorConfig(max_duty=0)
+    with pytest.raises(ValueError, match="max_duty"):
+        GovernorConfig(max_duty=1.1)
+
+
 def test_custom_policies():
     policies = dict(
         {

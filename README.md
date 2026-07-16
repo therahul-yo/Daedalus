@@ -143,6 +143,10 @@ versions, KV layout, and machine architecture. This prevents an upgrade from
 loading an incompatible KV snapshot. Pass `--model-revision <immutable-id>`
 when a model name may resolve to mutable upstream weights.
 
+Cache directories and snapshot files are restricted to the owning user. They
+can contain tokenized system prompts, so treat `~/.cache/daedalus` as sensitive
+local data and clear it when retiring a project.
+
 ## Tune for speed
 
 The fastest safe prefill chunk varies by model, RAM, and Mac generation. Run
