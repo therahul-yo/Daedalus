@@ -5,11 +5,19 @@ ArraysCache = non-trimmable (Qwen3.5 / hybrid GDN linear layers) — the case
 that forces exact-prefix-only matching.
 """
 
+import threading
+import time
+
 import mlx.core as mx
 import pytest
 from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
 
-from daedalus.cache.store import PrefixCacheStore
+from daedalus.cache.store import (
+    PrefixCacheStore,
+    _Entry,
+    _tokens_digest,
+    cache_nbytes,
+)
 
 
 def kv_cache_with(n_tokens: int) -> KVCache:
@@ -233,3 +241,156 @@ def test_ram_eviction_keeps_disk_entries_usable(tmp_path):
     hit = store.fetch(prefix + [1])
     assert hit is not None  # served from disk even though RAM evicted
     assert hit.matched_tokens == 1000
+
+
+# --------------------------------------------------------------------------
+# FIX 1 — persist/evict disk races
+# --------------------------------------------------------------------------
+
+def test_repersist_keeps_live_inode_for_open_reader(tmp_path):
+    """Re-persisting an already-on-disk key must not unlink the live file a
+    concurrent reader is materializing from: the atomic replace keeps the
+    reader on the old inode (POSIX)."""
+    store = make_store(tmp_path)
+    tokens = list(range(2000))
+    store.put(tokens, [kv_cache_with(2000)])
+    path = store._entries[_tokens_digest(tokens)].path
+    assert path is not None and path.exists()
+
+    with path.open("rb") as reader:
+        head = reader.read(64)
+        # Recurring head-snapshot re-persist of the same key.
+        store.put(tokens, [kv_cache_with(2000)])
+        rest = reader.read()  # old inode still fully readable
+    assert head and (head + rest)
+    assert path.exists()
+    with store._lock:
+        for p in store._disk_usage:
+            assert p.exists()
+
+
+def test_concurrent_persist_and_evict_keeps_index_consistent(tmp_path):
+    """Concurrent puts (which persist + evict) must never leave _disk_usage or
+    entry.path pointing at a deleted file."""
+    store = make_store(tmp_path, max_disk_bytes=30 * 1024)  # tiny → heavy evict
+    errors = []
+    barrier = threading.Barrier(2)
+
+    def worker(base):
+        try:
+            barrier.wait()
+            for i in range(25):
+                toks = list(range(base + i, base + i + 300))
+                store.put(toks, [kv_cache_with(300)])
+                store.fetch(toks + [7])
+        except Exception as exc:  # pragma: no cover - failure path
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(b,)) for b in (0, 100_000)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert not errors, errors
+    with store._lock:
+        for path in store._disk_usage:
+            assert path.exists(), f"_disk_usage references missing {path}"
+        for key, entry in store._entries.items():
+            if entry.path is not None:
+                assert entry.path.exists(), f"entry {key} path missing"
+
+
+# --------------------------------------------------------------------------
+# FIX 3 — TTL prune re-runs opportunistically from put()
+# --------------------------------------------------------------------------
+
+def _inject_stale_disk_entry(store, tokens, age_days):
+    key = _tokens_digest(tokens)
+    data = store.dir / f"{key}.safetensors"
+    data.write_bytes(b"\x00" * 512)
+    old = time.time() - age_days * 86400
+    entry = _Entry(tokens=tokens, cache=None, nbytes=0,
+                   last_used=time.monotonic(), path=data,
+                   created=old, last_used_at=old)
+    with store._lock:
+        store._entries[key] = entry
+        store._index(key, tokens)
+        store._disk_usage[data] = (512, old)
+    return key
+
+
+def test_ttl_reprune_triggered_by_put_after_interval(tmp_path):
+    store = make_store(tmp_path)
+    store.cache_ttl_days = 1
+    stale = _inject_stale_disk_entry(store, list(range(4)), age_days=7)
+    # Pretend the last prune was long ago so the interval has elapsed.
+    store._last_ttl_prune = time.monotonic() - store._ttl_prune_interval - 1
+
+    store.put(list(range(100, 110)), [kv_cache_with(10)], persist=False)
+
+    assert stale not in store._entries  # opportunistic re-prune removed it
+
+
+def test_ttl_reprune_skipped_within_interval(tmp_path):
+    store = make_store(tmp_path)
+    store.cache_ttl_days = 1
+    stale = _inject_stale_disk_entry(store, list(range(4)), age_days=7)
+    store._last_ttl_prune = time.monotonic()  # just pruned
+
+    store.put(list(range(100, 110)), [kv_cache_with(10)], persist=False)
+
+    assert stale in store._entries  # interval not elapsed → not re-pruned
+
+
+# --------------------------------------------------------------------------
+# FIX 4 — fetch must survive a concurrent trim_ram
+# --------------------------------------------------------------------------
+
+def test_fetch_hit_survives_concurrent_trim_ram(tmp_path):
+    """A RAM-only, unpinned entry is the silent-miss case: trim_ram would null
+    its cache and pop it. A fetch that already captured it must still return a
+    hit. Block inside _materialize to force the interleaving deterministically.
+    """
+    store = make_store(tmp_path)
+    tokens = list(range(50))
+    key = _tokens_digest(tokens)
+    entry = _Entry(
+        tokens=tokens,
+        cache=[kv_cache_with(50)],
+        nbytes=cache_nbytes([kv_cache_with(50)]),
+        last_used=time.monotonic(),
+        path=None,          # RAM-only → trim_ram would pop it entirely
+        pinned=False,
+        last_used_at=time.time(),
+    )
+    with store._lock:
+        store._entries[key] = entry
+        store._index(key, tokens)
+
+    entered = threading.Event()
+    proceed = threading.Event()
+    orig_materialize = store._materialize
+
+    def blocking_materialize(e):
+        entered.set()
+        proceed.wait(5)
+        return orig_materialize(e)
+
+    store._materialize = blocking_materialize
+
+    result = {}
+
+    def do_fetch():
+        result["hit"] = store.fetch(tokens + [999])
+
+    t = threading.Thread(target=do_fetch)
+    t.start()
+    assert entered.wait(5)      # fetch has pinned the entry, now inside materialize
+    store.trim_ram(0)           # attempt to evict everything mid-fetch
+    proceed.set()
+    t.join(timeout=5)
+
+    assert result["hit"] is not None      # no silent miss
+    assert result["hit"].matched_tokens == 50
+    assert key in store._entries          # pinned entry was not popped

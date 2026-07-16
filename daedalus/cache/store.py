@@ -28,6 +28,7 @@ import copy
 import hashlib
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -100,6 +101,10 @@ class _Entry:
     created: float = 0.0  # wall-clock timestamp of file creation (for TTL eviction)
     # LRU uses monotonic time; user-facing age and TTL reporting must not.
     last_used_at: float = 0.0
+    # Active fetch materializations holding a live reference to this entry.
+    # trim_ram and RAM eviction must not drop the cache or pop the entry
+    # while a fetch is copying it, or a valid hit becomes a silent miss.
+    inflight: int = 0
 
 
 @dataclass
@@ -167,6 +172,12 @@ class PrefixCacheStore:
         self.lookup_count = 0
         self._load_disk_index()
         self._prune_disk_by_ttl()
+        # Opportunistic re-prune bookkeeping: a long-running server must not
+        # rely solely on this constructor-time prune. put() re-runs the TTL
+        # prune once this interval has elapsed (see _maybe_prune_ttl).
+        self._last_ttl_prune = time.monotonic()
+        self._ttl_prune_interval = 15 * 60
+        self._ttl_pruning = False
 
     def _index(self, key: str, tokens: List[int]) -> None:
         node = self._trie
@@ -239,30 +250,37 @@ class PrefixCacheStore:
                 self.misses += 1
                 return None
             entry = self._entries[best_key]
-        with self._lock:
+            # Pin the entry in-use before releasing the lock: a concurrent
+            # trim_ram/eviction must not drop its cache or pop it mid-fetch,
+            # or a valid hit silently becomes a miss.
+            entry.inflight += 1
             self.lookup_seconds += time.perf_counter() - lookup_start
 
-        load_start = time.perf_counter()
-        cache_obj, source = self._materialize(entry)
-        with self._lock:
-            self.load_seconds += time.perf_counter() - load_start
-        if cache_obj is None:
-            self.misses += 1
-            return None
+        try:
+            load_start = time.perf_counter()
+            cache_obj, source = self._materialize(entry)
+            with self._lock:
+                self.load_seconds += time.perf_counter() - load_start
+            if cache_obj is None:
+                self.misses += 1
+                return None
 
-        overhang = len(entry.tokens) - best_usable
-        if overhang > 0:
-            if not can_trim_prompt_cache(cache_obj):
-                # Non-trimmable (hybrid/rotating) cache: only a pure-prefix
-                # entry is usable. Fall back to a strict-prefix search.
-                return self._fetch_strict_prefix(tokens, exclude=best_key)
-            trim_prompt_cache(cache_obj, overhang)
+            overhang = len(entry.tokens) - best_usable
+            if overhang > 0:
+                if not can_trim_prompt_cache(cache_obj):
+                    # Non-trimmable (hybrid/rotating) cache: only a pure-prefix
+                    # entry is usable. Fall back to a strict-prefix search.
+                    return self._fetch_strict_prefix(tokens, exclude=best_key)
+                trim_prompt_cache(cache_obj, overhang)
 
-        with self._lock:
-            entry.last_used = time.monotonic()
-            entry.last_used_at = time.time()
-            self.hits += 1
-        return CacheHit(cache=cache_obj, matched_tokens=best_usable, source=source)
+            with self._lock:
+                entry.last_used = time.monotonic()
+                entry.last_used_at = time.time()
+                self.hits += 1
+            return CacheHit(cache=cache_obj, matched_tokens=best_usable, source=source)
+        finally:
+            with self._lock:
+                entry.inflight -= 1
 
     def _fetch_strict_prefix(
         self, tokens: List[int], exclude: str
@@ -282,15 +300,20 @@ class PrefixCacheStore:
                 self.misses += 1
                 return None
             entry = self._entries[best_key]
-        cache_obj, source = self._materialize(entry)
-        if cache_obj is None:
-            self.misses += 1
-            return None
-        with self._lock:
-            entry.last_used = time.monotonic()
-            entry.last_used_at = time.time()
-            self.hits += 1
-        return CacheHit(cache=cache_obj, matched_tokens=best_len, source=source)
+            entry.inflight += 1  # pin against concurrent trim_ram/eviction
+        try:
+            cache_obj, source = self._materialize(entry)
+            if cache_obj is None:
+                self.misses += 1
+                return None
+            with self._lock:
+                entry.last_used = time.monotonic()
+                entry.last_used_at = time.time()
+                self.hits += 1
+            return CacheHit(cache=cache_obj, matched_tokens=best_len, source=source)
+        finally:
+            with self._lock:
+                entry.inflight -= 1
 
     def _materialize(self, entry: _Entry) -> tuple[Optional[List[Any]], str]:
         """Deep copy of the entry's cache, loading from disk if needed."""
@@ -335,6 +358,9 @@ class PrefixCacheStore:
         """Store (a deep copy of) ``prompt_cache`` for ``tokens``."""
         if len(tokens) == 0:
             return
+        # Opportunistic TTL re-prune so a long-running server keeps expiring
+        # stale disk entries without a background thread.
+        self._maybe_prune_ttl()
         key = _tokens_digest(tokens)
         stored = self._copy_cache(prompt_cache)
         deferred = not persist and len(tokens) >= self.min_persist_tokens
@@ -402,10 +428,9 @@ class PrefixCacheStore:
             last_used=time.monotonic(),
             last_used_at=time.time(),
         )
-        path = self._write_entry_files(key, prefix, prompt_cache)
+        path = self._write_entry_files(key, prefix, prompt_cache, entry=entry)
         if path is None:
             return
-        entry.path = path
         with self._lock:
             existing = self._entries.get(key)
             if existing is None or existing.cache is None:
@@ -416,21 +441,28 @@ class PrefixCacheStore:
     # ---------------------------------------------------------- persistence
 
     def _persist(self, key: str, entry: _Entry) -> None:
-        path = self._write_entry_files(key, entry.tokens, entry.cache)
+        # entry.path is set atomically inside _write_entry_files (under the
+        # lock, together with _disk_usage) so a concurrent _evict_disk can
+        # never observe the new file without its index accounting.
+        self._write_entry_files(key, entry.tokens, entry.cache, entry=entry)
         with self._lock:
-            if path is not None:
-                entry.path = path
             # Persisted (or persist failed and was logged): either way the
             # pin has done its job — release it so eviction works normally.
             entry.pinned = False
 
     def _write_entry_files(
-        self, key: str, tokens: List[int], prompt_cache: List[Any]
+        self, key: str, tokens: List[int], prompt_cache: List[Any],
+        entry: Optional[_Entry] = None,
     ) -> Optional[Path]:
         final = self.dir / f"{key}.safetensors"
+        final_sidecar = Path(str(final) + ".json")
         # NB: mx.save_safetensors appends ".safetensors" unless the name
-        # already ends with it — the tmp name must keep the suffix.
-        tmp = self.dir / f"{key}.tmp.{time.monotonic_ns()}.safetensors"
+        # already ends with it — the tmp data name must keep the suffix. The
+        # tmp sidecar must NOT end in ".safetensors.json" or _load_disk_index's
+        # glob would pick up a half-written crash remnant as a real entry.
+        ns = time.monotonic_ns()
+        tmp = self.dir / f"{key}.tmp.{ns}.safetensors"
+        sidecar_tmp = self.dir / f"{key}.tmp.{ns}.sidecar.json"
         try:
             save_prompt_cache(
                 str(tmp),
@@ -441,7 +473,6 @@ class PrefixCacheStore:
                     "n_tokens": str(len(tokens)),
                 },
             )
-            sidecar_tmp = Path(str(tmp) + ".json")
             sidecar_tmp.write_text(
                 json.dumps(
                     {
@@ -452,23 +483,38 @@ class PrefixCacheStore:
                     }
                 )
             )
-            # Sidecar first: a crash between the two renames then leaves a
-            # dangling sidecar (harmless, cleaned by _load_disk_index) rather
-            # than an orphaned multi-GB data file invisible to the index.
-            sidecar_tmp.rename(Path(str(final) + ".json"))
-            tmp.rename(final)
-            size = final.stat().st_size
+            # Swap both files into place and record the index under the lock so
+            # a concurrent _evict_disk never deletes the freshly-renamed file it
+            # hasn't seen in _disk_usage, nor observes the new file at `final`
+            # while _disk_usage still holds the stale size. os.replace is an
+            # atomic overwrite; a reader holding the old inode keeps reading it
+            # safely on POSIX. Sidecar first: a crash between the two renames
+            # then leaves a dangling sidecar (harmless, cleaned by
+            # _load_disk_index) rather than an orphaned data file.
             with self._lock:
+                os.replace(sidecar_tmp, final_sidecar)
+                os.replace(tmp, final)
+                size = final.stat().st_size
                 self._disk_usage[final] = (size, time.time())
+                if entry is not None:
+                    entry.path = final
             return final
         except Exception as exc:
             logger.warning("failed to persist cache entry %s: %s", key, exc)
             tmp.unlink(missing_ok=True)
-            Path(str(tmp) + ".json").unlink(missing_ok=True)
+            sidecar_tmp.unlink(missing_ok=True)
             return None
 
     def _load_disk_index(self) -> None:
+        # Crash janitor: remove leftover atomic-write temp files before they
+        # can be mis-indexed. A torn tmp data/sidecar carries the real
+        # token-digest key and would otherwise corrupt _disk_usage accounting
+        # and serve partial data under that key.
+        for leftover in self.dir.glob("*.tmp.*"):
+            leftover.unlink(missing_ok=True)
         for sidecar in self.dir.glob("*.safetensors.json"):
+            if ".tmp." in sidecar.name:
+                continue  # crash remnant (also cleaned by the janitor above)
             try:
                 meta = json.loads(sidecar.read_text())
                 data_path = Path(str(sidecar)[: -len(".json")])
@@ -519,9 +565,10 @@ class PrefixCacheStore:
             for entry in resident:
                 if total <= self.max_ram_bytes:
                     break
-                if entry.pinned:
-                    # A deferred snapshot awaiting persist(): dropping it
-                    # here would silently lose the request's cache write.
+                if entry.pinned or entry.inflight > 0:
+                    # A deferred snapshot awaiting persist(), or an entry a
+                    # concurrent fetch is materializing: dropping it here would
+                    # silently lose the request's cache write or a live hit.
                     continue
                 # Drop from RAM; keep the entry if it lives on disk.
                 total -= entry.nbytes
@@ -541,11 +588,17 @@ class PrefixCacheStore:
                 self._rebuild_index()
 
     def _evict_disk(self) -> None:
+        # All destructive work happens under the lock: victim selection, the
+        # unlink, and the index update are atomic with respect to writers (who
+        # rename-into-place and record _disk_usage under the same lock). unlink
+        # is a metadata op — microseconds regardless of file size — so holding
+        # the lock across it is cheap and closes the persist/evict race where a
+        # just-written valid file could be deleted with the index left stale.
         with self._lock:
             total = sum(size for size, _ in self._disk_usage.values())
             if total <= self.max_disk_bytes:
                 return
-            # Oldest-first victims, chosen under the lock…
+            # Oldest-first victims.
             victims = []
             for path, (size, mtime) in sorted(
                 self._disk_usage.items(), key=lambda kv: kv[1][1]
@@ -554,16 +607,15 @@ class PrefixCacheStore:
                     break
                 victims.append(path)
                 total -= size
-        # …file I/O outside the lock…
-        for path in victims:
-            path.unlink(missing_ok=True)
-            Path(str(path) + ".json").unlink(missing_ok=True)
-        # …then entry-table mutation back under the lock (fixes a race with
-        # the sync /metrics and /v1/cache routes on threadpool threads).
-        with self._lock:
             popped = False
             for path in victims:
+                # Re-check under the lock: never delete a file a concurrent
+                # writer has re-created and re-recorded since selection.
+                if path not in self._disk_usage:
+                    continue
                 self._disk_usage.pop(path, None)
+                path.unlink(missing_ok=True)
+                Path(str(path) + ".json").unlink(missing_ok=True)
                 for key, entry in list(self._entries.items()):
                     if entry.path == path:
                         if entry.cache is None:
@@ -612,7 +664,7 @@ class PrefixCacheStore:
             resident = [
                 e
                 for e in self._entries.values()
-                if e.cache is not None and not e.pinned
+                if e.cache is not None and not e.pinned and e.inflight == 0
             ]
             before = sum(e.nbytes for e in resident)
             resident.sort(key=lambda e: e.last_used)
@@ -658,22 +710,42 @@ class PrefixCacheStore:
 
     # ----------------------------------------------------------- TTL eviction
 
+    def _maybe_prune_ttl(self) -> None:
+        """Re-run the TTL prune if the interval has elapsed since the last one.
+
+        Cheap no-op when no TTL is configured or the interval has not elapsed.
+        A single winner runs the prune (reentrancy-guarded) while concurrent
+        callers return immediately. Driven from ``put`` — no background thread.
+        """
+        if self.cache_ttl_days is None:
+            return
+        now = time.monotonic()
+        with self._lock:
+            if self._ttl_pruning:
+                return
+            if now - self._last_ttl_prune < self._ttl_prune_interval:
+                return
+            self._ttl_pruning = True
+            self._last_ttl_prune = now
+        try:
+            self._prune_disk_by_ttl()
+        finally:
+            with self._lock:
+                self._ttl_pruning = False
+
     def _prune_disk_by_ttl(self) -> int:
         """Remove disk entries older than ``cache_ttl_days``.
 
-        Three-phase structure mirroring ``_evict_disk``:
-        1. Under lock: identify victims based on entry.created + pinned guard.
-        2. Outside lock: unlink files.
-        3. Under lock: remove from _entries, _disk_usage, rebuild index.
-        Returns count of removed entries.
+        Victim selection, unlink, and index update all run under the lock so
+        the prune is atomic with respect to concurrent writers (same locking
+        discipline as ``_evict_disk``). Returns count of removed entries.
         """
         if self.cache_ttl_days is None:
             return 0
         cutoff = time.time() - (self.cache_ttl_days * 86400)
 
-        # Phase 1: identify victims (under lock)
-        victims = []
         with self._lock:
+            victims = []
             for key, entry in list(self._entries.items()):
                 if entry.path is None:
                     continue  # RAM-only — not on disk
@@ -683,25 +755,20 @@ class PrefixCacheStore:
                 if created < cutoff:
                     victims.append((key, entry.path))
 
-        if not victims:
-            return 0
-
-        # Phase 2: unlink files (outside lock)
-        for _, path in victims:
-            path.unlink(missing_ok=True)
-            Path(str(path) + ".json").unlink(missing_ok=True)
-
-        # Phase 3: update data structures (under lock)
-        with self._lock:
+            popped = False
             for key, path in victims:
                 self._disk_usage.pop(path, None)
+                path.unlink(missing_ok=True)
+                Path(str(path) + ".json").unlink(missing_ok=True)
                 entry = self._entries.get(key)
                 if entry is not None and entry.path == path:
                     if entry.cache is None:
                         self._entries.pop(key, None)
+                        popped = True
                     else:
                         entry.path = None
-            self._rebuild_index()
+            if popped:
+                self._rebuild_index()
 
         return len(victims)
 
