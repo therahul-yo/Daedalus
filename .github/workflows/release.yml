@@ -14,6 +14,13 @@ jobs:
     name: Build and publish (macos-14)
     runs-on: macos-14
     timeout-minutes: 30
+    # Job-scoped so build provenance can mint an OIDC token and write an
+    # attestation, on top of the release upload's contents/packages writes.
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
     outputs:
       # Empty when the standalone binary didn't build; the homebrew job is
       # gated on this so it no-ops rather than publishing a bad formula.
@@ -30,6 +37,21 @@ jobs:
       # (uv tool install / pipx). These always build and gate the release.
       - name: Build wheel and sdist
         run: uv build
+
+      # Signed SLSA build provenance for the wheel + sdist. Best-effort: repo or
+      # org settings may not permit attestations yet, so never block a release
+      # on it — warn and continue.
+      - name: Attest build provenance
+        id: attest
+        continue-on-error: true
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            dist/*.whl
+            dist/*.tar.gz
+      - name: Warn if attestation failed
+        if: steps.attest.outcome == 'failure'
+        run: echo "::warning::build provenance attestation failed — repo/org settings may not allow attestations yet"
 
       # Standalone PyInstaller binary is best-effort: MLX ships @rpath-linked
       # native libs (libmlx/libjaccl) that don't survive PyInstaller's
@@ -80,7 +102,7 @@ jobs:
     timeout-minutes: 15
     # Only when this is the canonical repo AND a standalone binary was
     # actually produced (otherwise there is nothing for the formula to point at).
-    if: github.repository == 'therahul-yo/daedalus' && needs.build.outputs.binary_sha256 != ''
+    if: github.repository == 'therahul-yo/Daedalus' && needs.build.outputs.binary_sha256 != ''
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Update Homebrew formula

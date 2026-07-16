@@ -1,0 +1,56 @@
+name: Performance report
+description: Throughput, TTFT, or thermal behavior is worse than expected.
+labels: ["performance"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Performance on a MacBook Air depends heavily on thermal state and power
+        source. A benchmark JSON plus those conditions makes reports comparable.
+  - type: textarea
+    id: bench
+    attributes:
+      label: Benchmark JSON
+      description: >
+        Attach or paste the result of `bench/bench.py --out result.json`
+        (or the smoke result). It carries the config/software fingerprint we
+        compare against.
+      render: json
+    validations:
+      required: true
+  - type: dropdown
+    id: thermal
+    attributes:
+      label: Thermal state during the run
+      description: Reported by Daedalus (or `pmset -g therm`) at the start of the run.
+      options:
+        - Nominal
+        - Fair
+        - Serious
+        - Critical
+        - Unknown
+    validations:
+      required: true
+  - type: dropdown
+    id: power
+    attributes:
+      label: Power source
+      options:
+        - AC / plugged in
+        - Battery
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware
+      description: Mac model / chip and RAM.
+      placeholder: "MacBook Air M4, 16 GB"
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: What you expected vs. what you measured
+    validations:
+      required: false

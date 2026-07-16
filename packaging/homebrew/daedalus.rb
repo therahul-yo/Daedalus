@@ -1,3 +1,11 @@
+# UNPUBLISHED TEMPLATE — not a shipped artifact.
+#
+# The formula Homebrew actually installs lives in the external tap
+# therahul-yo/homebrew-daedalus (Formula/daedalus.rb there). Release automation
+# (.github/workflows/release.yml, the "homebrew" job) bumps that tap and fills
+# in the real url + sha256 from the built binary. The PLACEHOLDER_SHA256 below
+# is intentionally inert: it is never resolved from this file. Keep this copy
+# only as a reference for what the tap formula looks like.
 class Daedalus < Formula
   desc "MacBook-Air-first MLX inference engine: thermally-governed prefill, persistent prefix cache, OpenAI-compatible server"
   homepage "https://github.com/therahul-yo/daedalus"
